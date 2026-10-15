@@ -1,0 +1,8 @@
+{
+    "name": "My CloudStream Repo",
+    "description": "All my CloudStream extensions in one repository - EgyDead and AnimeZid",
+    "manifestVersion": 1,
+    "pluginLists": [
+        "https://raw.githubusercontent.com/mysdhj00-del/My-CloudStream-Repo/builds/plugins.json"
+    ]
+}

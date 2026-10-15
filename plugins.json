@@ -1,0 +1,211 @@
+[
+    {
+        "fileHash": "sha256-079e2c3d5c659d96b1c651a12a595baa350df03ef4407b64ad1daee530435bcb",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/mysdhj00-del/My-CloudStream-Repo",
+        "fileSize": 21994,
+        "status": 1,
+        "language": "ar",
+        "authors": [
+            "Saher"
+        ],
+        "tvTypes": [
+            "Movie",
+            "TvSeries",
+            "Anime"
+        ],
+        "version": 2,
+        "internalName": "Akwam",
+        "description": "Akwam - Arabic dubbed/subtitled movies, series and anime",
+        "url": "https://raw.githubusercontent.com/mysdhj00-del/My-CloudStream-Repo/builds/Akwam.cs3",
+        "name": "Akwam"
+    },
+    {
+        "fileHash": "sha256-6ac9cdf67a7b20f75aeb90a979c2ce3c5fee642f62ca789e5fa01c91f1422ed6",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/mysdhj00-del/My-CloudStream-Repo",
+        "fileSize": 50668,
+        "status": 1,
+        "language": "ar",
+        "authors": [
+            "Saher"
+        ],
+        "tvTypes": [
+            "Anime",
+            "Movie"
+        ],
+        "version": 11,
+        "internalName": "AnimeZid",
+        "description": "AnimeZid - Arabic dubbed/subtitled anime, cartoons and movies",
+        "url": "https://raw.githubusercontent.com/mysdhj00-del/My-CloudStream-Repo/builds/AnimeZid.cs3",
+        "name": "AnimeZid"
+    },
+    {
+        "fileHash": "sha256-d4da8cf16636b79a8d8024534643b4024b9aa6b043616be1c3433c017eddc72d",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/mysdhj00-del/My-CloudStream-Repo",
+        "fileSize": 25021,
+        "status": 1,
+        "language": "ar",
+        "authors": [
+            "Saher"
+        ],
+        "tvTypes": [
+            "Movie",
+            "TvSeries",
+            "Anime"
+        ],
+        "version": 5,
+        "internalName": "Brestj",
+        "description": "Brestj - Arabic dubbed/subtitled movies, series and anime",
+        "url": "https://raw.githubusercontent.com/mysdhj00-del/My-CloudStream-Repo/builds/Brestj.cs3",
+        "name": "Brestj"
+    },
+    {
+        "fileHash": "sha256-1aeb4806e3339eb9516ba4f8e22fd260998638f598b0a13851fb5720a70ea668",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/mysdhj00-del/My-CloudStream-Repo",
+        "fileSize": 24154,
+        "status": 1,
+        "language": "ar",
+        "authors": [
+            "Saher"
+        ],
+        "tvTypes": [
+            "Movie",
+            "TvSeries",
+            "Anime"
+        ],
+        "version": 2,
+        "internalName": "EgyBest",
+        "description": "EgyBest - Arabic dubbed/subtitled movies, series and anime",
+        "url": "https://raw.githubusercontent.com/mysdhj00-del/My-CloudStream-Repo/builds/EgyBest.cs3",
+        "name": "EgyBest"
+    },
+    {
+        "fileHash": "sha256-f63b058dde01f1aa3146e56c8be859cca583137ad78f1c669bf8fb6a709d6ebc",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/mysdhj00-del/My-CloudStream-Repo",
+        "fileSize": 33777,
+        "status": 1,
+        "language": "ar",
+        "authors": [
+            "Saher"
+        ],
+        "tvTypes": [
+            "Movie",
+            "TvSeries",
+            "Anime"
+        ],
+        "version": 13,
+        "internalName": "EgyDead",
+        "description": "EgyDead - Arabic dubbed/subtitled movies, series and anime",
+        "url": "https://raw.githubusercontent.com/mysdhj00-del/My-CloudStream-Repo/builds/EgyDead.cs3",
+        "name": "EgyDead"
+    },
+    {
+        "fileHash": "sha256-d4da36df10d309a334c8b028b4b7472c66a2a4c154850090e4aefb696ff59b08",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/mysdhj00-del/My-CloudStream-Repo",
+        "fileSize": 25104,
+        "status": 1,
+        "language": "ar",
+        "authors": [
+            "Saher"
+        ],
+        "tvTypes": [
+            "TvSeries",
+            "Movie",
+            "Anime"
+        ],
+        "version": 2,
+        "internalName": "Isk",
+        "description": "3isk Qessat Ashq - Turkish series dubbed/subtitled and movies",
+        "url": "https://raw.githubusercontent.com/mysdhj00-del/My-CloudStream-Repo/builds/Isk.cs3",
+        "name": "Isk"
+    },
+    {
+        "fileHash": "sha256-a41bf0b36bee221f31de851113d308e3b7c32f459891fc3dd483e3d104a3b1a5",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/mysdhj00-del/My-CloudStream-Repo",
+        "fileSize": 23663,
+        "status": 1,
+        "language": "ar",
+        "authors": [
+            "Saher"
+        ],
+        "tvTypes": [
+            "Movie",
+            "TvSeries",
+            "Anime"
+        ],
+        "version": 3,
+        "internalName": "MyCima",
+        "description": "MyCima (Cimawbas) - Arabic dubbed/subtitled movies, series and anime",
+        "url": "https://raw.githubusercontent.com/mysdhj00-del/My-CloudStream-Repo/builds/MyCima.cs3",
+        "name": "MyCima"
+    },
+    {
+        "fileHash": "sha256-d3a8c39cb93975b9ff48a72c1fd42fd2460a863d07e74594161d5d8404fed480",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/mysdhj00-del/My-CloudStream-Repo",
+        "fileSize": 20316,
+        "status": 3,
+        "language": "ar",
+        "authors": [
+            "Saher"
+        ],
+        "tvTypes": [
+            "TvSeries",
+            "Movie",
+            "Anime"
+        ],
+        "version": 1,
+        "internalName": "Viu",
+        "description": "Viu Egypt - series and movies (guest/free catalog, needs EG network or VPN)",
+        "url": "https://raw.githubusercontent.com/mysdhj00-del/My-CloudStream-Repo/builds/Viu.cs3",
+        "name": "Viu"
+    },
+    {
+        "fileHash": "sha256-f96285b054f349546e3c514913408a151de8cb32081f8166dfe92ed7fdae93ea",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/mysdhj00-del/My-CloudStream-Repo",
+        "fileSize": 44482,
+        "status": 1,
+        "language": "ar",
+        "authors": [
+            "Saher"
+        ],
+        "tvTypes": [
+            "Movie",
+            "TvSeries",
+            "Anime"
+        ],
+        "version": 21,
+        "internalName": "WeCima",
+        "description": "WeCima - Arabic dubbed/subtitled movies, series and anime",
+        "url": "https://raw.githubusercontent.com/mysdhj00-del/My-CloudStream-Repo/builds/WeCima.cs3",
+        "name": "WeCima"
+    },
+    {
+        "fileHash": "sha256-d4f60aa11d6f2089e10078da966ce6770ae3bae6ef60619173ed8e427bcbb717",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/mysdhj00-del/My-CloudStream-Repo",
+        "fileSize": 27894,
+        "status": 1,
+        "language": "ar",
+        "authors": [
+            "Saher"
+        ],
+        "tvTypes": [
+            "Movie",
+            "TvSeries",
+            "Anime"
+        ],
+        "version": 1,
+        "internalName": "WeCimaMobile",
+        "description": "WeCima (wecima.mobile) - Arabic dubbed/subtitled movies, series and anime",
+        "url": "https://raw.githubusercontent.com/mysdhj00-del/My-CloudStream-Repo/builds/WeCimaMobile.cs3",
+        "name": "WeCimaMobile"
+    }
+]

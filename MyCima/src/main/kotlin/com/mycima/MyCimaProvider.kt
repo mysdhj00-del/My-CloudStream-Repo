@@ -301,11 +301,40 @@ class MyCimaProvider : MainAPI() {
             }
         )
     }
+    // Dean Edwards packer blocks: eval(function(p,a,c,k,e,d){...}('payload',
+    // radix, count, 'k1|k2|...'.split('|'))). Some embed hosts hide their
+    // player config this way (minochinos on this site, verified live
+    // 2026-10-16: unpacked, it yields a direct stream on acek-cdn.com).
+    private val packedRegex = Regex(
+        """eval\(function\(p,a,c,k,e,d\)\{.*?\}\('(.+?)',(\d+),(\d+),'(.+?)'\.split\('\|'\)""",
+        RegexOption.DOT_MATCHES_ALL
+    )
+
+    /** Unpacks every packed-JS block in the page; returns the plain texts. */
+    private fun unpackPackedJs(text: String): List<String> {
+        val out = mutableListOf<String>()
+        for (m in packedRegex.findAll(text)) {
+            val payload = m.groupValues[1]
+            val radix = m.groupValues[2].toIntOrNull() ?: continue
+            val count = m.groupValues[3].toIntOrNull() ?: continue
+            if (radix < 2 || radix > 36 || count <= 0 || count > 5000) continue
+            val keywords = m.groupValues[4].split("|")
+            val map = HashMap<String, String>()
+            for (i in 0 until count) {
+                val tok = i.toString(radix)
+                val kw = keywords.getOrNull(i)
+                map[tok] = if (kw.isNullOrEmpty()) tok else kw
+            }
+            out += Regex("""\b\w+\b""").replace(payload) { mr -> map[mr.value] ?: mr.value }
+        }
+        return out
+    }
 
     /**
      * Stage 2 (phone-side): fetch an embed page the built-in extractors
-     * couldn't handle and pull the direct file out of it. Returns true when
-     * a link was emitted.
+     * couldn't handle and pull the direct file out of it — scanning the raw
+     * page first, then the unpacked form of any packed-JS player config.
+     * Returns true when a link was emitted.
      */
     private suspend fun scanEmbed(
         embed: String,
@@ -315,11 +344,14 @@ class MyCimaProvider : MainAPI() {
         val text = runCatching {
             app.get(embed, headers = browserHeaders, referer = data).text
         }.getOrNull() ?: return false
-        val direct = extractDirect(text) ?: return false
+        val direct = extractDirect(text)
+            ?: unpackPackedJs(text).firstNotNullOfOrNull { extractDirect(it) }
+            ?: return false
         if (direct.isBlank()) return false
         emitDirect(direct, embed, callback)
         return true
     }
+   
 
     /**
      * Stage 3 (server-side): asks the relay's generic resolver to fetch the

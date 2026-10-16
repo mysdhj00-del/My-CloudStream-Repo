@@ -88,10 +88,19 @@ import org.jsoup.nodes.Element
  *   serves the phone and its player chain differs from gripe's dead
  *   Worker, series episodes come back to life; if not, gripe keeps
  *   today's exact behavior (shape-B streams play).
+ * - v7 (2026-10-16): the generic scan gained the JW file: pattern and a
+ *   packed-JS unpack fallback (repo-wide hardening round).
+ * - v8 (2026-10-16): REVERT to gripe-primary. On-device, a tattoo-only
+ *   title (Silo S1E10) died at load() with "No title": tattoo's inner
+ *   pages refuse the app's fetches (Cloudflare check — only a real
+ *   browser passes), and the gripe fallback 404s on tattoo-only posts,
+ *   so the dual-domain v6 design dead-ended every tattoo-only title at
+ *   an error screen. mainUrl is gripe again (altUrl kept, now equal);
+ *   tattoo remains watchable in the phone's browser, where it plays.
  * - Every request carries an Android-Chrome header set.
  */
 class WeCimaProvider : MainAPI() {
-    override var mainUrl = "https://wecima.tattoo"
+    override var mainUrl = "https://wecima.gripe"
     override var name = "WeCima"
     override var lang = "ar"
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries, TvType.Anime)

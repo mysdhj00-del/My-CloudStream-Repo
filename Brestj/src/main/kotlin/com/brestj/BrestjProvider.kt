@@ -204,13 +204,26 @@ class BrestjProvider : MainAPI() {
         val hubSeason = seasonOf(title)
         val core = title
             .removePrefix("مسلسل").trim()
+            .replace(Regex("""\s+الحلقة\s+.*$"""), "").trim()
             .replace(Regex("""الموسم\s+.*$"""), "").trim()
             .removePrefix("انمي").trim()
         val episodes = mutableListOf<Episode>()
         val seenEp = HashSet<String>()
         document.select("a[href*=\"watch.php?vid=\"]").forEach { a ->
             val href = fixUrl(a.attr("href"))
-            if (href == url || !seenEp.add(href)) return@forEach
+            if (!seenEp.add(href)) return@forEach
+            val anchorText = a.text().trim().replace(Regex("""\s+"""), " ")
+            // Numbered episode strip: the anchor's whole text is "N حلقة".
+            val numbered = Regex("""^(\d{1,4})\s*حلقة$""").find(anchorText)
+            if (numbered != null) {
+                val n = numbered.groupValues[1].toIntOrNull() ?: return@forEach
+                episodes += newEpisode(href) {
+                    this.name = "الحلقة $n"
+                    this.season = hubSeason
+                    this.episode = n
+                }
+                return@forEach
+            }
             val epTitle = cleanTitle(a.attr("title").ifBlank { a.text() })
             if (!epTitle.contains("الحلقة")) return@forEach
             if (core.isNotBlank() && !epTitle.contains(core, ignoreCase = true)) return@forEach

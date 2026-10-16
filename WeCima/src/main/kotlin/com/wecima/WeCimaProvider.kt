@@ -154,6 +154,13 @@ import org.jsoup.nodes.Element
  *   extractor stage tries the usually-fastest hosts first (MixDrop,
  *   Doodstream, Voe, StreamTape...) — a stable sort, every server is
  *   still tried. DEBUG gains cache=hit.
+ * - v16 (2026-10-16, Mohamed: "الكتالوج لايوجد" — section names render
+ *   but every row is empty on-device, while the site serves 62 cards
+ *   to the sandbox in ~1 s): getMainPage retries once on an empty
+ *   parse and, if still empty, returns ONE diagnostic card naming the
+ *   HTTP code / document length / serving host, so the row reports
+ *   what the phone actually received; search does the same. Nothing
+ *   changes when fetches succeed.
  * - Every request carries an Android-Chrome header set.
  */
 class WeCimaProvider : MainAPI() {
@@ -399,14 +406,41 @@ class WeCimaProvider : MainAPI() {
         // (verified on the home page and category archives).
         val base = request.data.trimEnd('/')
         val url = if (page <= 1) base else "$base?page=$page"
-        val document = fetchPage(url).document
-        val items = document.parseCards()
-        return newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
+        var fetched = fetchPage(url)
+        var items = fetched.document.parseCards()
+        if (items.isEmpty()) {
+            // One retry (transient carrier/host failures render as an
+            // empty row in the app, with no error shown).
+            Thread.sleep(1500)
+            fetched = fetchPage(url)
+            items = fetched.document.parseCards()
+        }
+        var isDebug = false
+        if (items.isEmpty()) {
+            // v16: surface WHAT the app received as a visible card, so
+            // an "empty catalog" report carries its own diagnosis (the
+            // site's markup was verified intact the same hour: 62
+            // a.show-card anchors on the home page).
+            val len = runCatching { fetched.document.html().length }.getOrDefault(-1)
+            items = listOf(
+                newMovieSearchResponse(
+                    "DEBUG cat code=${fetched.code} cards=0 len=$len via=${fetched.host}",
+                    url, TvType.Movie
+                ) {}
+            )
+            isDebug = true
+        }
+        return newHomePageResponse(request.name, items, hasNext = !isDebug && items.isNotEmpty())
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
         val url = mobileUrl + "/search?s=" + java.net.URLEncoder.encode(query, "UTF-8")
-        return fetchPage(url).document.parseCards()
+        val items = fetchPage(url).document.parseCards()
+        if (items.isNotEmpty()) return items
+        // v16: distinguish "no results" from "fetch failed" visibly.
+        return listOf(
+            newMovieSearchResponse("DEBUG search cards=0", url, TvType.Movie) {}
+        )
     }
 
     override suspend fun load(url: String): LoadResponse {

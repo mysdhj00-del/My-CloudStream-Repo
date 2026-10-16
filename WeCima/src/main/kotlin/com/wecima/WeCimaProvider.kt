@@ -178,6 +178,15 @@ import org.jsoup.nodes.Element
  *   og:title present). loadMobile now retries ONCE after 2 s when the
  *   title is blank, falls back to a slug-derived title, and falls back
  *   to the first <img> for the poster.
+ * - v19 (2026-10-16): the 403 block is INTERMITTENT, not a one-off —
+ *   the catalog rendered fully at 13:11 and was 403 again at 13:18
+ *   under light use. The app bursts all section fetches at once; the
+ *   site punishes bursts. v19 adds a provider-wide pacing gate
+ *   (request starts >= 400 ms apart: fetchPage + resolveOneMobile),
+ *   cuts the phase-1 pool 5 -> 3, and guards the slug-title fallback
+ *   to post URLs only (a tapped DEBUG card had produced a junk title
+ *   page named "https://wecima.mobile"). Poster image loads are the
+ *   app's own and cannot be paced from here.
  * - Every request carries an Android-Chrome header set.
  */
 class WeCimaProvider : MainAPI() {
@@ -241,6 +250,7 @@ class WeCimaProvider : MainAPI() {
                 candidate.startsWith(altUrl) -> altUrl
                 else -> mainUrl
             }
+            awaitPace()
             val res = runCatching {
                 app.get(candidate, headers = browserHeaders, cookies = hostCookies[host].orEmpty())
             }.getOrNull() ?: continue
@@ -880,9 +890,14 @@ class WeCimaProvider : MainAPI() {
                 ?: document.title()
         }
         val title = cleanTitle(rawTitle).ifBlank {
-            decode(url).substringAfter("/film/").substringAfter("/episode/")
-                .trimEnd('/').removePrefix("فيلم-").removePrefix("مسلسل-")
-                .replace('-', ' ').trim()
+            // Only post URLs carry a naming slug — for anything else
+            // (e.g. a tapped DEBUG card pointing at the bare domain)
+            // stay blank and let the "No title" error stand.
+            if (url.contains("/film/") || url.contains("/episode/")) {
+                decode(url).substringAfter("/film/").substringAfter("/episode/")
+                    .trimEnd('/').removePrefix("فيلم-").removePrefix("مسلسل-")
+                    .replace('-', ' ').trim()
+            } else ""
         }
         if (title.isBlank()) throw ErrorLoadingException("No title")
         val poster = fixUrlNull(document.selectFirst("meta[property=\"og:image\"]")?.attr("content"))
@@ -1064,6 +1079,7 @@ class WeCimaProvider : MainAPI() {
             .build()
         var rText: String? = null
         for (attempt in 1..2) {
+            awaitPace()
             rText = runCatching {
                 rawClient.newCall(postReq).execute().use { it.body?.string() }
             }.getOrNull()
@@ -1080,6 +1096,7 @@ class WeCimaProvider : MainAPI() {
             .header("Referer", watchUrl)
             .header("Cookie", cookieHeader)
             .build()
+        awaitPace()
         return runCatching {
             rawClientNoFollow.newCall(getReq).execute().use { resp ->
                 val loc = resp.header("Location")
@@ -1131,6 +1148,23 @@ class WeCimaProvider : MainAPI() {
          * skips the watch + resolve phases entirely (v15). */
         val playCache =
             java.util.concurrent.ConcurrentHashMap<String, Pair<Long, List<String>>>()
+
+        /** v19 pacing gate for the operator's hosts: request STARTS
+         * are spaced >= 400 ms apart provider-wide. The 403 block is
+         * INTERMITTENT (catalog worked 13:11, blocked again 13:18) —
+         * the app fires all 17 section fetches in one burst and the
+         * site answers bursts with 403s; a browser never requests
+         * like that. awaitPace() is called before fetches in
+         * fetchPage and before every raw call in resolveOneMobile. */
+        val paceLock = Any()
+        var lastReqAt = 0L
+        fun awaitPace() {
+            synchronized(paceLock) {
+                val wait = 400L - (System.currentTimeMillis() - lastReqAt)
+                if (wait > 0) Thread.sleep(wait)
+                lastReqAt = System.currentTimeMillis()
+            }
+        }
     }
 
     /**
@@ -1148,7 +1182,7 @@ class WeCimaProvider : MainAPI() {
     ): List<Pair<Int, String>> {
         val hits = java.util.Collections.synchronizedList(mutableListOf<Pair<Int, String>>())
         val fails = java.util.Collections.synchronizedList(mutableListOf<Int>())
-        val pool = java.util.concurrent.Executors.newFixedThreadPool(5)
+        val pool = java.util.concurrent.Executors.newFixedThreadPool(3)
         val latch = java.util.concurrent.CountDownLatch(count)
         val t0 = System.currentTimeMillis()
         for (index in 0 until count) {

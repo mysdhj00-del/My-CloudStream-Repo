@@ -134,6 +134,16 @@ import org.jsoup.nodes.Element
  *   loadLinksMobile choke point — data, watchUrl and every referer in
  *   the chain derive from the encoded form. The v11 retries stay as
  *   insurance for the host's genuine slowness.
+ * - v12 CONFIRMED WORKING on-device (2026-10-16, "اشتغل").
+ * - v13 (2026-10-16, Mohamed: "ياخذ وقت هل يمكنك جعله يفتح بسرعة"):
+ *   speed pass on measured timings (warm session: watch ~2.3 s, resolve
+ *   POST 0.3-0.8 s, fragment ~0.3 s unfollowed). Phase 1 now resolves
+ *   ALL servers in parallel on a 5-thread raw-okhttp pool (NiceHttp is
+ *   suspend-only, so pool threads use synchronous okhttp), fragments
+ *   are read with redirects DISABLED (Location = the embed; v12
+ *   followed each redirect and downloaded every embed page — the main
+ *   cost), and a fully-failed round re-warms the watch session once.
+ *   DEBUG gains p1ms= (phase-1 wall time) and fails= markers.
  * - Every request carries an Android-Chrome header set.
  */
 class WeCimaProvider : MainAPI() {
@@ -923,6 +933,83 @@ class WeCimaProvider : MainAPI() {
         return emitted
     }
 
+    // Raw synchronous clients for the phase-1 pool (NiceHttp calls are
+    // suspend and cannot run on pool threads). Timeouts are generous;
+    // the measured per-call cost is under a second on a warm session.
+    private val rawClient by lazy {
+        okhttp3.OkHttpClient.Builder()
+            .connectTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
+            .readTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
+            .build()
+    }
+    private val rawClientNoFollow by lazy {
+        okhttp3.OkHttpClient.Builder()
+            .followRedirects(false)
+            .followSslRedirects(false)
+            .connectTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
+            .readTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
+            .build()
+    }
+
+    /**
+     * One server of the mobile protocol, run on a pool thread: POST
+     * /watch/resolve {key, index}, then GET the /m/ fragment WITHOUT
+     * following redirects — its Location header is the real embed (the
+     * ~765-byte fragment answers in ~0.3 s; following the redirect
+     * would download the whole embed page just to learn its URL).
+     */
+    private fun resolveOneMobile(
+        index: Int,
+        key: String,
+        csrf: String,
+        cookieHeader: String,
+        watchUrl: String
+    ): String? {
+        val ua = browserHeaders["User-Agent"] ?: "Mozilla/5.0"
+        val body = JSONObject().put("key", key).put("index", index).toString()
+        val postReq = okhttp3.Request.Builder()
+            .url("$mobileUrl/watch/resolve")
+            .header("User-Agent", ua)
+            .header("X-CSRF-TOKEN", csrf)
+            .header("X-Requested-With", "XMLHttpRequest")
+            .header("Accept", "application/json")
+            .header("Content-Type", "application/json")
+            .header("Referer", watchUrl)
+            .header("Cookie", cookieHeader)
+            .post(body.toRequestBody("application/json".toMediaType()))
+            .build()
+        var rText: String? = null
+        for (attempt in 1..2) {
+            rText = runCatching {
+                rawClient.newCall(postReq).execute().use { it.body?.string() }
+            }.getOrNull()
+            if (rText != null) break
+            Thread.sleep(700)
+        }
+        val frag = (rText?.let { runCatching { JSONObject(it) }.getOrNull() })
+            ?.takeIf { it.optBoolean("ok") }?.optString("url")?.takeIf { it.isNotBlank() }
+            ?: return null
+        val fragUrl = if (frag.startsWith("http")) frag else mobileUrl + frag
+        val getReq = okhttp3.Request.Builder()
+            .url(fragUrl)
+            .header("User-Agent", ua)
+            .header("Referer", watchUrl)
+            .header("Cookie", cookieHeader)
+            .build()
+        return runCatching {
+            rawClientNoFollow.newCall(getReq).execute().use { resp ->
+                val loc = resp.header("Location")
+                if (loc != null && loc.startsWith("http") && !loc.contains("wecima.mobile")) {
+                    loc
+                } else {
+                    val t = runCatching { resp.body?.string() }.getOrNull() ?: ""
+                    Regex("""url='([^']+)'""").find(t)?.groupValues?.get(1)
+                        ?: Regex("""<a href="([^"]+)""").find(t)?.groupValues?.get(1)
+                }
+            }
+        }.getOrNull()
+    }
+
     /**
      * Mobile playback (traced end-to-end live on 2026-10-16): the post's
      * /watch/{slug} page carries an inline `const servers = [...]` list
@@ -1005,67 +1092,66 @@ class WeCimaProvider : MainAPI() {
             return true
         }
 
-        val jsonType = "application/json".toMediaType()
-        val postHeaders = browserHeaders + mapOf(
-            "X-CSRF-TOKEN" to csrf,
-            "X-Requested-With" to "XMLHttpRequest",
-            "Accept" to "application/json"
-        )
-        val embeds = LinkedHashSet<String>()
-        var resolved = 0
-        for (index in servers.indices) {
-            val body = JSONObject().put("key", key).put("index", index).toString()
-            var rText = runCatching {
-                app.post(
-                    "$mobileUrl/watch/resolve",
-                    headers = postHeaders,
-                    cookies = cookies,
-                    referer = watchUrl,
-                    requestBody = body.toRequestBody(jsonType)
-                ).text
-            }.getOrNull()
-            if (rText == null) {
-                // One retry: the host is slow (see the watch GET note).
-                Thread.sleep(1500)
-                rText = runCatching {
-                    app.post(
-                        "$mobileUrl/watch/resolve",
-                        headers = postHeaders,
-                        cookies = cookies,
-                        referer = watchUrl,
-                        requestBody = body.toRequestBody(jsonType)
-                    ).text
-                }.getOrNull()
-            }
-            val frag = rText?.let { runCatching { JSONObject(it) }.getOrNull() }
-                ?.takeIf { it.optBoolean("ok") }?.optString("url")?.takeIf { it.isNotBlank() }
-            if (frag == null) {
-                diag += "resolve[$index]=fail"
-                continue
-            }
-            resolved++
-            val fragUrl = if (frag.startsWith("http")) frag else mobileUrl + frag
-            // The fragment redirects (302 + meta refresh) to the real
-            // embed: after redirects the response URL is the embed; if
-            // it is still the fragment, parse the refresh target.
-            val fres = runCatching {
-                app.get(fragUrl, headers = browserHeaders, cookies = cookies, referer = watchUrl)
-            }.getOrNull()
-            var embed: String? = null
-            if (fres != null) {
-                val landed = fres.url.takeIf { it.isNotBlank() && !it.contains("wecima.mobile") }
-                if (landed != null) {
-                    embed = landed
-                } else {
-                    val ftext = runCatching { fres.text }.getOrDefault("")
-                    embed = Regex("""url='([^']+)'""").find(ftext)?.groupValues?.get(1)
-                        ?: Regex("""<a href="([^"]+)""").find(ftext)?.groupValues?.get(1)
+        // Phase 1, parallel (v13 speed pass; timings measured live on a
+        // warm session: watch ~2.3 s, each resolve POST 0.3-0.8 s, each
+        // fragment ~0.3 s when redirects are NOT followed). v12 ran this
+        // loop strictly sequentially AND followed every fragment
+        // redirect, downloading all ~14 embed pages one by one — the
+        // on-device slowness Mohamed reported ("ياخذ وقت"). Now: raw
+        // okhttp calls resolve all servers on a 5-thread pool, fragments
+        // are read without following redirects (the Location header IS
+        // the embed), and a fully-failed round re-warms the watch
+        // session once (a stale session answers ok:false "expired").
+        val cookieHeader = cookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
+        fun phase1(k: String, c: String, ck: String): List<Pair<Int, String>> {
+            val hits = java.util.Collections.synchronizedList(mutableListOf<Pair<Int, String>>())
+            val fails = java.util.Collections.synchronizedList(mutableListOf<Int>())
+            val pool = java.util.concurrent.Executors.newFixedThreadPool(5)
+            val latch = java.util.concurrent.CountDownLatch(servers.size)
+            val t0 = System.currentTimeMillis()
+            for (index in servers.indices) {
+                pool.execute {
+                    try {
+                        val embed = resolveOneMobile(index, k, c, ck, watchUrl)
+                        if (embed != null) hits += index to embed else fails += index
+                    } catch (e: Exception) {
+                        fails += index
+                    } finally {
+                        latch.countDown()
+                    }
                 }
             }
-            if (embed != null && embed.startsWith("http")) embeds += embed
-            Thread.sleep(250)
+            latch.await(90, java.util.concurrent.TimeUnit.SECONDS)
+            pool.shutdown()
+            diag += "p1ms=${System.currentTimeMillis() - t0}"
+            if (fails.isNotEmpty()) diag += "fails=${fails.sorted()}"
+            return hits.sortedBy { it.first }
         }
-        diag += "resolved=$resolved"
+        var hits = phase1(key, csrf, cookieHeader)
+        if (hits.isEmpty()) {
+            // Re-warm once: fresh watch page -> fresh key/csrf/cookies.
+            diag += "rewarm=1"
+            val res2 = runCatching {
+                app.get(watchUrl, headers = browserHeaders, referer = safeData)
+            }.getOrNull()
+            val text2 = res2?.let { runCatching { it.text }.getOrNull() }
+            val key2 = text2?.let {
+                Regex("""watchResolveKey\s*=\s*"([^"]+)"""").find(it)?.groupValues?.get(1)
+            }
+            val csrf2 = text2?.let {
+                Regex("""csrfToken\s*=\s*"([^"]+)"""").find(it)?.groupValues?.get(1)
+            }
+            val cookies2 = res2?.let { runCatching { it.cookies }.getOrNull() }.orEmpty()
+            if (key2 != null && csrf2 != null) {
+                hits = phase1(
+                    key2, csrf2,
+                    cookies2.entries.joinToString("; ") { e -> "${e.key}=${e.value}" }
+                )
+            }
+        }
+        val embeds = LinkedHashSet<String>()
+        hits.forEach { embeds += it.second }
+        diag += "resolved=${hits.size}"
         diag += "embeds=${embeds.size}"
 
         var found = false

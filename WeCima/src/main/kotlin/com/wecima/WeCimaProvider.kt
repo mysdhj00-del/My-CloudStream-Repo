@@ -125,6 +125,15 @@ import org.jsoup.nodes.Element
  *   chain: the watch GET retries 3x with backoff, each resolve POST
  *   retries once, and the DEBUG line records the exception class
  *   (werr=) so a failure names itself (timeout vs TLS vs DNS).
+ * - v12 (2026-10-16): the werr marker named it — IllegalArgumentException,
+ *   thrown LOCALLY before any network I/O: the site's anchors carry RAW
+ *   Arabic slugs, the episode's data URL went into the watch GET's
+ *   referer header unencoded, and okhttp rejects non-ASCII header
+ *   values. (Browsing worked because okhttp encodes the request-line
+ *   URL itself; only headers are strict.) Fix: pctEncodeNonAscii at the
+ *   loadLinksMobile choke point — data, watchUrl and every referer in
+ *   the chain derive from the encoded form. The v11 retries stay as
+ *   insurance for the host's genuine slowness.
  * - Every request carries an Android-Chrome header set.
  */
 class WeCimaProvider : MainAPI() {
@@ -924,25 +933,48 @@ class WeCimaProvider : MainAPI() {
      * earnvids -> fastvid.cam/embed/...). EVERY server is resolved and
      * handed to the extractors — no first-hit stop (Mohamed's rule).
      */
+    /**
+     * Percent-encodes any non-ASCII characters of a URL string. The
+     * site's anchors carry RAW Arabic slugs (verified in its HTML:
+     * home/search/category/episode hrefs are 100% raw Arabic). okhttp
+     * percent-encodes a URL in the request line by itself, but a
+     * raw-Arabic string used as a HEADER value (referer) throws
+     * IllegalArgumentException before any request is sent — the true
+     * cause of the v9-v11 on-device "watch=err | werr=
+     * IllegalArgumentException". Every header-bound URL goes through
+     * this first.
+     */
+    private fun pctEncodeNonAscii(url: String): String {
+        if (url.all { it.code < 128 }) return url
+        val sb = StringBuilder()
+        for (ch in url) {
+            if (ch.code < 128) sb.append(ch)
+            else sb.append(java.net.URLEncoder.encode(ch.toString(), "UTF-8"))
+        }
+        return sb.toString()
+    }
+
     private suspend fun loadLinksMobile(
         data: String,
         diag: MutableList<String>,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val watchUrl = data.replace("/episode/", "/watch/").replace("/film/", "/watch/")
+        val safeData = pctEncodeNonAscii(data)
+        if (safeData != data) diag += "enc=1"
+        val watchUrl = safeData.replace("/episode/", "/watch/").replace("/film/", "/watch/")
         // The host is slow and the phone-side fetch can die at transport
         // level (v9 on-device: "watch=err" — the GET threw, no HTTP code
         // at all, while curl and the phone's browser get 200). Retry with
         // backoff and record the exception class so the DEBUG line names
         // the failure (timeout vs TLS vs DNS).
         var watchErr: String? = null
-        var res = runCatching { app.get(watchUrl, headers = browserHeaders, referer = data) }
+        var res = runCatching { app.get(watchUrl, headers = browserHeaders, referer = safeData) }
             .onFailure { watchErr = it.javaClass.simpleName }.getOrNull()
         for (attempt in 2..3) {
             if (res != null) break
             Thread.sleep(if (attempt == 2) 1500L else 4000L)
-            res = runCatching { app.get(watchUrl, headers = browserHeaders, referer = data) }
+            res = runCatching { app.get(watchUrl, headers = browserHeaders, referer = safeData) }
                 .onFailure { watchErr = it.javaClass.simpleName }.getOrNull()
             if (res != null) watchErr = null
         }

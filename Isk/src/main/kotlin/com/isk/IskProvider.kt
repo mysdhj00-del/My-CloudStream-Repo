@@ -220,6 +220,30 @@ class IskProvider : MainAPI() {
             newTvSeriesLoadResponse(
                 seriesTitle, url,
                 if (isAnimeTitle(title)) TvType.Anime else TvType.TvSeries,
+                episodes
+            ) {
+                this.posterUrl = poster
+                this.plot = plot
+            }
+        } else {
+            // A lone episode page with no sibling list: play it as a
+            // single-episode series entry pointing at itself.
+            val (s, e) = slugNumbers(url)
+            newTvSeriesLoadResponse(
+                seriesTitle, url,
+                if (isAnimeTitle(title)) TvType.Anime else TvType.TvSeries,
+                listOf(newEpisode(url) {
+                    this.name = e?.let { "الحلقة $it" } ?: title
+                    this.season = s ?: 1
+                    this.episode = e
+                })
+            ) {
+                this.posterUrl = poster
+                this.plot = plot
+            }
+        }
+    }
+
     // ---------- playback ----------
 
     /** Orders embed URLs: hosts the app's extractors know come first. */
@@ -461,27 +485,3 @@ class IskProvider : MainAPI() {
         }
     }
 }
-
-                episodes
-            ) {
-                this.posterUrl = poster
-                this.plot = plot
-            }
-        } else {
-            // A lone episode page with no sibling list: play it as a
-            // single-episode series entry pointing at itself.
-            val (s, e) = slugNumbers(url)
-            newTvSeriesLoadResponse(
-                seriesTitle, url,
-                if (isAnimeTitle(title)) TvType.Anime else TvType.TvSeries,
-                listOf(newEpisode(url) {
-                    this.name = e?.let { "الحلقة $it" } ?: title
-                    this.season = s ?: 1
-                    this.episode = e
-                })
-            ) {
-                this.posterUrl = poster
-                this.plot = plot
-            }
-        }
-    }

@@ -333,6 +333,37 @@ class WeCimaProvider : MainAPI() {
         }
     }
 
+    // Dean Edwards packer blocks: eval(function(p,a,c,k,e,d){...}('payload',
+    // radix, count, 'k1|k2|...'.split('|'))). Embed hosts on the tattoo side
+    // (Filelions/StreamWish family) hide their player config this way;
+    // unpacked, it carries a plain file:"..." URL. Added v7 as the final
+    // fallback of the scan below — the generalized AnimeZid lesson: never
+    // stop at an unexpanded intermediate player page.
+    private val packedRegex = Regex(
+        """eval\(function\(p,a,c,k,e,d\)\{.*?\}\('(.+?)',(\d+),(\d+),'(.+?)'\.split\('\|'\)""",
+        RegexOption.DOT_MATCHES_ALL
+    )
+
+    /** Unpacks every packed-JS block in the page; returns the plain texts. */
+    private fun unpackPackedJs(text: String): List<String> {
+        val out = mutableListOf<String>()
+        for (m in packedRegex.findAll(text)) {
+            val payload = m.groupValues[1]
+            val radix = m.groupValues[2].toIntOrNull() ?: continue
+            val count = m.groupValues[3].toIntOrNull() ?: continue
+            if (radix < 2 || radix > 36 || count <= 0 || count > 5000) continue
+            val keywords = m.groupValues[4].split("|")
+            val map = HashMap<String, String>()
+            for (i in 0 until count) {
+                val tok = i.toString(radix)
+                val kw = keywords.getOrNull(i)
+                map[tok] = if (kw.isNullOrEmpty()) tok else kw
+            }
+            out += Regex("""\b\w+\b""").replace(payload) { mr -> map[mr.value] ?: mr.value }
+        }
+        return out
+    }
+
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -522,9 +553,15 @@ class WeCimaProvider : MainAPI() {
                     found = true
                     break
                 }
-                val direct = Regex("""https?://[^\s"'<>]+\.m3u8[^\s"'<>]*""").find(pageText)?.value
+                val direct = Regex("""file\s*:\s*["'](https?://[^"']+)["']""").find(pageText.replace("\\/", "/"))?.groupValues?.get(1)
+                    ?: Regex("""https?://[^\s"'<>]+\.m3u8[^\s"'<>]*""").find(pageText)?.value
                     ?: Regex("""https?://[^\s"'<>]+/master\.txt[^\s"'<>]*""").find(pageText)?.value
                     ?: Regex("""https?://[^\s"'<>]+\.mp4[^\s"'<>]*""").find(pageText)?.value
+                    ?: unpackPackedJs(pageText).firstNotNullOfOrNull { unpacked ->
+                        Regex("""file\s*:\s*["'](https?://[^"']+)["']""").find(unpacked)?.groupValues?.get(1)
+                            ?: Regex("""https?://[^\s"'<>]+\.m3u8[^\s"'<>]*""").find(unpacked)?.value
+                            ?: Regex("""https?://[^\s"'<>]+\.mp4[^\s"'<>]*""").find(unpacked)?.value
+                    }
                 if (direct != null) {
                     callback(
                         newExtractorLink(

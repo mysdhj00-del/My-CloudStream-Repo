@@ -110,6 +110,11 @@ import org.jsoup.nodes.Element
  *   and tattoo stay as slug-mapped fallbacks for post pages, served by
  *   the WP chains below (gripe's akhbarworld shapes; tattoo activates
  *   only if its check ever lets the app through).
+ * - v10 (2026-10-16): WP-domain items (old history entries) whose slug
+ *   also exists on mobile are redirected to the mobile chain inside
+ *   loadLinks — a gripe entry for أحلى نصيب ep1 otherwise still runs
+ *   into the operator-dead Worker (p1/p2/p3=500) while the same episode
+ *   has 13 working servers on mobile.
  * - Every request carries an Android-Chrome header set.
  */
 class WeCimaProvider : MainAPI() {
@@ -471,6 +476,63 @@ class WeCimaProvider : MainAPI() {
         val diag = mutableListOf<String>()
         if (data.contains("wecima.mobile")) {
             return loadLinksMobile(data, diag, subtitleCallback, callback)
+        }
+        // A WordPress-domain item (an old gripe/tattoo entry, e.g. from
+        // the user's history) whose slug also exists on wecima.mobile is
+        // served by the MOBILE chain — its 13 standard servers instead of
+        // the WP domains' single proprietary player (whose stream Worker
+        // is operator-dead). Added in v10 after Mohamed's أحلى نصيب ep1
+        // screenshot: a history entry ran via=gripe into p1/p2/p3=500
+        // while the same episode sits on mobile with working servers.
+        val wpSlug = data.trimEnd('/').substringAfterLast("/")
+        if (wpSlug.isNotBlank() && !data.contains("wecima.mobile")) {
+            var twinFound: String? = null
+            for (kind in listOf("episode", "film")) {
+                val twin = "$mobileUrl/$kind/$wpSlug"
+                val twinText = runCatching {
+                    app.get(twin, headers = browserHeaders).text
+                }.getOrNull()
+                if (twinText != null && twinText.contains("/watch/")) {
+                    twinFound = twin
+                    break
+                }
+            }
+            if (twinFound == null && decode(wpSlug).contains("الحلقة")) {
+                // Ordinal spellings differ per post (الاولي vs الاولى —
+                // the exact twin 404s), so discover the same series +
+                // episode number through mobile search instead.
+                val decodedSlug = decode(wpSlug)
+                val stem = decodedSlug.substringBefore("-الحلقة").substringBefore("-الموسم")
+                val epNum = Regex("""الحلقة\s*-?\s*(\d{1,4})""").find(decodedSlug)
+                    ?.groupValues?.get(1)?.toIntOrNull()
+                val query = stem.removePrefix("مسلسل-").removePrefix("انمي-")
+                    .replace('-', ' ').trim()
+                val searchDoc = runCatching {
+                    app.get(
+                        "$mobileUrl/search?s=" + java.net.URLEncoder.encode(query, "UTF-8"),
+                        headers = browserHeaders
+                    ).document
+                }.getOrNull()
+                if (searchDoc != null) {
+                    for (a in searchDoc.select("a.show-card")) {
+                        val href = fixUrl(a.attr("href"))
+                        if (!href.startsWith(mobileUrl) || !href.contains("/episode/")) continue
+                        val dec = decode(href)
+                        val candStem = dec.substringAfter("/episode/")
+                            .substringBefore("-الحلقة").substringBefore("-الموسم")
+                        val candEp = Regex("""الحلقة\s*-?\s*(\d{1,4})""").find(dec)
+                            ?.groupValues?.get(1)?.toIntOrNull()
+                        if (candStem == stem && (epNum == null || candEp == epNum)) {
+                            twinFound = href
+                            break
+                        }
+                    }
+                }
+            }
+            if (twinFound != null) {
+                diag += "twin=hit"
+                return loadLinksMobile(twinFound, diag, subtitleCallback, callback)
+            }
         }
         val fetched = runCatching { fetchPage(data) }.getOrNull()
         diag += "page=${fetched?.code ?: "err"}"

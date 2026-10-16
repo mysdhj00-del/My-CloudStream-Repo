@@ -1,5 +1,5 @@
 // WeCima CloudStream plugin module.
-version = 15
+version = 16
 
 
 android {

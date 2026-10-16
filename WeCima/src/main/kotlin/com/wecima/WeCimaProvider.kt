@@ -144,6 +144,16 @@ import org.jsoup.nodes.Element
  *   followed each redirect and downloaded every embed page — the main
  *   cost), and a fully-failed round re-warms the watch session once.
  *   DEBUG gains p1ms= (phase-1 wall time) and fails= markers.
+ *   (Publish incident: the first v13 artifact silently shipped the v12
+ *   code — caught by the parent agent inspecting the live .cs3's dex
+ *   for the p1ms= marker; republished as v14 with the real code.)
+ * - v15 (2026-10-16, Mohamed: a film still took ~22 s to open): two
+ *   more cuts. (1) PREFETCH: opening a title page starts resolving its
+ *   servers on a background thread (raw okhttp; playCache, 10-min TTL)
+ *   so the play press goes straight to the extractors. (2) ORDER: the
+ *   extractor stage tries the usually-fastest hosts first (MixDrop,
+ *   Doodstream, Voe, StreamTape...) — a stable sort, every server is
+ *   still tried. DEBUG gains cache=hit.
  * - Every request carries an Android-Chrome header set.
  */
 class WeCimaProvider : MainAPI() {
@@ -797,6 +807,9 @@ class WeCimaProvider : MainAPI() {
     }
 
     private suspend fun loadMobile(url: String): LoadResponse {
+        // v15: start resolving this title's servers in the background
+        // NOW, so the play press finds them cached (see prefetchMobileAsync).
+        prefetchMobileAsync(url)
         val document = fetchPage(url).document
         val rawTitle = document.selectFirst("meta[property=\"og:title\"]")?.attr("content")
             ?: document.title()
@@ -1041,6 +1054,112 @@ class WeCimaProvider : MainAPI() {
         return sb.toString()
     }
 
+    private companion object {
+        /** Post URL -> (fetch time, resolved embed URLs). Filled by a
+         * background prefetch when a title page opens, so the play press
+         * skips the watch + resolve phases entirely (v15). */
+        val playCache =
+            java.util.concurrent.ConcurrentHashMap<String, Pair<Long, List<String>>>()
+    }
+
+    /**
+     * Phase 1 of the mobile protocol on a 5-thread pool (raw okhttp;
+     * NiceHttp is suspend-only and cannot run on pool threads):
+     * resolves servers 0..count-1 to embed URLs, in server order.
+     */
+    private fun phase1Mobile(
+        count: Int,
+        key: String,
+        csrf: String,
+        cookieHeader: String,
+        watchUrl: String,
+        diag: MutableList<String>
+    ): List<Pair<Int, String>> {
+        val hits = java.util.Collections.synchronizedList(mutableListOf<Pair<Int, String>>())
+        val fails = java.util.Collections.synchronizedList(mutableListOf<Int>())
+        val pool = java.util.concurrent.Executors.newFixedThreadPool(5)
+        val latch = java.util.concurrent.CountDownLatch(count)
+        val t0 = System.currentTimeMillis()
+        for (index in 0 until count) {
+            pool.execute {
+                try {
+                    val embed = resolveOneMobile(index, key, csrf, cookieHeader, watchUrl)
+                    if (embed != null) hits += index to embed else fails += index
+                } catch (e: Exception) {
+                    fails += index
+                } finally {
+                    latch.countDown()
+                }
+            }
+        }
+        latch.await(90, java.util.concurrent.TimeUnit.SECONDS)
+        pool.shutdown()
+        diag += "p1ms=${System.currentTimeMillis() - t0}"
+        if (fails.isNotEmpty()) diag += "fails=${fails.sorted()}"
+        return hits.sortedBy { it.first }
+    }
+
+    /** Extractor hosts that usually resolve in one fast fetch go first;
+     * the rest keep the site's order (the sort is stable). */
+    private fun hostPriority(url: String): Int {
+        val h = url.lowercase()
+        return when {
+            h.contains("mixdrop") || h.contains("m1xdrop") -> 0
+            h.contains("doodstream") || h.contains("d0o0d") || h.contains("dood") -> 1
+            h.contains("voe.sx") || h.contains("voe") -> 2
+            h.contains("streamtape") -> 3
+            h.contains("uqload") -> 4
+            h.contains("mp4upload") -> 5
+            h.contains("streamwish") || h.contains("hgcloud") -> 6
+            h.contains("filemoon") || h.contains("byse") -> 7
+            else -> 10
+        }
+    }
+
+    /**
+     * Background prefetch (v15): when a title page opens, resolve its
+     * servers on a plain thread (raw okhttp only — no suspend calls) and
+     * cache the embeds, so the play press goes straight to extractors.
+     * Mohamed's report: even a film took ~22 s to open, most of it the
+     * watch + resolve phases running AFTER the play press.
+     */
+    private fun prefetchMobileAsync(url: String) {
+        Thread {
+            runCatching {
+                val safe = pctEncodeNonAscii(url)
+                val watchUrl = safe.replace("/episode/", "/watch/").replace("/film/", "/watch/")
+                val ua = browserHeaders["User-Agent"] ?: "Mozilla/5.0"
+                val req = okhttp3.Request.Builder().url(watchUrl)
+                    .header("User-Agent", ua)
+                    .header("Referer", safe)
+                    .build()
+                val session = rawClient.newCall(req).execute().use { resp ->
+                    val cookies = resp.headers("Set-Cookie").mapNotNull { sc ->
+                        val nv = sc.substringBefore(";").trim()
+                        if (nv.contains("=")) nv else null
+                    }
+                    (resp.body?.string() ?: "") to cookies.joinToString("; ")
+                }
+                val text = session.first
+                if (text.isBlank()) return@runCatching
+                val key = Regex("""watchResolveKey\s*=\s*"([^"]+)"""").find(text)
+                    ?.groupValues?.get(1) ?: return@runCatching
+                val csrf = Regex("""csrfToken\s*=\s*"([^"]+)"""").find(text)
+                    ?.groupValues?.get(1) ?: return@runCatching
+                val serversJson = Regex("""const servers = (\[.*?\]);""", RegexOption.DOT_MATCHES_ALL)
+                    .find(text)?.groupValues?.get(1) ?: return@runCatching
+                val count = runCatching { org.json.JSONArray(serversJson).length() }
+                    .getOrDefault(0)
+                if (count == 0) return@runCatching
+                val sink = mutableListOf<String>()
+                val hits = phase1Mobile(count, key, csrf, session.second, watchUrl, sink)
+                if (hits.isNotEmpty()) {
+                    playCache[url] = System.currentTimeMillis() to hits.map { it.second }
+                }
+            }
+        }.start()
+    }
+
     private suspend fun loadLinksMobile(
         data: String,
         diag: MutableList<String>,
@@ -1050,113 +1169,95 @@ class WeCimaProvider : MainAPI() {
         val safeData = pctEncodeNonAscii(data)
         if (safeData != data) diag += "enc=1"
         val watchUrl = safeData.replace("/episode/", "/watch/").replace("/film/", "/watch/")
-        // The host is slow and the phone-side fetch can die at transport
-        // level (v9 on-device: "watch=err" — the GET threw, no HTTP code
-        // at all, while curl and the phone's browser get 200). Retry with
-        // backoff and record the exception class so the DEBUG line names
-        // the failure (timeout vs TLS vs DNS).
-        var watchErr: String? = null
-        var res = runCatching { app.get(watchUrl, headers = browserHeaders, referer = safeData) }
-            .onFailure { watchErr = it.javaClass.simpleName }.getOrNull()
-        for (attempt in 2..3) {
-            if (res != null) break
-            Thread.sleep(if (attempt == 2) 1500L else 4000L)
-            res = runCatching { app.get(watchUrl, headers = browserHeaders, referer = safeData) }
-                .onFailure { watchErr = it.javaClass.simpleName }.getOrNull()
-            if (res != null) watchErr = null
-        }
-        diag += "watch=${res?.code ?: "err"}"
-        if (watchErr != null) diag += "werr=$watchErr"
-        if (res == null) {
-            emitDebug(diag, callback)
-            return true
-        }
-        val cookies = runCatching { res.cookies }.getOrNull().orEmpty()
-        val text = res.text
-        val key = Regex("""watchResolveKey\s*=\s*"([^"]+)"""").find(text)?.groupValues?.get(1)
-        val csrf = Regex("""csrfToken\s*=\s*"([^"]+)"""").find(text)?.groupValues?.get(1)
-        val serversJson = Regex("""const servers = (\[.*?\]);""", RegexOption.DOT_MATCHES_ALL)
-            .find(text)?.groupValues?.get(1)
-        val servers = mutableListOf<String>()
-        if (serversJson != null) {
-            val arr = runCatching { org.json.JSONArray(serversJson) }.getOrNull()
-            if (arr != null) {
-                for (i in 0 until arr.length()) {
-                    servers += arr.optJSONObject(i)?.optString("name") ?: "server$i"
-                }
-            }
-        }
-        diag += "servers=${servers.size}"
-        if (key == null || csrf == null || servers.isEmpty()) {
-            emitDebug(diag, callback)
-            return true
-        }
 
-        // Phase 1, parallel (v13 speed pass; timings measured live on a
-        // warm session: watch ~2.3 s, each resolve POST 0.3-0.8 s, each
-        // fragment ~0.3 s when redirects are NOT followed). v12 ran this
-        // loop strictly sequentially AND followed every fragment
-        // redirect, downloading all ~14 embed pages one by one — the
-        // on-device slowness Mohamed reported ("ياخذ وقت"). Now: raw
-        // okhttp calls resolve all servers on a 5-thread pool, fragments
-        // are read without following redirects (the Location header IS
-        // the embed), and a fully-failed round re-warms the watch
-        // session once (a stale session answers ok:false "expired").
-        val cookieHeader = cookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
-        fun phase1(k: String, c: String, ck: String): List<Pair<Int, String>> {
-            val hits = java.util.Collections.synchronizedList(mutableListOf<Pair<Int, String>>())
-            val fails = java.util.Collections.synchronizedList(mutableListOf<Int>())
-            val pool = java.util.concurrent.Executors.newFixedThreadPool(5)
-            val latch = java.util.concurrent.CountDownLatch(servers.size)
-            val t0 = System.currentTimeMillis()
-            for (index in servers.indices) {
-                pool.execute {
-                    try {
-                        val embed = resolveOneMobile(index, k, c, ck, watchUrl)
-                        if (embed != null) hits += index to embed else fails += index
-                    } catch (e: Exception) {
-                        fails += index
-                    } finally {
-                        latch.countDown()
+        // v15: a background prefetch at page-open time may already hold
+        // this title's embeds — then the play press skips everything
+        // below and goes straight to the extractors.
+        var embeds: List<String>? = null
+        val cached = playCache[data]
+        if (cached != null && System.currentTimeMillis() - cached.first < 10 * 60 * 1000L) {
+            diag += "cache=hit"
+            embeds = cached.second
+        }
+        if (embeds == null) {
+            // The host is slow and the phone-side fetch can die at
+            // transport level (v9 on-device: "watch=err"). Retry with
+            // backoff; the exception class goes to the DEBUG line.
+            var watchErr: String? = null
+            var res = runCatching { app.get(watchUrl, headers = browserHeaders, referer = safeData) }
+                .onFailure { watchErr = it.javaClass.simpleName }.getOrNull()
+            for (attempt in 2..3) {
+                if (res != null) break
+                Thread.sleep(if (attempt == 2) 1500L else 4000L)
+                res = runCatching { app.get(watchUrl, headers = browserHeaders, referer = safeData) }
+                    .onFailure { watchErr = it.javaClass.simpleName }.getOrNull()
+                if (res != null) watchErr = null
+            }
+            diag += "watch=${res?.code ?: "err"}"
+            if (watchErr != null) diag += "werr=$watchErr"
+            if (res == null) {
+                emitDebug(diag, callback)
+                return true
+            }
+            val cookies = runCatching { res.cookies }.getOrNull().orEmpty()
+            val text = res.text
+            val key = Regex("""watchResolveKey\s*=\s*"([^"]+)"""").find(text)?.groupValues?.get(1)
+            val csrf = Regex("""csrfToken\s*=\s*"([^"]+)"""").find(text)?.groupValues?.get(1)
+            val serversJson = Regex("""const servers = (\[.*?\]);""", RegexOption.DOT_MATCHES_ALL)
+                .find(text)?.groupValues?.get(1)
+            val servers = mutableListOf<String>()
+            if (serversJson != null) {
+                val arr = runCatching { org.json.JSONArray(serversJson) }.getOrNull()
+                if (arr != null) {
+                    for (i in 0 until arr.length()) {
+                        servers += arr.optJSONObject(i)?.optString("name") ?: "server$i"
                     }
                 }
             }
-            latch.await(90, java.util.concurrent.TimeUnit.SECONDS)
-            pool.shutdown()
-            diag += "p1ms=${System.currentTimeMillis() - t0}"
-            if (fails.isNotEmpty()) diag += "fails=${fails.sorted()}"
-            return hits.sortedBy { it.first }
+            diag += "servers=${servers.size}"
+            if (key == null || csrf == null || servers.isEmpty()) {
+                emitDebug(diag, callback)
+                return true
+            }
+            val cookieHeader = cookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
+            var hits = phase1Mobile(servers.size, key, csrf, cookieHeader, watchUrl, diag)
+            if (hits.isEmpty()) {
+                // Re-warm once: fresh watch page -> fresh session.
+                diag += "rewarm=1"
+                val res2 = runCatching {
+                    app.get(watchUrl, headers = browserHeaders, referer = safeData)
+                }.getOrNull()
+                val text2 = res2?.let { runCatching { it.text }.getOrNull() }
+                val key2 = text2?.let {
+                    Regex("""watchResolveKey\s*=\s*"([^"]+)"""").find(it)?.groupValues?.get(1)
+                }
+                val csrf2 = text2?.let {
+                    Regex("""csrfToken\s*=\s*"([^"]+)"""").find(it)?.groupValues?.get(1)
+                }
+                val cookies2 = res2?.let { runCatching { it.cookies }.getOrNull() }.orEmpty()
+                if (key2 != null && csrf2 != null) {
+                    hits = phase1Mobile(
+                        servers.size, key2, csrf2,
+                        cookies2.entries.joinToString("; ") { e -> "${e.key}=${e.value}" },
+                        watchUrl, diag
+                    )
+                }
+            }
+            val set = LinkedHashSet<String>()
+            hits.forEach { set += it.second }
+            diag += "resolved=${hits.size}"
+            diag += "embeds=${set.size}"
+            embeds = set.toList()
+            if (embeds.isNotEmpty()) {
+                playCache[data] = System.currentTimeMillis() to embeds
+            }
         }
-        var hits = phase1(key, csrf, cookieHeader)
-        if (hits.isEmpty()) {
-            // Re-warm once: fresh watch page -> fresh key/csrf/cookies.
-            diag += "rewarm=1"
-            val res2 = runCatching {
-                app.get(watchUrl, headers = browserHeaders, referer = safeData)
-            }.getOrNull()
-            val text2 = res2?.let { runCatching { it.text }.getOrNull() }
-            val key2 = text2?.let {
-                Regex("""watchResolveKey\s*=\s*"([^"]+)"""").find(it)?.groupValues?.get(1)
-            }
-            val csrf2 = text2?.let {
-                Regex("""csrfToken\s*=\s*"([^"]+)"""").find(it)?.groupValues?.get(1)
-            }
-            val cookies2 = res2?.let { runCatching { it.cookies }.getOrNull() }.orEmpty()
-            if (key2 != null && csrf2 != null) {
-                hits = phase1(
-                    key2, csrf2,
-                    cookies2.entries.joinToString("; ") { e -> "${e.key}=${e.value}" }
-                )
-            }
-        }
-        val embeds = LinkedHashSet<String>()
-        hits.forEach { embeds += it.second }
-        diag += "resolved=${hits.size}"
-        diag += "embeds=${embeds.size}"
 
+        // Fastest extractor hosts first; every server is still tried.
+        val ordered = embeds.sortedBy { hostPriority(it) }
         var found = false
         val unresolved = mutableListOf<String>()
-        for (embed in embeds) {
+        for (embed in ordered) {
             if (loadExtractor(embed, watchUrl, subtitleCallback, callback)) {
                 found = true
             } else {

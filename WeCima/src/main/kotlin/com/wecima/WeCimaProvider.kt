@@ -161,6 +161,16 @@ import org.jsoup.nodes.Element
  *   HTTP code / document length / serving host, so the row reports
  *   what the phone actually received; search does the same. Nothing
  *   changes when fetches succeed.
+ * - v17 (2026-10-16): the DEBUG card spoke — code=403 in EVERY row:
+ *   the site now refuses the app's catalog fetches from the user's IP
+ *   (his browser and the sandbox still get 200; playback had worked
+ *   at 12:09 and the block appeared after an hour of heavy test
+ *   traffic, v15's prefetch storms included — volume is the prime
+ *   suspect). Quiet-mode response: the prefetch call is REMOVED,
+ *   getMainPage fetches exactly once per section, and fetchPage now
+ *   carries per-host session cookies across requests (browser-like
+ *   continuity). The DEBUG card stays — it will show the code
+ *   recovering (403 -> 200) if/when the block cools down.
  * - Every request carries an Android-Chrome header set.
  */
 class WeCimaProvider : MainAPI() {
@@ -196,6 +206,11 @@ class WeCimaProvider : MainAPI() {
 
     private class Fetched(val document: Document, val code: Int, val host: String)
 
+    /** Per-host session cookies, carried across fetches (v17): the
+     * site's filter appears to favor requests with session continuity
+     * (a browser always has it; stateless one-shot requests get 403). */
+    private val hostCookies = mutableMapOf<String, Map<String, String>>()
+
     private suspend fun fetchPage(url: String): Fetched {
         // Candidate chain across the operator's three domains: a mobile
         // post maps to the same slug on the two WordPress domains; a WP
@@ -219,8 +234,12 @@ class WeCimaProvider : MainAPI() {
                 candidate.startsWith(altUrl) -> altUrl
                 else -> mainUrl
             }
-            val res = runCatching { app.get(candidate, headers = browserHeaders) }.getOrNull()
-                ?: continue
+            val res = runCatching {
+                app.get(candidate, headers = browserHeaders, cookies = hostCookies[host].orEmpty())
+            }.getOrNull() ?: continue
+            runCatching { res.cookies }.getOrNull()?.takeIf { it.isNotEmpty() }?.let {
+                hostCookies[host] = it
+            }
             val doc = runCatching { res.document }.getOrNull() ?: continue
             val html = runCatching { doc.html() }.getOrDefault("")
             val real = res.code == 200 && html.length > 20000 &&
@@ -406,15 +425,10 @@ class WeCimaProvider : MainAPI() {
         // (verified on the home page and category archives).
         val base = request.data.trimEnd('/')
         val url = if (page <= 1) base else "$base?page=$page"
-        var fetched = fetchPage(url)
+        // v17: exactly ONE fetch per section — no retry (request
+        // volume discipline; the site rate-blocks, see the v17 note).
+        val fetched = fetchPage(url)
         var items = fetched.document.parseCards()
-        if (items.isEmpty()) {
-            // One retry (transient carrier/host failures render as an
-            // empty row in the app, with no error shown).
-            Thread.sleep(1500)
-            fetched = fetchPage(url)
-            items = fetched.document.parseCards()
-        }
         var isDebug = false
         if (items.isEmpty()) {
             // v16: surface WHAT the app received as a visible card, so
@@ -841,9 +855,9 @@ class WeCimaProvider : MainAPI() {
     }
 
     private suspend fun loadMobile(url: String): LoadResponse {
-        // v15: start resolving this title's servers in the background
-        // NOW, so the play press finds them cached (see prefetchMobileAsync).
-        prefetchMobileAsync(url)
+        // (v17: the v15 background prefetch call was REMOVED — its
+        // request volume from the user's IP is the prime suspect for
+        // the site's 403 rate-block of the app; see the v17 note.)
         val document = fetchPage(url).document
         val rawTitle = document.selectFirst("meta[property=\"og:title\"]")?.attr("content")
             ?: document.title()

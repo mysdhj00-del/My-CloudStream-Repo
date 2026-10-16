@@ -187,6 +187,14 @@ import org.jsoup.nodes.Element
  *   to post URLs only (a tapped DEBUG card had produced a junk title
  *   page named "https://wecima.mobile"). Poster image loads are the
  *   app's own and cannot be paced from here.
+ * - v20 (2026-10-16): Mohamed's correction stands — "not my
+ *   connection; the catalog disappeared after you sped up playback":
+ *   the fault is this provider's request volume (the v15 prefetch
+ *   storm first of all), not his line. v20 therefore adds in-process
+ *   response caching on top of the pacing: sections cached 30 min,
+ *   post pages 10 min, only real 200 pages cached — repeat opens
+ *   issue ZERO requests, so a flagged address can cool while the app
+ *   keeps showing content.
  * - Every request carries an Android-Chrome header set.
  */
 class WeCimaProvider : MainAPI() {
@@ -228,6 +236,15 @@ class WeCimaProvider : MainAPI() {
     private val hostCookies = mutableMapOf<String, Map<String, String>>()
 
     private suspend fun fetchPage(url: String): Fetched {
+        // v20: post pages come from the 10-min cache when fresh (see
+        // the sectionCache note in the companion).
+        val isPostPage = url.contains("/film/") || url.contains("/episode/")
+        if (isPostPage) {
+            val hit = pageCache[url]
+            if (hit != null && System.currentTimeMillis() - hit.first < 10 * 60 * 1000L) {
+                return hit.second
+            }
+        }
         // Candidate chain across the operator's three domains: a mobile
         // post maps to the same slug on the two WordPress domains; a WP
         // post swaps between the WP hosts; anything else is fetched as-is.
@@ -262,7 +279,10 @@ class WeCimaProvider : MainAPI() {
             val real = res.code == 200 && html.length > 20000 &&
                 !html.contains("Just a moment")
             val fetched = Fetched(doc, res.code, host)
-            if (real) return fetched
+            if (real) {
+                if (isPostPage) pageCache[url] = System.currentTimeMillis() to fetched
+                return fetched
+            }
             if (firstBad == null) firstBad = fetched
         }
         if (firstBad != null) return firstBad
@@ -442,6 +462,13 @@ class WeCimaProvider : MainAPI() {
         // (verified on the home page and category archives).
         val base = request.data.trimEnd('/')
         val url = if (page <= 1) base else "$base?page=$page"
+        // v20: a fresh cached section is served with NO request at all.
+        val cachedSec = sectionCache[url]
+        if (cachedSec != null &&
+            System.currentTimeMillis() - cachedSec.first < 30 * 60 * 1000L
+        ) {
+            return newHomePageResponse(request.name, cachedSec.second, hasNext = cachedSec.third)
+        }
         // v17: exactly ONE fetch per section — no retry (request
         // volume discipline; the site rate-blocks, see the v17 note).
         val fetched = fetchPage(url)
@@ -461,7 +488,11 @@ class WeCimaProvider : MainAPI() {
             )
             isDebug = true
         }
-        return newHomePageResponse(request.name, items, hasNext = !isDebug && items.isNotEmpty())
+        val hasNext = !isDebug && items.isNotEmpty()
+        if (!isDebug) {
+            sectionCache[url] = Triple(System.currentTimeMillis(), items, hasNext)
+        }
+        return newHomePageResponse(request.name, items, hasNext = hasNext)
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
@@ -1165,6 +1196,18 @@ class WeCimaProvider : MainAPI() {
                 lastReqAt = System.currentTimeMillis()
             }
         }
+
+        /** v20 response caches (in-process): Mohamed's correction —
+         * the catalog died right after the v15 speed work, i.e. the
+         * problem is OUR request volume, not his connection. So the
+         * provider stops re-asking the site for what it already has:
+         * sections are served from cache for 30 min and post pages
+         * for 10 min; repeat opens cost ZERO requests while a block
+         * cools down. Only successful REAL pages are cached. */
+        val sectionCache =
+            java.util.concurrent.ConcurrentHashMap<String, Triple<Long, List<SearchResponse>, Boolean>>()
+        val pageCache =
+            java.util.concurrent.ConcurrentHashMap<String, Pair<Long, Fetched>>()
     }
 
     /**

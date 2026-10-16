@@ -171,6 +171,13 @@ import org.jsoup.nodes.Element
  *   carries per-host session cookies across requests (browser-like
  *   continuity). The DEBUG card stays — it will show the code
  *   recovering (403 -> 200) if/when the block cools down.
+ * - The block LIFTED (2026-10-16 13:11: full poster catalog on-device).
+ * - v18 (2026-10-16): a film tap at 13:10 (the cooldown's tail) still
+ *   died with "No title" — the post-page fetch came back stripped
+ *   while the page itself is complete (verified from the sandbox:
+ *   og:title present). loadMobile now retries ONCE after 2 s when the
+ *   title is blank, falls back to a slug-derived title, and falls back
+ *   to the first <img> for the poster.
  * - Every request carries an Android-Chrome header set.
  */
 class WeCimaProvider : MainAPI() {
@@ -858,12 +865,28 @@ class WeCimaProvider : MainAPI() {
         // (v17: the v15 background prefetch call was REMOVED — its
         // request volume from the user's IP is the prime suspect for
         // the site's 403 rate-block of the app; see the v17 note.)
-        val document = fetchPage(url).document
-        val rawTitle = document.selectFirst("meta[property=\"og:title\"]")?.attr("content")
+        var document = fetchPage(url).document
+        var rawTitle = document.selectFirst("meta[property=\"og:title\"]")?.attr("content")
             ?: document.title()
-        val title = cleanTitle(rawTitle)
+        if (cleanTitle(rawTitle).isBlank()) {
+            // A stripped/blocked fetch (e.g. the tail of the site's 403
+            // cooldown — Mohamed's White Dragon tap at 13:10 errored
+            // "No title" while the catalog already worked at 13:11 and
+            // the page itself is complete). ONE quiet retry, then a
+            // slug-derived title as the last resort — never a dead end.
+            Thread.sleep(2000)
+            document = fetchPage(url).document
+            rawTitle = document.selectFirst("meta[property=\"og:title\"]")?.attr("content")
+                ?: document.title()
+        }
+        val title = cleanTitle(rawTitle).ifBlank {
+            decode(url).substringAfter("/film/").substringAfter("/episode/")
+                .trimEnd('/').removePrefix("فيلم-").removePrefix("مسلسل-")
+                .replace('-', ' ').trim()
+        }
         if (title.isBlank()) throw ErrorLoadingException("No title")
         val poster = fixUrlNull(document.selectFirst("meta[property=\"og:image\"]")?.attr("content"))
+            ?: fixUrlNull(document.selectFirst("img")?.attr("src"))
         val plot = document.selectFirst("meta[name=\"description\"]")?.attr("content")
             ?.trim()?.ifBlank { null }
         val decoded = decode(url)

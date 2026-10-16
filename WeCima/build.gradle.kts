@@ -1,11 +1,9 @@
 // WeCima CloudStream plugin module.
-version = 20
-
+version = 21
 
 android {
     namespace = "com.wecima"
 }
-
 
 cloudstream {
     description = "WeCima - Arabic dubbed/subtitled movies, series and anime"

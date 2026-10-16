@@ -115,6 +115,16 @@ import org.jsoup.nodes.Element
  *   loadLinks — a gripe entry for أحلى نصيب ep1 otherwise still runs
  *   into the operator-dead Worker (p1/p2/p3=500) while the same episode
  *   has 13 working servers on mobile.
+ * - v11 (2026-10-16): the mobile chain RAN on-device but its watch-page
+ *   GET threw at transport level ("watch=err": no HTTP code, while curl
+ *   and the phone's own browser get 200 — the host is slow: a 17 s page
+ *   load was timed from the sandbox). A server-side relay is NOT an
+ *   escape here: the operator 403s Render's fetches of wecima.mobile
+ *   too (verified live via /relay/wecima: diag watch=403), the same
+ *   block it gives Render for akhbarworld. So v11 hardens the local
+ *   chain: the watch GET retries 3x with backoff, each resolve POST
+ *   retries once, and the DEBUG line records the exception class
+ *   (werr=) so a failure names itself (timeout vs TLS vs DNS).
  * - Every request carries an Android-Chrome header set.
  */
 class WeCimaProvider : MainAPI() {
@@ -921,8 +931,23 @@ class WeCimaProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val watchUrl = data.replace("/episode/", "/watch/").replace("/film/", "/watch/")
-        val res = runCatching { app.get(watchUrl, headers = browserHeaders, referer = data) }.getOrNull()
+        // The host is slow and the phone-side fetch can die at transport
+        // level (v9 on-device: "watch=err" — the GET threw, no HTTP code
+        // at all, while curl and the phone's browser get 200). Retry with
+        // backoff and record the exception class so the DEBUG line names
+        // the failure (timeout vs TLS vs DNS).
+        var watchErr: String? = null
+        var res = runCatching { app.get(watchUrl, headers = browserHeaders, referer = data) }
+            .onFailure { watchErr = it.javaClass.simpleName }.getOrNull()
+        for (attempt in 2..3) {
+            if (res != null) break
+            Thread.sleep(if (attempt == 2) 1500L else 4000L)
+            res = runCatching { app.get(watchUrl, headers = browserHeaders, referer = data) }
+                .onFailure { watchErr = it.javaClass.simpleName }.getOrNull()
+            if (res != null) watchErr = null
+        }
         diag += "watch=${res?.code ?: "err"}"
+        if (watchErr != null) diag += "werr=$watchErr"
         if (res == null) {
             emitDebug(diag, callback)
             return true
@@ -958,7 +983,7 @@ class WeCimaProvider : MainAPI() {
         var resolved = 0
         for (index in servers.indices) {
             val body = JSONObject().put("key", key).put("index", index).toString()
-            val rText = runCatching {
+            var rText = runCatching {
                 app.post(
                     "$mobileUrl/watch/resolve",
                     headers = postHeaders,
@@ -967,6 +992,19 @@ class WeCimaProvider : MainAPI() {
                     requestBody = body.toRequestBody(jsonType)
                 ).text
             }.getOrNull()
+            if (rText == null) {
+                // One retry: the host is slow (see the watch GET note).
+                Thread.sleep(1500)
+                rText = runCatching {
+                    app.post(
+                        "$mobileUrl/watch/resolve",
+                        headers = postHeaders,
+                        cookies = cookies,
+                        referer = watchUrl,
+                        requestBody = body.toRequestBody(jsonType)
+                    ).text
+                }.getOrNull()
+            }
             val frag = rText?.let { runCatching { JSONObject(it) }.getOrNull() }
                 ?.takeIf { it.optBoolean("ok") }?.optString("url")?.takeIf { it.isNotBlank() }
             if (frag == null) {

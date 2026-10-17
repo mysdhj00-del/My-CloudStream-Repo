@@ -323,20 +323,18 @@ class AnimeZidProvider : MainAPI() {
         val extracted = HashSet<String>()
         val seenDig = HashSet<String>()
         if (finals != null) {
-            // v8 SPEED (v7 on-device: still slow). Diagnosis from the
-            // numbers: the relay answers in ~4.5-7 s with all 29 finals;
-            // the swamp was this pass walking them SEQUENTIALLY - every
-            // dead host cost its own slow failed fetch, one after another.
-            // v8 runs the extractor attempts in PARALLEL WINDOWS
-            // (CloudStream amap, 6 at a time): the wait collapses from
-            // the SUM of the failures to roughly the slowest single host
-            // in the window. Ordering discipline from v7 is kept (dead
-            // classes demoted to the tail, MegaMax player page skipped -
-            // the relay already expanded it), the dig stage still runs
-            // phone-side for the proven diggable hosts (their tokens are
-            // IP-bound to the fetching device), and the whole pass keeps
-            // a hard budget: stop at 6 emitted links, at 10 s once
-            // anything playable exists, 18 s absolute.
+            // v9 (Mohamed's order 2026-10-17, after v8 still felt slow):
+            // start DIRECTLY with Doodstream - on his device it is the
+            // only host class that actually plays; everything else just
+            // eats time. Phase 1 therefore tries ONLY the Doodstream
+            // finals (the embedded playmogo page plus the MegaMax
+            // doodstream.com mirrors) in one small parallel window, and
+            // the moment one of them emits, the pass is DONE - playback
+            // can start. Phase 2 (the v8 parallel windows over every
+            // remaining class, then the phone-side dig stage) runs ONLY
+            // when Doodstream produced nothing; the rest are the tail,
+            // exactly as he asked. Budgets unchanged from v8: stop at 6
+            // emitted, 10 s once anything playable exists, 18 s absolute.
             val passStart = System.currentTimeMillis()
             val emitted = java.util.concurrent.atomic.AtomicInteger(0)
             val parFound = java.util.concurrent.atomic.AtomicBoolean(false)
@@ -353,14 +351,12 @@ class AnimeZidProvider : MainAPI() {
                 rawFinals.filter { u -> demotedHosts.any { u.contains(it) } }
             val failed = java.util.Collections.synchronizedList(mutableListOf<String>())
             val parExtracted = java.util.Collections.synchronizedSet(HashSet<String>())
-            var idx = 0
-            while (idx < orderedFinals.size) {
-                val elapsed = System.currentTimeMillis() - passStart
-                if (emitted.get() >= 6) break
-                if (emitted.get() > 0 && elapsed > 10_000) { diag += "pass:deadline"; break }
-                if (emitted.get() == 0 && elapsed > 18_000) { diag += "pass:deadline0"; break }
-                val window = orderedFinals.subList(idx, minOf(idx + 6, orderedFinals.size))
-                window.amap { url ->
+            fun isDood(u: String): Boolean =
+                u.contains("playmogo") || u.contains("doodstream") || u.contains("dood.")
+            val dsFinals = orderedFinals.filter { isDood(it) }
+            val restFinals = orderedFinals.filter { !isDood(it) }
+            suspend fun tryParallel(urls: List<String>) {
+                urls.amap { url ->
                     if (loadExtractor(url, referer, subtitleCallback, counting)) {
                         parFound.set(true)
                         parExtracted += url
@@ -368,27 +364,50 @@ class AnimeZidProvider : MainAPI() {
                         failed += url
                     }
                 }
-                idx += window.size
             }
-            if (parFound.get()) found = true
-            extracted += parExtracted
-            // Dig stage: sequential by design (each dig is a full page
-            // fetch + unpack), only for finals the parallel pass could
-            // not open, only while short on links and inside budget.
-            for (url in failed) {
-                if (dug >= 3 || emitted.get() >= 5) break
-                if (System.currentTimeMillis() - passStart > 12_000) break
-                val diggable = url.contains("uqload.") || url.contains("lulustream") ||
-                    url.contains("streamtape") || url.contains("vidhide")
-                if (!diggable) continue
-                val key = if (url.contains("uqload.", ignoreCase = true)) {
-                    "uqload/" + url.substringAfter("://").substringAfter("/", "")
-                } else url
-                if (!seenDig.add(key)) continue
-                if (key.startsWith("uqload/") &&
-                    extracted.any { it.contains("uqload.", ignoreCase = true) }
-                ) continue
-                if (digEmbed(url, referer, counting, diag)) dug++
+            // Phase 1: Doodstream only, in parallel.
+            if (dsFinals.isNotEmpty()) {
+                tryParallel(dsFinals)
+                diag += if (emitted.get() > 0) "ds=hit" else "ds:miss"
+            } else {
+                diag += "ds:none"
+            }
+            // Phase 2: everything else, only if Doodstream gave nothing.
+            if (emitted.get() == 0) {
+                var idx = 0
+                while (idx < restFinals.size) {
+                    val elapsed = System.currentTimeMillis() - passStart
+                    if (emitted.get() >= 6) break
+                    if (emitted.get() > 0 && elapsed > 10_000) { diag += "pass:deadline"; break }
+                    if (emitted.get() == 0 && elapsed > 18_000) { diag += "pass:deadline0"; break }
+                    val window = restFinals.subList(idx, minOf(idx + 6, restFinals.size))
+                    tryParallel(window)
+                    idx += window.size
+                }
+                if (parFound.get()) found = true
+                extracted += parExtracted
+                // Dig stage: sequential by design (each dig is a full
+                // page fetch + unpack), only for finals the parallel
+                // pass could not open, while short on links and inside
+                // budget.
+                for (url in failed) {
+                    if (dug >= 3 || emitted.get() >= 5) break
+                    if (System.currentTimeMillis() - passStart > 12_000) break
+                    val diggable = url.contains("uqload.") || url.contains("lulustream") ||
+                        url.contains("streamtape") || url.contains("vidhide")
+                    if (!diggable) continue
+                    val key = if (url.contains("uqload.", ignoreCase = true)) {
+                        "uqload/" + url.substringAfter("://").substringAfter("/", "")
+                    } else url
+                    if (!seenDig.add(key)) continue
+                    if (key.startsWith("uqload/") &&
+                        extracted.any { it.contains("uqload.", ignoreCase = true) }
+                    ) continue
+                    if (digEmbed(url, referer, counting, diag)) dug++
+                }
+            } else {
+                if (parFound.get()) found = true
+                extracted += parExtracted
             }
             diag += "pass:par"
             diag += "pass=" + ((System.currentTimeMillis() - passStart) / 1000) + "s"

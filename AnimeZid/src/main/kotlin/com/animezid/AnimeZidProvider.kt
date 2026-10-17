@@ -9,6 +9,7 @@ import com.lagradost.cloudstream3.MainPageRequest
 import com.lagradost.cloudstream3.SearchResponse
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.TvType
+import com.lagradost.cloudstream3.amap
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.fixUrl
 import com.lagradost.cloudstream3.fixUrlNull
@@ -322,46 +323,64 @@ class AnimeZidProvider : MainAPI() {
         val extracted = HashSet<String>()
         val seenDig = HashSet<String>()
         if (finals != null) {
-            // v7 SPEED (v6 measured on-device: still 20 s+). The relay is
-            // warm and answers in ~5 s; the swamp is this pass on the
-            // phone's own network: after the first wave, the mirror tail
-            // (mp4upload/ds2play/rpmhub/byse/streamtape classes — dead or
-            // inconclusive in the census) burns a slow failed fetch each.
-            // v7 therefore runs under a HARD TIME BUDGET: once anything
-            // playable exists, the pass stops at 9 s no matter what is
-            // left; with nothing found it may grind to 18 s before giving
-            // up to the local chain. Dead classes are demoted to the tail
-            // (stable order), the MegaMax player page is skipped outright
-            // (no extractor exists and the relay already expanded its
-            // mirrors into finals), and digs run only for the proven
-            // diggable hosts, early, and while short on links.
-            var emitted = 0
-            val counting: (ExtractorLink) -> Unit = { link -> emitted++; callback(link) }
+            // v8 SPEED (v7 on-device: still slow). Diagnosis from the
+            // numbers: the relay answers in ~4.5-7 s with all 29 finals;
+            // the swamp was this pass walking them SEQUENTIALLY - every
+            // dead host cost its own slow failed fetch, one after another.
+            // v8 runs the extractor attempts in PARALLEL WINDOWS
+            // (CloudStream amap, 6 at a time): the wait collapses from
+            // the SUM of the failures to roughly the slowest single host
+            // in the window. Ordering discipline from v7 is kept (dead
+            // classes demoted to the tail, MegaMax player page skipped -
+            // the relay already expanded it), the dig stage still runs
+            // phone-side for the proven diggable hosts (their tokens are
+            // IP-bound to the fetching device), and the whole pass keeps
+            // a hard budget: stop at 6 emitted links, at 10 s once
+            // anything playable exists, 18 s absolute.
             val passStart = System.currentTimeMillis()
+            val emitted = java.util.concurrent.atomic.AtomicInteger(0)
+            val parFound = java.util.concurrent.atomic.AtomicBoolean(false)
+            val emitLock = Any()
+            val counting: (ExtractorLink) -> Unit = { link ->
+                emitted.incrementAndGet()
+                synchronized(emitLock) { callback(link) }
+            }
             val rawFinals = (0 until finals.length())
                 .map { finals.optJSONObject(it)?.optString("url").orEmpty() }
-                .filter { it.isNotBlank() }
+                .filter { it.isNotBlank() && !it.contains("megamax.me") }
             val demotedHosts = listOf("mp4upload.", "ds2play.", "rpmhub.", "byseraguci.", "streamtape.")
             val orderedFinals = rawFinals.filter { u -> demotedHosts.none { u.contains(it) } } +
                 rawFinals.filter { u -> demotedHosts.any { u.contains(it) } }
-            for (url in orderedFinals) {
+            val failed = java.util.Collections.synchronizedList(mutableListOf<String>())
+            val parExtracted = java.util.Collections.synchronizedSet(HashSet<String>())
+            var idx = 0
+            while (idx < orderedFinals.size) {
                 val elapsed = System.currentTimeMillis() - passStart
-                if (emitted >= 8) break
-                if (emitted > 0 && elapsed > 9_000) { diag += "pass:deadline"; break }
-                if (emitted == 0 && elapsed > 18_000) { diag += "pass:deadline0"; break }
-                if (url.contains("megamax.me")) continue
-                if (loadExtractor(url, referer, subtitleCallback, counting)) {
-                    found = true
-                    extracted += url
-                    continue
+                if (emitted.get() >= 6) break
+                if (emitted.get() > 0 && elapsed > 10_000) { diag += "pass:deadline"; break }
+                if (emitted.get() == 0 && elapsed > 18_000) { diag += "pass:deadline0"; break }
+                val window = orderedFinals.subList(idx, minOf(idx + 6, orderedFinals.size))
+                window.amap { url ->
+                    if (loadExtractor(url, referer, subtitleCallback, counting)) {
+                        parFound.set(true)
+                        parExtracted += url
+                    } else {
+                        failed += url
+                    }
                 }
-                if (dug >= 3 || emitted >= 5) continue
-                if (System.currentTimeMillis() - passStart > 7_000) continue
+                idx += window.size
+            }
+            if (parFound.get()) found = true
+            extracted += parExtracted
+            // Dig stage: sequential by design (each dig is a full page
+            // fetch + unpack), only for finals the parallel pass could
+            // not open, only while short on links and inside budget.
+            for (url in failed) {
+                if (dug >= 3 || emitted.get() >= 5) break
+                if (System.currentTimeMillis() - passStart > 12_000) break
                 val diggable = url.contains("uqload.") || url.contains("lulustream") ||
                     url.contains("streamtape") || url.contains("vidhide")
                 if (!diggable) continue
-                // The uqload .vc/.com pair is one file on two hosts: dig it
-                // once, and not at all if an extractor already opened it.
                 val key = if (url.contains("uqload.", ignoreCase = true)) {
                     "uqload/" + url.substringAfter("://").substringAfter("/", "")
                 } else url
@@ -371,6 +390,7 @@ class AnimeZidProvider : MainAPI() {
                 ) continue
                 if (digEmbed(url, referer, counting, diag)) dug++
             }
+            diag += "pass:par"
             diag += "pass=" + ((System.currentTimeMillis() - passStart) / 1000) + "s"
         }
         diag += "relay:digs=$dug"

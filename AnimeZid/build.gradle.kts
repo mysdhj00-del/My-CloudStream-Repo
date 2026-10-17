@@ -1,11 +1,9 @@
 // AnimeZid CloudStream plugin module.
-version = 7
-
+version = 8
 
 android {
     namespace = "com.animezid"
 }
-
 
 cloudstream {
     description = "AnimeZid - Arabic dubbed/subtitled anime, cartoons and movies"

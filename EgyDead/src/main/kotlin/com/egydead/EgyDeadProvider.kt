@@ -210,15 +210,50 @@ class EgyDeadProvider : MainAPI() {
         return Regex("""\d{1,4}""").findAll(text).lastOrNull()?.value?.toIntOrNull()
     }
 
-    private fun seasonNumberOf(href: String): Int? =
-        Regex("""-s(\d{1,3})""").find(href)?.groupValues?.get(1)?.toIntOrNull()
+    private fun seasonNumberOf(href: String, text: String = ""): Int? {
+        Regex("""-s(\d{1,3})""").find(href)?.let { return it.groupValues[1].toIntOrNull() }
+        // Arabic season posts carry the number in the slug/title instead:
+        // a plain digit ("الموسم 2") or an ordinal word ("الموسم الرابع").
+        val decoded = runCatching {
+            java.net.URLDecoder.decode("$href $text", "UTF-8")
+        }.getOrDefault(href)
+        Regex("""الموسم\s*(\d{1,3})""").find(decoded)?.let { return it.groupValues[1].toIntOrNull() }
+        if (decoded.contains("الموسم")) {
+            val ordinals = listOf(
+                "الحادي عشر" to 11, "الثاني عشر" to 12,
+                "الأول" to 1, "الاول" to 1, "الثاني" to 2, "الثالث" to 3,
+                "الرابع" to 4, "الخامس" to 5, "السادس" to 6, "السابع" to 7,
+                "الثامن" to 8, "التاسع" to 9, "العاشر" to 10
+            )
+            for ((word, n) in ordinals) if (decoded.contains(word)) return n
+        }
+        return null
+    }
+
+    /** True for URLs on this site's own domain. The site's header menu
+     *  links /season/ and /serie/ archives on the brand's old domain
+     *  (egydead.com); those must never be mistaken for a post's own
+     *  season/series links. */
+    private fun isSiteUrl(u: String): Boolean = u.startsWith(mainUrl)
+
+    /** The parent series page ("all seasons") linked from a season page, or
+     *  null when the post has none. Bare archive links are skipped. */
+    private fun Document.serieParentUrl(): String? =
+        select("a[href*=\"/serie/\"]")
+            .map { fixUrl(it.attr("href")) }
+            .firstOrNull {
+                isSiteUrl(it) && it.contains("/serie/") &&
+                    it.substringAfter("/serie/").isNotBlank()
+            }
 
     /** Episode links listed on a season page, sorted ascending by episode number. */
     private fun Document.parseEpisodes(seasonNumber: Int?): List<Episode> {
         val byUrl = LinkedHashMap<String, Episode>()
         select("a[href*=\"/episode/\"]").forEach { a ->
             val href = fixUrl(a.attr("href"))
+            if (!isSiteUrl(href)) return@forEach
             if (!href.contains("/episode/")) return@forEach
+            if (href.substringAfter("/episode/").isBlank()) return@forEach
             val epNum = episodeNumberOf(href, a.text())
             val ep = newEpisode(href, {
                 this.name = a.text().trim().ifBlank { epNum?.let { n -> "الحلقة $n" } }
@@ -277,21 +312,43 @@ class EgyDeadProvider : MainAPI() {
 
         return when {
             url.contains("/season/") -> {
-                val title = document.pageTitle() ?: throw ErrorLoadingException("No title")
-                newTvSeriesLoadResponse(title, url, TvType.TvSeries, document.parseEpisodes(seasonNumberOf(url))) {
-                    this.posterUrl = document.pagePoster()
-                    this.plot = document.pagePlot()
-                    this.year = document.pageYear()
-                    this.tags = document.pageTags()
+                // v11: a season post is one slice of a show. When the season
+                // page links its parent series page ("all seasons"), open the
+                // series instead so the user gets EVERY season's episodes
+                // stacked in one list, not just this season's. Posts with no
+                // series page (single-post complete shows) keep the plain
+                // season list below, which is already complete for them.
+                val serieUrl = document.serieParentUrl()
+                if (serieUrl != null && serieUrl != url) {
+                    load(serieUrl)
+                } else {
+                    val title = document.pageTitle() ?: throw ErrorLoadingException("No title")
+                    newTvSeriesLoadResponse(title, url, TvType.TvSeries, document.parseEpisodes(seasonNumberOf(url))) {
+                        this.posterUrl = document.pagePoster()
+                        this.plot = document.pagePlot()
+                        this.year = document.pageYear()
+                        this.tags = document.pageTags()
+                    }
                 }
             }
 
             url.contains("/serie/") -> {
                 val title = document.pageTitle() ?: throw ErrorLoadingException("No title")
                 val seasonLinks = LinkedHashMap<String, Int?>()
-                document.select("a[href*=\"/season/\"]").forEach { a ->
+                // Seasons are listed on the series page as cards; prefer card
+                // anchors so sidebar/feed links of other shows cannot leak
+                // in, and fall back to the plain sweep only when no card
+                // matches.
+                val seasonAnchors = document
+                    .select("li.movieItem > a[href*=\"/season/\"], a:has(.BottomTitle)[href*=\"/season/\"]")
+                    .ifEmpty { document.select("a[href*=\"/season/\"]") }
+                seasonAnchors.forEach { a ->
                     val href = fixUrl(a.attr("href"))
-                    if (href.contains("/season/")) seasonLinks.putIfAbsent(href, seasonNumberOf(href))
+                    if (!isSiteUrl(href)) return@forEach
+                    if (!href.contains("/season/")) return@forEach
+                    if (href.contains("/feed")) return@forEach
+                    if (href.substringAfter("/season/").isBlank()) return@forEach
+                    seasonLinks.putIfAbsent(href, seasonNumberOf(href, a.text()))
                 }
                 val episodes = mutableListOf<Episode>()
                 if (seasonLinks.isEmpty()) {
@@ -319,10 +376,8 @@ class EgyDeadProvider : MainAPI() {
                 // season (or series) page so the user gets the full episode list.
                 val seasonUrl = document.select("a[href*=\"/season/\"]")
                     .map { fixUrl(it.attr("href")) }
-                    .firstOrNull { it.contains("/season/") }
-                val serieUrl = document.select("a[href*=\"/serie/\"]")
-                    .map { fixUrl(it.attr("href")) }
-                    .firstOrNull { it.contains("/serie/") }
+                    .firstOrNull { isSiteUrl(it) && it.contains("/season/") }
+                val serieUrl = document.serieParentUrl()
                 when {
                     seasonUrl != null && seasonUrl != url -> load(seasonUrl)
                     serieUrl != null && serieUrl != url -> load(serieUrl)

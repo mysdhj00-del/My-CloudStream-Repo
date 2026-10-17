@@ -217,6 +217,12 @@ class AnimeZidProvider : MainAPI() {
     }
 
     override suspend fun load(url: String): LoadResponse {
+        val resp = loadInner(url)
+        maybePrewarm(url)
+        return resp
+    }
+
+    private suspend fun loadInner(url: String): LoadResponse {
         val document = app.get(url, headers = browserHeaders).document
 
         return when {
@@ -283,6 +289,176 @@ class AnimeZidProvider : MainAPI() {
         }
     }
 
+    // ------------------------------------------------------------ v11
+    // Pre-warm + streaming (panel-approved build, Mohamed 2026-10-17).
+    // Measured basis: relay sessions live >= 300 s and their resolves
+    // are idempotent, so the relay flow may run while the user is
+    // still reading the episode page; the tap then spends the cached
+    // finals and collapses to the phone-side pass. On a cold tap the
+    // NDJSON stream lets the pass start on the first arrivals instead
+    // of waiting out the whole relay response.
+
+    private data class WarmEntry(val ts: Long, val finals: org.json.JSONArray)
+
+    private val warmCache = java.util.concurrent.ConcurrentHashMap<String, WarmEntry>()
+    private val warmInFlight = java.util.concurrent.ConcurrentHashMap<String, Boolean>()
+
+    /** Fire-and-forget pre-warm: when an EPISODE page is opened (its
+     * URL carries vid=), collect the relay stream in a background
+     * thread and cache the finals for the tap. Series pages have no
+     * vid in the URL and are skipped by construction. */
+    private fun maybePrewarm(url: String) {
+        val vid = Regex("""vid=([A-Za-z0-9]+)""").find(url)?.groupValues?.get(1) ?: return
+        val hit = warmCache[vid]
+        if (hit != null && System.currentTimeMillis() - hit.ts < 240_000) return
+        if (warmInFlight.putIfAbsent(vid, true) != null) return
+        val t = Thread {
+            try {
+                val sink = mutableListOf<String>()
+                val finals = readStreamFinals(vid, sink) { false }
+                if (finals.length() > 0) {
+                    warmCache[vid] = WarmEntry(System.currentTimeMillis(), finals)
+                    while (warmCache.size > 8) {
+                        val oldest = warmCache.entries.minByOrNull { it.value.ts }?.key ?: break
+                        warmCache.remove(oldest)
+                    }
+                }
+            } catch (e: Exception) {
+                // pre-warm is best-effort; the tap paths are unaffected
+            } finally {
+                warmInFlight.remove(vid)
+            }
+        }
+        t.isDaemon = true
+        t.name = "az-prewarm"
+        t.start()
+    }
+
+    /** Blocking NDJSON reader for /relay/animezid?stream=1. Collects
+     * finals as they arrive; [gate] runs after every final and may
+     * stop the read early by returning true. Overall deadline 45 s. */
+    private fun readStreamFinals(
+        vid: String,
+        diag: MutableList<String>,
+        gate: (org.json.JSONArray) -> Boolean
+    ): org.json.JSONArray {
+        val finals = org.json.JSONArray()
+        val t0 = System.currentTimeMillis()
+        var conn: java.net.HttpURLConnection? = null
+        try {
+            val u = java.net.URL("https://egydead-stremio.onrender.com/relay/animezid?vid=$vid&stream=1")
+            conn = u.openConnection() as java.net.HttpURLConnection
+            conn.connectTimeout = 15000
+            conn.readTimeout = 20000
+            conn.setRequestProperty(
+                "User-Agent",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            )
+            conn.setRequestProperty("Accept", "application/x-ndjson")
+            val code = conn.responseCode
+            if (code != 200) {
+                diag += "str:http=$code"
+                return finals
+            }
+            val reader = java.io.BufferedReader(java.io.InputStreamReader(conn.inputStream, "UTF-8"))
+            while (true) {
+                if (System.currentTimeMillis() - t0 > 45_000) {
+                    diag += "str:deadline"
+                    break
+                }
+                val line = reader.readLine() ?: break
+                if (line.isBlank()) continue
+                val obj = runCatching { JSONObject(line) }.getOrNull() ?: continue
+                when (obj.optString("t")) {
+                    "final" -> {
+                        val f = JSONObject()
+                        f.put("provider", obj.optString("provider", "unknown"))
+                        f.put("url", obj.optString("url", ""))
+                        finals.put(f)
+                        if (finals.length() == 1) {
+                            diag += "str:first=" + (System.currentTimeMillis() - t0) + "ms"
+                        }
+                        if (gate(finals)) {
+                            diag += "str:gate@" + finals.length()
+                            break
+                        }
+                    }
+                    "done" -> {
+                        diag += "str:done=" + (System.currentTimeMillis() - t0) + "ms"
+                        return finals
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            diag += "str:fail"
+        } finally {
+            runCatching { conn?.disconnect() }
+        }
+        return finals
+    }
+
+    /** Live tap path over the stream: read until the first
+     * Doodstream-class final lands (or the stream ends), then run the
+     * standard pass over what has arrived. */
+    private suspend fun loadViaStream(
+        vid: String,
+        referer: String,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit,
+        diag: MutableList<String>
+    ): Boolean {
+        val finals = readStreamFinals(vid, diag) { arr ->
+            (0 until arr.length()).any { i ->
+                val u = arr.optJSONObject(i)?.optString("url").orEmpty()
+                u.contains("playmogo") || u.contains("doodstream") || u.contains("dood.")
+            }
+        }
+        if (finals.length() == 0) {
+            diag += "str:empty"
+            return false
+        }
+        diag += "str:n=${finals.length()}"
+        val r = runPass(finals, referer, subtitleCallback, callback, diag, skipDood = false)
+        diag += "relay:digs=${r.dug}"
+        if (r.found || r.dug > 0) {
+            diag += "str:hit"
+            return true
+        }
+        diag += "str:miss"
+        return false
+    }
+
+    /** Spend a fresh pre-warm entry (<= 240 s old) before any network
+     * path: the tap collapses to the phone-side pass only. */
+    private suspend fun loadViaWarmCache(
+        vid: String,
+        referer: String,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit,
+        diag: MutableList<String>
+    ): Boolean {
+        val e = warmCache[vid] ?: run {
+            diag += "warm:miss"
+            return false
+        }
+        val age = (System.currentTimeMillis() - e.ts) / 1000
+        if (age > 240) {
+            diag += "warm:stale"
+            return false
+        }
+        diag += "warm=hit"
+        diag += "warm:age=${age}s"
+        diag += "warm:finals=${e.finals.length()}"
+        val r = runPass(e.finals, referer, subtitleCallback, callback, diag, skipDood = false)
+        diag += "relay:digs=${r.dug}"
+        if (r.found || r.dug > 0) {
+            diag += "warm:win"
+            return true
+        }
+        diag += "warm:dead"
+        return false
+    }
+
     private data class PassResult(val found: Boolean, val dug: Int)
 
     /** 2-attempt relay fetch + JSON parse; logs "<tag>:fetch-fail /
@@ -326,6 +502,8 @@ class AnimeZidProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit,
         diag: MutableList<String>
     ): Boolean {
+        if (loadViaStream(vid, referer, subtitleCallback, callback, diag)) return true
+
         val fastUrl = "https://egydead-stremio.onrender.com/relay/animezid?vid=$vid&fast=1"
         val fast = fetchRelayJson(fastUrl, diag, "fast")
         if (fast != null) {
@@ -608,6 +786,8 @@ class AnimeZidProvider : MainAPI() {
         // built-in extractors. The relay (free tier) can be asleep, so one
         // retry is allowed inside loadViaRelay; the local chain below
         // remains the fallback.
+        if (loadViaWarmCache(vid, data, subtitleCallback, callback, diag)) return true
+
         if (loadViaRelay(vid, data, subtitleCallback, callback, diag)) return true
 
         val playUrl = "$mainUrl/play.php?vid=$vid"

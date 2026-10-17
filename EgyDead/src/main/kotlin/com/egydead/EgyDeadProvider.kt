@@ -131,9 +131,11 @@ class EgyDeadProvider : MainAPI() {
             cat.contains("انمي") || cat.contains("أنمي") || cat.contains("انميات") -> TvType.Anime
             cat.contains("مسلسل") || cat.contains("مسلسلات") || cat.contains("برامج") ||
                 cat.contains("برنامج") -> TvType.TvSeries
+
             cat.contains("افلام") || cat.contains("أفلام") || cat.contains("فيلم") -> TvType.Movie
             href.contains("/episode/") || href.contains("/season/") ||
                 href.contains("/serie/") -> TvType.TvSeries
+
             else -> TvType.Movie
         }
     }
@@ -147,12 +149,15 @@ class EgyDeadProvider : MainAPI() {
             href.contains("/year/") || href.contains("/quality/") ||
             href.contains("/country/") || href.contains("/language/")
         ) return null
+
         val titleEl = selectFirst("h1.BottomTitle") ?: selectFirst(".BottomTitle")
         val title = (titleEl?.text() ?: attr("title")).trim()
         if (title.isBlank()) return null
+
         val poster = fixUrlNull(selectFirst("img")?.attr("src"))
         val catName = selectFirst("span.cat_name")?.text()
         val year = Regex("""(19|20)\d{2}""").find(title)?.value?.toIntOrNull()
+
         return when (detectType(catName, href)) {
             TvType.Anime -> newAnimeSearchResponse(title, href, TvType.Anime) {
                 this.posterUrl = poster
@@ -225,6 +230,28 @@ class EgyDeadProvider : MainAPI() {
         return byUrl.values.sortedBy { it.episode ?: Int.MAX_VALUE }
     }
 
+    /**
+     * Fetches a site page as a parsed document. Since 2026-10-17 the site
+     * sits behind a Cloudflare fingerprint wall that refuses the app's
+     * direct requests (403 "Just a moment"), so pages are fetched through
+     * the relay's Chrome-impersonating /relay/page route first; the direct
+     * fetch remains as a fallback for the day the wall lifts.
+     */
+    private suspend fun fetchDocument(url: String): Document {
+        val relayUrl = "https://egydead-stremio.onrender.com/relay/page?url=" +
+            java.net.URLEncoder.encode(url, "UTF-8")
+        for (attempt in 1..2) {
+            val text = runCatching { app.get(relayUrl).text }.getOrNull()
+            val json = text?.let { runCatching { JSONObject(it) }.getOrNull() }
+            val html = json?.optString("text")?.takeIf { it.isNotBlank() }
+            if (json?.optBoolean("ok") == true && html != null) {
+                return org.jsoup.Jsoup.parse(html, url)
+            }
+            if (attempt == 1) Thread.sleep(2000)
+        }
+        return app.get(url, headers = browserHeaders).document
+    }
+
     // ---------- MainAPI ----------
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
@@ -235,18 +262,19 @@ class EgyDeadProvider : MainAPI() {
         // v8 and earlier wrongly reported hasNext=false for the /type/ and
         // other unlisted sections, truncating them to their first page.
         val url = if (page <= 1) request.data else "${request.data}?page=$page/"
-        val document = app.get(url, headers = browserHeaders).document
+        val document = fetchDocument(url)
         val items = document.parseCards()
         return newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
-        val url = mainUrl + "/?s=" + java.net.URLEncoder.encode(query, "UTF-8")
-        return app.get(url, headers = browserHeaders).document.parseCards()
+        val url = "$mainUrl/?s=${java.net.URLEncoder.encode(query, "UTF-8")}"
+        return fetchDocument(url).parseCards()
     }
 
     override suspend fun load(url: String): LoadResponse {
-        val document = app.get(url, headers = browserHeaders).document
+        val document = fetchDocument(url)
+
         return when {
             url.contains("/season/") -> {
                 val title = document.pageTitle() ?: throw ErrorLoadingException("No title")
@@ -257,6 +285,7 @@ class EgyDeadProvider : MainAPI() {
                     this.tags = document.pageTags()
                 }
             }
+
             url.contains("/serie/") -> {
                 val title = document.pageTitle() ?: throw ErrorLoadingException("No title")
                 val seasonLinks = LinkedHashMap<String, Int?>()
@@ -269,7 +298,7 @@ class EgyDeadProvider : MainAPI() {
                     episodes += document.parseEpisodes(1)
                 } else {
                     seasonLinks.entries.forEachIndexed { index, (seasonUrl, seasonNum) ->
-                        val seasonDoc = runCatching { app.get(seasonUrl, headers = browserHeaders).document }.getOrNull()
+                        val seasonDoc = runCatching { fetchDocument(seasonUrl) }.getOrNull()
                             ?: return@forEachIndexed
                         episodes += seasonDoc.parseEpisodes(seasonNum ?: (index + 1))
                     }
@@ -284,7 +313,10 @@ class EgyDeadProvider : MainAPI() {
                     this.tags = document.pageTags()
                 }
             }
+
             url.contains("/episode/") -> {
+                // An episode page on this site belongs to a season; jump to the
+                // season (or series) page so the user gets the full episode list.
                 val seasonUrl = document.select("a[href*=\"/season/\"]")
                     .map { fixUrl(it.attr("href")) }
                     .firstOrNull { it.contains("/season/") }
@@ -310,6 +342,7 @@ class EgyDeadProvider : MainAPI() {
                     }
                 }
             }
+
             else -> {
                 val title = document.pageTitle() ?: throw ErrorLoadingException("No title")
                 newMovieLoadResponse(title, url, TvType.Movie, url) {

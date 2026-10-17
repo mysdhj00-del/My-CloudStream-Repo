@@ -318,26 +318,25 @@ class AnimeZidProvider : MainAPI() {
         val finals = json.optJSONArray("finals")
         diag += "relay:finals=${finals?.length() ?: 0}"
         var found = false
+        var dug = 0
         val extracted = HashSet<String>()
+        val seenDig = HashSet<String>()
         if (finals != null) {
+            // v5: ONE pass. Each final goes to the built-in extractors
+            // first; when an extractor cannot open it, the phone-side dig
+            // runs IMMEDIATELY for that same final instead of after the
+            // whole list has been tried — dug links (Uqload, VidHide,
+            // LuluStream...) reach the source list minutes earlier on
+            // slow hosts. Same coverage as v4's two passes, same dig cap.
             for (i in 0 until finals.length()) {
                 val url = finals.optJSONObject(i)?.optString("url").orEmpty()
                 if (url.isBlank()) continue
                 if (loadExtractor(url, referer, subtitleCallback, callback)) {
                     found = true
                     extracted += url
+                    continue
                 }
-            }
-        }
-        // v4: dig — on the phone itself, whose IP the stream tokens are
-        // minted for — every final the extractors did not already open.
-        var dug = 0
-        if (finals != null) {
-            val seenDig = HashSet<String>()
-            for (i in 0 until finals.length()) {
-                if (dug >= 8) break
-                val url = finals.optJSONObject(i)?.optString("url").orEmpty()
-                if (url.isBlank() || url in extracted) continue
+                if (dug >= 8) continue
                 // The uqload .vc/.com pair is one file on two hosts: dig it
                 // once, and not at all if an extractor already opened it.
                 val key = if (url.contains("uqload.", ignoreCase = true)) {
@@ -462,7 +461,7 @@ class AnimeZidProvider : MainAPI() {
         return true
     }
 
-        override suspend fun loadLinks(
+    override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
         subtitleCallback: (SubtitleFile) -> Unit,

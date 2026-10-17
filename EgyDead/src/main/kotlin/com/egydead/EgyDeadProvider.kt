@@ -10,6 +10,7 @@ import com.lagradost.cloudstream3.SearchResponse
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.TvType
 import com.lagradost.cloudstream3.app
+import com.lagradost.cloudstream3.amap
 import com.lagradost.cloudstream3.fixUrl
 import com.lagradost.cloudstream3.fixUrlNull
 import com.lagradost.cloudstream3.mainPageOf
@@ -410,6 +411,11 @@ class EgyDeadProvider : MainAPI() {
         }
     }
 
+    /** Set by loadViaRelay when the relay's own origin fetches were
+     * answered 403 (the site's wall is up): the local chain cannot do
+     * better, so loadLinks skips it. */
+    @Volatile private var originBlocked = false
+
     /**
      * Asks the relay server (the Stremio addon service) to perform the watch
      * unlock for [data] server-side and feeds what it returns — the MegaMax
@@ -439,40 +445,73 @@ class EgyDeadProvider : MainAPI() {
             return false
         }
         if (!json.optBoolean("ok")) {
-            diag += "relay:not-ok"
+            val rd = json.optJSONObject("diag")
+            if (rd != null && (rd.optInt("getCode") == 403 || rd.optInt("postCode") == 403)) {
+                diag += "relay:BLOCKED-403"
+                originBlocked = true
+            } else {
+                diag += "relay:not-ok"
+            }
             return false
         }
         var found = false
-        // v12 SPEED: count what actually reaches the source list and stop
-        // early. v11 walked ALL ~21 mirrors with a sequential extractor
-        // call each; on a phone that alone took ~10 s before the video
-        // could start. Six sources are plenty to choose from, the mirrors
-        // are tried fastest-host first, and total attempts are capped so
-        // dead hosts cannot burn the wait.
-        var emitted = 0
-        val counting: (ExtractorLink) -> Unit = { link -> emitted++; callback(link) }
+        // v14: PARALLEL mirror pass (the AnimeZid v8/v11 lesson, panel-
+        // confirmed for this shape too). v12/v13 walked the ranked
+        // mirrors SEQUENTIALLY - one extractor round-trip each - so a
+        // few dead hosts burned the whole wait. Now the ranked,
+        // de-duplicated list is tried in windows of 5 concurrent
+        // attempts (amap), at most 2 attempts per host (duplicates of
+        // a dead host cannot eat the budget), still stopping at 6
+        // emitted links / 12 attempts, under a 14 s pass deadline.
+        val emitted = java.util.concurrent.atomic.AtomicInteger(0)
+        val counting: (ExtractorLink) -> Unit = { link ->
+            emitted.incrementAndGet()
+            callback(link)
+        }
         val mirrors = json.optJSONArray("mirrors")
         diag += "relay:mirrors=${mirrors?.length() ?: 0}"
         if (mirrors != null) {
             val mirrorList = (0 until mirrors.length())
                 .map { mirrors.optString(it) }
                 .filter { it.isNotBlank() }
+                .distinct()
                 .sortedBy { mirrorRank(it) }
-            var attempts = 0
-            for (link in mirrorList) {
-                if (emitted >= 6 || attempts >= 12) break
-                attempts++
-                if (loadExtractor(link, data, subtitleCallback, counting)) {
-                    found = true
+            diag += "relay:mirrorsDedup=${mirrorList.size}"
+            val attempts = java.util.concurrent.atomic.AtomicInteger(0)
+            val perHost = java.util.concurrent.ConcurrentHashMap<String, Int>()
+            val foundAny = java.util.concurrent.atomic.AtomicBoolean(false)
+            val passStart = System.currentTimeMillis()
+            var idx = 0
+            while (idx < mirrorList.size) {
+                if (emitted.get() >= 6 || attempts.get() >= 12) break
+                if (System.currentTimeMillis() - passStart > 14_000) {
+                    diag += "pass:deadline"
+                    break
+                }
+                val window = mirrorList.subList(idx, minOf(idx + 5, mirrorList.size))
+                idx += window.size
+                window.amap { link ->
+                    if (emitted.get() < 6 && attempts.get() < 12) {
+                        val hostKey = runCatching { java.net.URL(link).host }.getOrNull() ?: link
+                        val used = perHost.merge(hostKey, 1) { x, y -> x + y } ?: 1
+                        if (used <= 2) {
+                            attempts.incrementAndGet()
+                            if (loadExtractor(link, data, subtitleCallback, counting)) {
+                                foundAny.set(true)
+                            }
+                        }
+                    }
                 }
             }
+            found = foundAny.get()
+            diag += "pass:par"
         }
         if (!found) {
             val relayEmbeds = json.optJSONArray("embeds")
             diag += "relay:embeds=${relayEmbeds?.length() ?: 0}"
             if (relayEmbeds != null) {
                 for (i in 0 until relayEmbeds.length()) {
-                    if (emitted >= 6) break
+                    if (emitted.get() >= 6) break
                     val embed = relayEmbeds.optString(i)
                     if (embed.isBlank()) continue
                     if (loadExtractor(embed, data, subtitleCallback, counting)) {
@@ -533,6 +572,16 @@ class EgyDeadProvider : MainAPI() {
         // (free tier) can be asleep, so one retry is allowed inside
         // loadViaRelay before falling back to the local chain below.
         if (loadViaRelay(data, subtitleCallback, callback, diag)) return true
+
+        // v14: when the relay's own origin fetches were answered 403
+        // (the site's wall is up), the local chain below cannot succeed
+        // either - the app's client is the most-blocked of all - so
+        // skip its minutes of retries and surface the diagnostics now.
+        if (originBlocked) {
+            diag += "local:skipped-blocked"
+            emitDebug(diag, callback)
+            return true
+        }
 
         // v7: visit the page first like a real browser (this also picks up
         // the CDN's bot-management cookie for the session), then unlock the

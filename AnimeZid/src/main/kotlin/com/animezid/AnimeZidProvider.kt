@@ -322,21 +322,26 @@ class AnimeZidProvider : MainAPI() {
         val extracted = HashSet<String>()
         val seenDig = HashSet<String>()
         if (finals != null) {
-            // v5: ONE pass. Each final goes to the built-in extractors
-            // first; when an extractor cannot open it, the phone-side dig
-            // runs IMMEDIATELY for that same final instead of after the
-            // whole list has been tried — dug links (Uqload, VidHide,
-            // LuluStream...) reach the source list minutes earlier on
-            // slow hosts. Same coverage as v4's two passes, same dig cap.
+            // v6 SPEED: count emitted links and STOP at 8. v5's single
+            // pass walked all ~29 finals (an extractor fetch each, plus
+            // up to 8 embed digs) before returning, which is where the
+            // ~10 s+ wait before the source list lived. The finals arrive
+            // in extractor-priority order, so the first sources are the
+            // good ones; the dig (the slowest step) now runs only while
+            // fewer than 5 links have been emitted, as a coverage floor,
+            // with its success cap lowered from 8 to 4.
+            var emitted = 0
+            val counting: (ExtractorLink) -> Unit = { link -> emitted++; callback(link) }
             for (i in 0 until finals.length()) {
+                if (emitted >= 8) break
                 val url = finals.optJSONObject(i)?.optString("url").orEmpty()
                 if (url.isBlank()) continue
-                if (loadExtractor(url, referer, subtitleCallback, callback)) {
+                if (loadExtractor(url, referer, subtitleCallback, counting)) {
                     found = true
                     extracted += url
                     continue
                 }
-                if (dug >= 8) continue
+                if (dug >= 4 || emitted >= 5) continue
                 // The uqload .vc/.com pair is one file on two hosts: dig it
                 // once, and not at all if an extractor already opened it.
                 val key = if (url.contains("uqload.", ignoreCase = true)) {
@@ -346,7 +351,7 @@ class AnimeZidProvider : MainAPI() {
                 if (key.startsWith("uqload/") &&
                     extracted.any { it.contains("uqload.", ignoreCase = true) }
                 ) continue
-                if (digEmbed(url, referer, callback, diag)) dug++
+                if (digEmbed(url, referer, counting, diag)) dug++
             }
         }
         diag += "relay:digs=$dug"

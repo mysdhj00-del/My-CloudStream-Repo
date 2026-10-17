@@ -273,7 +273,7 @@ class EgyDeadProvider : MainAPI() {
      * fetch remains as a fallback for the day the wall lifts.
      */
     private suspend fun fetchDocument(url: String): Document {
-        val relayUrl = "https://egydead-stremio.onrender.com/relay/page?url=" +
+        val relayUrl = "https://deno-relay.mysdhj00-del.deno.net/relay/page?url=" +
             java.net.URLEncoder.encode(url, "UTF-8")
         for (attempt in 1..2) {
             val text = runCatching { app.get(relayUrl).text }.getOrNull()
@@ -422,7 +422,7 @@ class EgyDeadProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit,
         diag: MutableList<String>
     ): Boolean {
-        val relayUrl = "https://egydead-stremio.onrender.com/relay/egydead?url=" +
+        val relayUrl = "https://deno-relay.mysdhj00-del.deno.net/relay/egydead?url=" +
             java.net.URLEncoder.encode(data, "UTF-8")
         var text: String? = null
         for (attempt in 1..2) {

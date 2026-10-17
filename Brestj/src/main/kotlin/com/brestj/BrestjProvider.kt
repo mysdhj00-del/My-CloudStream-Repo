@@ -196,11 +196,15 @@ class BrestjProvider : MainAPI() {
         val plot = document.selectFirst("meta[name=\"description\"]")?.attr("content")
             ?.trim()?.ifBlank { null }
 
-        // A series hub lists its episodes as watch anchors whose titles carry
-        // "الحلقة N" plus the series' core name (recommendations on the same
-        // page name other series, so the shared name is the filter). Episode
-        // anchors name no season — the season lives in the hub's own title —
-        // so episodes inherit the hub's season unless an anchor overrides it.
+        // A watch page lists its series' episodes two ways (both verified on
+        // هند خانم: the ep46 page carries the complete ordered 1–58 list):
+        // a numbered strip of anchors whose whole text is "N حلقة", and
+        // titled anchors carrying "الحلقة N" plus the series' core name
+        // (recommendations on the same page name other series, so the shared
+        // name is the filter there). Episode anchors name no season — the
+        // season lives in the page's own title — so episodes inherit the
+        // page's season unless an anchor overrides it. The core name must
+        // strip the page's own episode tail first, or no sibling matches it.
         val hubSeason = seasonOf(title)
         val core = title
             .removePrefix("مسلسل").trim()
@@ -299,11 +303,22 @@ class BrestjProvider : MainAPI() {
             ) {
                 this.referer = referer
                 this.quality = Qualities.Unknown.value
+                // v5: the vhdup200 CDN answers 403 to EVERY request in the
+                // chain (master, variants, segments) whose Referer is not
+                // the hdup400 embed page itself (verified live 2026-10-17:
+                // segment + referer=master -> 403, + referer=embed -> 200).
+                // Carry the referer in the headers map too, not only the
+                // referer field, so whichever channel the player propagates
+                // to segment requests is covered.
+                this.headers = mapOf(
+                    "Referer" to referer,
+                    "User-Agent" to browserHeaders.getValue("User-Agent")
+                )
             }
         )
     }
 
-        // Dean Edwards packer blocks: eval(function(p,a,c,k,e,d){...}('payload',
+    // Dean Edwards packer blocks: eval(function(p,a,c,k,e,d){...}('payload',
     // radix, count, 'k1|k2|...'.split('|'))). hdup400 (the only server on
     // most Brestj episodes) hides its JW config this way; unpacked, it
     // carries a plain file:"...master.m3u8" (verified live 2026-10-16).
@@ -406,7 +421,13 @@ class BrestjProvider : MainAPI() {
         }
 
         val playUrl = "$mainUrl/play.php?vid=$vid"
-        val res = runCatching { app.get(playUrl, headers = browserHeaders, referer = data) }.getOrNull()
+        // v5: one retry — a single flaked play.php response used to mean
+        // zero candidates and a dead end for the whole episode.
+        var res = runCatching { app.get(playUrl, headers = browserHeaders, referer = data) }.getOrNull()
+        if (res == null || res.code != 200) {
+            Thread.sleep(1200)
+            res = runCatching { app.get(playUrl, headers = browserHeaders, referer = data) }.getOrNull() ?: res
+        }
         diag += "play=${res?.code ?: "err"}"
 
         val candidates = LinkedHashSet<String>()
@@ -442,38 +463,47 @@ class BrestjProvider : MainAPI() {
         diag += "embeds=${candidates.size}"
 
         val ordered = orderEmbeds(candidates)
-        // Stage 1: the app's host-based extractors.
+        // Stage 1: the app's host-based extractors. v5: each call is
+        // isolated — an extractor that THROWS on a junk candidate from the
+        // raw-URL sweep (or on a host the user's network resets) used to
+        // abort the whole chain before the dig stages ever ran, which is
+        // how an episode with a perfectly good hdup400 server ended at
+        // "link not found".
         var found = false
         val unresolved = mutableListOf<String>()
         for (embed in ordered) {
-            if (loadExtractor(embed, data, subtitleCallback, callback)) {
+            val ok = runCatching {
+                loadExtractor(embed, data, subtitleCallback, callback)
+            }.getOrDefault(false)
+            if (ok) {
                 found = true
             } else {
                 unresolved += embed
             }
         }
-        // Stage 2: dig the direct file out of each unresolved embed page on
-        // the phone itself — covers hosts/TLDs the extractors don't know
-        // (the per-title variance behind "some play, some don't").
-        if (!found) {
-            var scanned = 0
-            for (embed in unresolved) {
-                if (scanEmbed(embed, data, callback)) {
-                    scanned++
-                    found = true
-                }
+        // Stage 2: dig the direct file out of EVERY unresolved embed page
+        // on the phone itself — v5 no longer gates this on stage 1 having
+        // found nothing: an extractor can claim a server (ok.ru) and still
+        // hand back a link that never plays, and that must not block the
+        // hdup400 dig behind it.
+        var scanned = 0
+        val dugOk = HashSet<String>()
+        for (embed in unresolved) {
+            if (scanEmbed(embed, data, callback)) {
+                scanned++
+                dugOk += embed
+                found = true
             }
-            diag += "scan=$scanned"
         }
-        // Stage 3: the relay server takes the same dig from its side.
-        if (!found) {
-            var relayed = 0
-            for (embed in unresolved.take(3)) {
-                relayed += resolveViaRelay(embed, data, callback)
-            }
-            diag += "relay=$relayed"
-            if (relayed > 0) found = true
+        diag += "scan=$scanned"
+        // Stage 3: the relay server takes the same dig from its side for
+        // whatever is still unresolved.
+        var relayed = 0
+        for (embed in unresolved.filter { it !in dugOk }.take(3)) {
+            relayed += resolveViaRelay(embed, data, callback)
         }
+        diag += "relay=$relayed"
+        if (relayed > 0) found = true
         if (!found) {
             emitDebug(diag, callback)
             return true

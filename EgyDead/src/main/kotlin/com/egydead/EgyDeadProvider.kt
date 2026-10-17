@@ -443,12 +443,26 @@ class EgyDeadProvider : MainAPI() {
             return false
         }
         var found = false
+        // v12 SPEED: count what actually reaches the source list and stop
+        // early. v11 walked ALL ~21 mirrors with a sequential extractor
+        // call each; on a phone that alone took ~10 s before the video
+        // could start. Six sources are plenty to choose from, the mirrors
+        // are tried fastest-host first, and total attempts are capped so
+        // dead hosts cannot burn the wait.
+        var emitted = 0
+        val counting: (ExtractorLink) -> Unit = { link -> emitted++; callback(link) }
         val mirrors = json.optJSONArray("mirrors")
         diag += "relay:mirrors=${mirrors?.length() ?: 0}"
         if (mirrors != null) {
-            for (i in 0 until mirrors.length()) {
-                val link = mirrors.optString(i)
-                if (link.isNotBlank() && loadExtractor(link, data, subtitleCallback, callback)) {
+            val mirrorList = (0 until mirrors.length())
+                .map { mirrors.optString(it) }
+                .filter { it.isNotBlank() }
+                .sortedBy { mirrorRank(it) }
+            var attempts = 0
+            for (link in mirrorList) {
+                if (emitted >= 6 || attempts >= 12) break
+                attempts++
+                if (loadExtractor(link, data, subtitleCallback, counting)) {
                     found = true
                 }
             }
@@ -458,13 +472,14 @@ class EgyDeadProvider : MainAPI() {
             diag += "relay:embeds=${relayEmbeds?.length() ?: 0}"
             if (relayEmbeds != null) {
                 for (i in 0 until relayEmbeds.length()) {
+                    if (emitted >= 6) break
                     val embed = relayEmbeds.optString(i)
                     if (embed.isBlank()) continue
-                    if (loadExtractor(embed, data, subtitleCallback, callback)) {
+                    if (loadExtractor(embed, data, subtitleCallback, counting)) {
                         found = true
                         continue
                     }
-                    if (loadFromMegaMax(embed, data, subtitleCallback, callback, diag)) {
+                    if (loadFromMegaMax(embed, data, subtitleCallback, counting, diag)) {
                         found = true
                     }
                 }
@@ -472,6 +487,23 @@ class EgyDeadProvider : MainAPI() {
         }
         if (found) diag += "relay:hit"
         return found
+    }
+
+    /** v12: fastest/most reliable mirror hosts first for the early-stop pass. */
+    private fun mirrorRank(url: String): Int {
+        val h = url.lowercase()
+        return when {
+            h.contains("voe.") -> 0
+            h.contains("vidmoly") -> 1
+            h.contains("streamwish") || h.contains("streamhg") -> 2
+            h.contains("mixdrop") -> 3
+            h.contains("doodstream") || h.contains("dood.") -> 4
+            h.contains("uqload") -> 5
+            h.contains("vidhide") || h.contains("earnvids") -> 6
+            h.contains("vidara") -> 7
+            h.contains("byse") -> 8
+            else -> 9
+        }
     }
 
     private fun collectEmbeds(document: Document, into: LinkedHashSet<String>) {

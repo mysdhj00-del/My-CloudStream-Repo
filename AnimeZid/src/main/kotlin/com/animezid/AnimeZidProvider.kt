@@ -283,12 +283,41 @@ class AnimeZidProvider : MainAPI() {
         }
     }
 
+    private data class PassResult(val found: Boolean, val dug: Int)
+
+    /** 2-attempt relay fetch + JSON parse; logs "<tag>:fetch-fail /
+     * bad-json / not-ok" and returns null on any failure. */
+    private suspend fun fetchRelayJson(url: String, diag: MutableList<String>, tag: String): JSONObject? {
+        var text: String? = null
+        for (attempt in 1..2) {
+            text = runCatching { app.get(url).text }.getOrNull()
+            if (text != null) break
+            Thread.sleep(2000)
+        }
+        val body = text ?: run {
+            diag += "$tag:fetch-fail"
+            return null
+        }
+        val json = runCatching { JSONObject(body) }.getOrNull() ?: run {
+            diag += "$tag:bad-json"
+            return null
+        }
+        if (!json.optBoolean("ok")) {
+            diag += "$tag:not-ok"
+            return null
+        }
+        return json
+    }
+
     /**
-     * Asks the relay server (the Stremio addon service) to run the whole
-     * protected playback-session flow for [vid] server-side and feeds the
-     * returned final host URLs to the built-in extractors, then (v4) digs
-     * phone-side whatever the extractors could not open. Returns true when
-     * at least one playable link was emitted.
+     * v10: FAST LANE FIRST. The relay's fast endpoint runs the same
+     * protected session flow but resolves only the priority sources and
+     * stops at a live Doodstream (or 3 finals), answering in ~2-3 s
+     * instead of the full ~4.5-7 s, and it classifies the Doodstream
+     * file server-side (ds=dead means its embed is the site's plain
+     * "Video not found" page - the pass then skips it entirely). When
+     * the fast answer produces a playable link we are done; otherwise
+     * the full relay flow below runs exactly as v9 did.
      */
     private suspend fun loadViaRelay(
         vid: String,
@@ -297,32 +326,66 @@ class AnimeZidProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit,
         diag: MutableList<String>
     ): Boolean {
+        val fastUrl = "https://egydead-stremio.onrender.com/relay/animezid?vid=$vid&fast=1"
+        val fast = fetchRelayJson(fastUrl, diag, "fast")
+        if (fast != null) {
+            diag += "fast=hit"
+            val ds = fast.optString("ds", "none")
+            diag += "ds=$ds"
+            val stages = fast.optJSONObject("diag")?.optJSONObject("stages")
+            if (stages != null) diag += "fst=" + stages.optLong("totalMs", 0) + "ms"
+            val fFinals = fast.optJSONArray("finals")
+            diag += "fast:finals=${fFinals?.length() ?: 0}"
+            if (fFinals != null && fFinals.length() > 0) {
+                val r = runPass(fFinals, referer, subtitleCallback, callback, diag, skipDood = ds == "dead")
+                diag += "relay:digs=${r.dug}"
+                if (r.found || r.dug > 0) {
+                    diag += "relay:hit"
+                    return true
+                }
+            }
+            diag += "fast:miss"
+        }
+        return loadViaRelayFull(vid, referer, subtitleCallback, callback, diag)
+    }
+
+    /** The full relay flow (v9 behaviour, unchanged): every source
+     * resolved server-side, MegaMax expanded, then the pass. */
+    private suspend fun loadViaRelayFull(
+        vid: String,
+        referer: String,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit,
+        diag: MutableList<String>
+    ): Boolean {
         val relayUrl = "https://egydead-stremio.onrender.com/relay/animezid?vid=$vid"
-        var text: String? = null
-        for (attempt in 1..2) {
-            text = runCatching { app.get(relayUrl).text }.getOrNull()
-            if (text != null) break
-            Thread.sleep(2000)
-        }
-        val body = text ?: run {
-            diag += "relay:fetch-fail"
-            return false
-        }
-        val json = runCatching { JSONObject(body) }.getOrNull() ?: run {
-            diag += "relay:bad-json"
-            return false
-        }
-        if (!json.optBoolean("ok")) {
-            diag += "relay:not-ok"
-            return false
-        }
+        val json = fetchRelayJson(relayUrl, diag, "relay") ?: return false
         val finals = json.optJSONArray("finals")
         diag += "relay:finals=${finals?.length() ?: 0}"
+        if (finals == null) return false
+        val r = runPass(finals, referer, subtitleCallback, callback, diag, skipDood = false)
+        diag += "relay:digs=${r.dug}"
+        if (r.found || r.dug > 0) diag += "relay:hit"
+        return r.found || r.dug > 0
+    }
+
+    /** The v9 pass over one finals array: Doodstream-first parallel
+     * phase, then parallel windows over the rest, then the phone-side
+     * dig stage - under the hard time budget. [skipDood] drops the
+     * Doodstream finals from every phase (server-flagged dead file). */
+    private suspend fun runPass(
+        finals: org.json.JSONArray,
+        referer: String,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit,
+        diag: MutableList<String>,
+        skipDood: Boolean
+    ): PassResult {
         var found = false
         var dug = 0
         val extracted = HashSet<String>()
         val seenDig = HashSet<String>()
-        if (finals != null) {
+        if (finals.length() > 0) {
             // v9 (Mohamed's order 2026-10-17, after v8 still felt slow):
             // start DIRECTLY with Doodstream - on his device it is the
             // only host class that actually plays; everything else just
@@ -353,7 +416,7 @@ class AnimeZidProvider : MainAPI() {
             val parExtracted = java.util.Collections.synchronizedSet(HashSet<String>())
             fun isDood(u: String): Boolean =
                 u.contains("playmogo") || u.contains("doodstream") || u.contains("dood.")
-            val dsFinals = orderedFinals.filter { isDood(it) }
+            val dsFinals = if (skipDood) emptyList() else orderedFinals.filter { isDood(it) }
             val restFinals = orderedFinals.filter { !isDood(it) }
             suspend fun tryParallel(urls: List<String>) {
                 urls.amap { url ->
@@ -370,7 +433,7 @@ class AnimeZidProvider : MainAPI() {
                 tryParallel(dsFinals)
                 diag += if (emitted.get() > 0) "ds=hit" else "ds:miss"
             } else {
-                diag += "ds:none"
+                diag += if (skipDood) "ds:skip" else "ds:none"
             }
             // Phase 2: everything else, only if Doodstream gave nothing.
             if (emitted.get() == 0) {
@@ -412,9 +475,7 @@ class AnimeZidProvider : MainAPI() {
             diag += "pass:par"
             diag += "pass=" + ((System.currentTimeMillis() - passStart) / 1000) + "s"
         }
-        diag += "relay:digs=$dug"
-        if (found || dug > 0) diag += "relay:hit"
-        return found || dug > 0
+        return PassResult(found, dug)
     }
 
     // ------------------------------------------------------------ v4 dig

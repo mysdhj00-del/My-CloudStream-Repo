@@ -228,10 +228,19 @@ class FasselHDProvider : MainAPI() {
         return rowsToCards(arr(root, "search"))
     }
 
+    /**
+     * Extracts the (kind, id) token from a data string. CloudStream resolves
+     * card URLs against mainUrl before load() (a card stored as "movie:56442"
+     * arrives as "https://fasselhd.com/movie:56442"), so the token is matched
+     * anywhere in the string rather than parsed positionally.
+     */
+    private fun parseToken(data: String): Pair<String, String>? {
+        val m = Regex("""(movie|serie|anime|episode):(\d+)""").find(data) ?: return null
+        return m.groupValues[1] to m.groupValues[2]
+    }
+
     override suspend fun load(url: String): LoadResponse {
-        val kind = url.substringBefore(":")
-        val id = url.substringAfter(":", "")
-        if (id.isBlank()) throw ErrorLoadingException("Bad url")
+        val (kind, id) = parseToken(url) ?: throw ErrorLoadingException("Unknown kind")
         return when (kind) {
             "movie" -> loadMovie(id, url)
             "serie", "anime" -> loadSeries(id, url, kind == "anime")
@@ -335,8 +344,7 @@ class FasselHDProvider : MainAPI() {
 
     /** Pulls the videos[] server list for a movie id or an episode id. */
     private suspend fun fetchServers(data: String): List<ServerRow> {
-        val kind = data.substringBefore(":")
-        val id = data.substringAfter(":", "")
+        val (kind, id) = parseToken(data) ?: return emptyList()
         val videos: JSONArray? = when (kind) {
             "movie" -> arr(apiJson("media/detail/$id/1"), "videos")
             "episode" -> {

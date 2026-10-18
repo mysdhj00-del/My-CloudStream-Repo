@@ -64,6 +64,13 @@ class EgyDeadProvider : MainAPI() {
     // one fixed identity and the phone streams from the relay only.
     private val RELAY_BASE = "https://egydead-stremio.onrender.com"
 
+    // Second door for the same stream proxy (Deno Deploy mirror of
+    // /relay/vid + /relay/hls, added 2026-10-18 for v20): the phone ran
+    // v19 all day without one call reaching the Render door (server
+    // hit-log proof) while its Chrome opened the same host fine — so
+    // v20 tries both doors and uses whichever answers.
+    private val RELAY_BASE_2 = "https://deno-relay.mysdhj00-del.deno.net"
+
     // A browser identity on every request (the provider's standing rule
     // since the v7/v8 CDN blocks): an ANDROID Chrome UA, matching the
     // phone + mobile-carrier reality of the app's traffic.
@@ -375,6 +382,7 @@ class EgyDeadProvider : MainAPI() {
         var dug = 0
         var extracted = 0
         var relayed = 0
+        var doorUsed = "-"
         for (v in sortedTargets) {
             val src = v.optString("src").trim()
             if (src.isEmpty()) continue
@@ -394,14 +402,24 @@ class EgyDeadProvider : MainAPI() {
             }
 
             // v19 FIRST: play through the relay's stream proxy (see
-            // RELAY_BASE). The local dig below stays as a second entry.
+            // RELAY_BASE). v20: TWO doors (Render, then the Deno mirror)
+            // and every call carries pv=20 so the server hit logs prove
+            // which build called and through which door. The local dig
+            // below stays as a second entry.
             var relayOk = false
-            val proxied = runCatching {
-                val relayUrl = RELAY_BASE + "/relay/vid?src=" +
-                    URLEncoder.encode(src, "UTF-8")
-                val respText = app.get(relayUrl, headers = browserHeaders).text
-                JSONObject(respText).optString("master")
-            }.getOrNull()
+            var proxied: String? = null
+            for (base in listOf(RELAY_BASE, RELAY_BASE_2)) {
+                proxied = runCatching {
+                    val relayUrl = base + "/relay/vid?src=" +
+                        URLEncoder.encode(src, "UTF-8") + "&pv=20"
+                    val respText = app.get(relayUrl, headers = browserHeaders).text
+                    JSONObject(respText).optString("master")
+                }.getOrNull()
+                if (!proxied.isNullOrEmpty()) {
+                    doorUsed = if (base == RELAY_BASE) "R" else "D"
+                    break
+                }
+            }
             if (!proxied.isNullOrEmpty()) {
                 emit(serverName, proxied, ExtractorLinkType.M3U8, "$RELAY_BASE/")
                 relayOk = true
@@ -443,6 +461,7 @@ class EgyDeadProvider : MainAPI() {
         }
         diag += "dig:$dug"
         diag += "rel:$relayed"
+        diag += "door:$doorUsed"
         diag += "extr:$extracted"
         emitDebug(diag, callback)
         return true

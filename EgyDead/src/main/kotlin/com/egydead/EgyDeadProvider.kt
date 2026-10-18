@@ -110,11 +110,21 @@ class EgyDeadProvider : MainAPI() {
     @Volatile private var bootDiag: String = "-"
     @Volatile private var lastApiDiag: String = "-"
 
-    private suspend fun ensureSession(force: Boolean = false) {
+    private suspend fun ensureSession(force: Boolean = false): Boolean {
         val fresh = rawCookieHeader.isNotEmpty() &&
             System.currentTimeMillis() - sessionAtMs < 10 * 60 * 1000
-        if (!force && fresh) return
-        val resp = app.get("$mainUrl/", headers = browserHeaders)
+        if (!force && fresh) return true
+        // v21: the bootstrap used to throw straight out of apiGet,
+        // killing loadLinks entirely ("links not available") whenever
+        // the shell GET hiccuped on the phone. Now it degrades: a stale
+        // session is still attempted, and a total failure reports
+        // false so the caller can bow out cleanly.
+        val resp = runCatching { app.get("$mainUrl/", headers = browserHeaders) }
+            .getOrNull()
+        if (resp == null) {
+            bootDiag = "exc"
+            return rawCookieHeader.isNotEmpty()
+        }
         val setCookies = runCatching { resp.headers.values("Set-Cookie") }
             .getOrDefault(emptyList())
         var pairs = setCookies.map { it.substringBefore(';').trim() }
@@ -132,6 +142,7 @@ class EgyDeadProvider : MainAPI() {
             "|csrf${if (csrfToken.isNotEmpty()) 1 else 0}" +
             "|bd${if (resp.text.contains("bootstrapData")) 1 else 0}|len${resp.text.length}"
         sessionAtMs = System.currentTimeMillis()
+        return true
     }
 
     private fun apiHeaders(): Map<String, String> {
@@ -154,7 +165,10 @@ class EgyDeadProvider : MainAPI() {
 
     /** One API GET with a single session-refresh retry on 401/419. */
     private suspend fun apiGet(path: String): JSONObject? {
-        ensureSession()
+        if (!ensureSession() && rawCookieHeader.isEmpty()) {
+            lastApiDiag = "bsx"
+            return null
+        }
         var resp = runCatching {
             app.get("$mainUrl$path", headers = apiHeaders())
         }.getOrNull() ?: run { lastApiDiag = "exc"; return null }
@@ -323,6 +337,23 @@ class EgyDeadProvider : MainAPI() {
         }
     }
 
+    // v21 stage beacon: one tiny pv-tagged GET per loadLinks stage to
+    // the doors' /relay/ping, which only logs {stage, n, pv, door} —
+    // so a single tap on the phone maps exactly which stage died,
+    // read from the server side, no on-screen diagnostics needed.
+    private suspend fun ping(stage: String, n: Int) {
+        for (base in listOf(RELAY_BASE, RELAY_BASE_2)) {
+            val ok = runCatching {
+                app.get(
+                    "$base/relay/ping?pv=21&stage=$stage&n=$n",
+                    headers = browserHeaders
+                )
+                true
+            }.getOrDefault(false)
+            if (ok) return
+        }
+    }
+
     // ---------- links ----------
 
     override suspend fun loadLinks(
@@ -334,11 +365,13 @@ class EgyDeadProvider : MainAPI() {
         val diag = mutableListOf<String>()
         val parts = data.removePrefix("ca://").split('/')
         val titleId = parts.getOrNull(0)?.toIntOrNull() ?: return false
+        ping("start", titleId)
         val episodeId = parts.getOrNull(1)?.toIntOrNull() ?: 0
         val wantSeason = parts.getOrNull(2)?.toIntOrNull()
         val wantEpisode = parts.getOrNull(3)?.toIntOrNull()
 
-        val videos = titleVideos(titleId)
+        val videos = runCatching { titleVideos(titleId) }.getOrDefault(emptyList())
+        ping("vids", videos.size)
         // Matching cascade against the operator's messy linkage: exact
         // episode_id first, then season/episode numbers; a "movie" whose
         // rows all carry episode ids falls back to every row.
@@ -360,6 +393,7 @@ class EgyDeadProvider : MainAPI() {
             targets = videos
         }
         val sortedTargets = targets.sortedBy { it.optInt("order") }
+        ping("tgts", sortedTargets.size)
         diag += "vids:${videos.size}/${sortedTargets.size}"
         diag += "m:$mode"
 
@@ -462,6 +496,7 @@ class EgyDeadProvider : MainAPI() {
         diag += "dig:$dug"
         diag += "rel:$relayed"
         diag += "door:$doorUsed"
+        ping("done", relayed)
         diag += "extr:$extracted"
         emitDebug(diag, callback)
         return true

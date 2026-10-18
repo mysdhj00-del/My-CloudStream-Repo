@@ -348,6 +348,22 @@ class EgyDeadProvider : MainAPI() {
         diag += "vids:${videos.size}/${sortedTargets.size}"
         diag += "m:$mode"
 
+        // v18: egybestvid stream tokens are bound to (IP + User-Agent) —
+        // measured live 2026-10-18: the playlist answers 200 when the
+        // request carries the SAME UA that dug the embed, 403 with the
+        // player's default ExoPlayer UA. Every link below therefore ships
+        // an explicit headers map pinning the dig's UA + the embed as
+        // Referer (the Brestj pattern), so the player presents the exact
+        // identity that minted the token.
+        val digUa = browserHeaders.getValue("User-Agent")
+        suspend fun emit(serverName: String, url: String, type: ExtractorLinkType, ref: String) {
+            callback(newExtractorLink(serverName, serverName, url, type) {
+                this.referer = ref
+                this.headers = mapOf("User-Agent" to digUa, "Referer" to ref)
+                this.quality = Qualities.Unknown.value
+            })
+        }
+
         var dug = 0
         var extracted = 0
         for (v in sortedTargets) {
@@ -358,18 +374,12 @@ class EgyDeadProvider : MainAPI() {
 
             // A direct file handed over as-is.
             if (src.contains(".m3u8")) {
-                callback(newExtractorLink(serverName, serverName, src, ExtractorLinkType.M3U8) {
-                    this.referer = "$mainUrl/"
-                    this.quality = Qualities.Unknown.value
-                })
+                emit(serverName, src, ExtractorLinkType.M3U8, "$mainUrl/")
                 dug++
                 continue
             }
             if (src.contains(".mp4")) {
-                callback(newExtractorLink(serverName, serverName, src, ExtractorLinkType.VIDEO) {
-                    this.referer = "$mainUrl/"
-                    this.quality = Qualities.Unknown.value
-                })
+                emit(serverName, src, ExtractorLinkType.VIDEO, "$mainUrl/")
                 dug++
                 continue
             }
@@ -387,17 +397,11 @@ class EgyDeadProvider : MainAPI() {
                     .find(clean)?.value
                 when {
                     playlist != null -> {
-                        callback(newExtractorLink(serverName, serverName, playlist, ExtractorLinkType.M3U8) {
-                            this.referer = src
-                            this.quality = Qualities.Unknown.value
-                        })
+                        emit(serverName, playlist, ExtractorLinkType.M3U8, src)
                         emitted = true
                     }
                     file != null -> {
-                        callback(newExtractorLink(serverName, serverName, file, ExtractorLinkType.VIDEO) {
-                            this.referer = src
-                            this.quality = Qualities.Unknown.value
-                        })
+                        emit(serverName, file, ExtractorLinkType.VIDEO, src)
                         emitted = true
                     }
                 }

@@ -339,8 +339,36 @@ class FasselHDProvider : MainAPI() {
         val link: String,
         val tmpLink: String?,
         val referer: String?,
+        val extraHeaders: Map<String, String>,
         val userAgent: String?
     )
+
+    /**
+     * The API's video "header" field is polymorphic (measured 2026-10-18):
+     * a plain URL means Referer ("https://faselhd.center/"), while other
+     * rows carry a pipe-separated header blob meant for the player
+     * ("Accept-Encoding:identity|connection:keep-alive" on the seriesmp4
+     * rows). Parse each shape into its proper place.
+     */
+    private fun parseHeaderField(raw: String): Pair<String?, Map<String, String>> {
+        val t = raw.trim()
+        if (t.isBlank()) return null to emptyMap()
+        if (t.startsWith("http")) return t to emptyMap()
+        val extra = LinkedHashMap<String, String>()
+        if (t.contains(":")) {
+            for (part in t.split("|")) {
+                val kv = part.split(":", limit = 2)
+                if (kv.size == 2) {
+                    val k = kv[0].trim()
+                    val v = kv[1].trim()
+                    if (k.isNotBlank() && v.isNotBlank() &&
+                        k.all { it.isLetterOrDigit() || it == '-' }
+                    ) extra[k] = v
+                }
+            }
+        }
+        return null to extra
+    }
 
     /** Pulls the videos[] server list for a movie id or an episode id. */
     private suspend fun fetchServers(data: String): List<ServerRow> {
@@ -361,11 +389,13 @@ class FasselHDProvider : MainAPI() {
             val v = videos.optJSONObject(i) ?: continue
             val link = s(v, "link")
             if (link.isBlank()) continue
+            val (ref, extra) = parseHeaderField(s(v, "header"))
             out += ServerRow(
                 server = s(v, "server").ifBlank { "Server" },
                 link = link,
                 tmpLink = s(v, "tmp_link").ifBlank { null },
-                referer = s(v, "header").ifBlank { null },
+                referer = ref,
+                extraHeaders = extra,
                 userAgent = s(v, "useragent").ifBlank { null }
             )
         }
@@ -440,10 +470,69 @@ class FasselHDProvider : MainAPI() {
     }
 
     /**
+     * Streaming probe of a candidate direct URL: opens the connection,
+     * reads AT MOST 512 bytes, disconnects. Returns 1 when the response
+     * looks like media, 0 when it is provably not (HTTP error, an HTML
+     * body, or a playlist URL whose body is not a playlist), -1 when the
+     * probe itself could not decide. This exists because the operator's
+     * "direct .mp4" rows can be HTML WRAPPER pages (seriesmp4 CDN: the
+     * .mp4 URL serves a page hiding the real file in an iframe) — feeding
+     * one to the player raw is exactly ExoPlayer's
+     * ERROR_CODE_PARSING_CONTAINER_UNSUPPORTED (measured on-device
+     * 2026-10-18, The Odyssey).
+     */
+    private fun probeMedia(
+        url: String,
+        referer: String?,
+        ua: String?,
+        extra: Map<String, String> = emptyMap()
+    ): Int {
+        return try {
+            val conn = (java.net.URL(url).openConnection() as? java.net.HttpURLConnection)
+                ?: return -1
+            conn.connectTimeout = 6000
+            conn.readTimeout = 6000
+            conn.setRequestProperty("Range", "bytes=0-511")
+            conn.setRequestProperty("User-Agent", ua?.ifBlank { null } ?: browserUA)
+            if (!referer.isNullOrBlank() && asciiSafe(referer)) {
+                conn.setRequestProperty("Referer", referer)
+            }
+            for ((k, v) in extra) {
+                if (asciiSafe(k) && asciiSafe(v)) conn.setRequestProperty(k, v)
+            }
+            val code = conn.responseCode
+            if (code !in 200..299) {
+                conn.disconnect()
+                return 0
+            }
+            val ctype = (conn.contentType ?: "").lowercase()
+            val buf = ByteArray(512)
+            var n = 0
+            val ins = conn.inputStream
+            while (n < 512) {
+                val r = ins.read(buf, n, 512 - n)
+                if (r <= 0) break
+                n += r
+            }
+            conn.disconnect()
+            val head = String(buf, 0, n, Charsets.UTF_8).trimStart()
+            when {
+                url.contains(".m3u8") -> if (head.startsWith("#EXTM3U")) 1 else 0
+                ctype.contains("text/html") || head.startsWith("<") -> 0
+                else -> 1
+            }
+        } catch (e: Exception) {
+            -1
+        }
+    }
+
+    /**
      * Phone-side dig: fetch an embed/API page with the row's own identity,
-     * scan raw text, then unpacked packed-JS, then chase one iframe or one
-     * embed-shaped URL found in the body (vidsrc / WordPress player pages /
-     * API endpoints that answer with an embed reference).
+     * then — in order — a media-bearing iframe src (the seriesmp4 wrapper
+     * hides a Yandex-Disk downloader URL in a hidden iframe; it is the
+     * real file), the raw-text scan, the unpacked packed-JS scan, and one
+     * iframe/embed chase (vidsrc / WordPress player pages / API endpoints
+     * that answer with an embed reference).
      */
     private suspend fun digForDirect(
         url: String,
@@ -451,16 +540,24 @@ class FasselHDProvider : MainAPI() {
         ua: String?,
         depth: Int = 0
     ): String? {
-        val text = runCatching {
+        val rawText = runCatching {
             app.get(url, headers = pageHeaders(ua, referer)).text
         }.getOrNull() ?: return null
+        val text = rawText.replace("&amp;", "&")
+        val iframeSrc = Regex("""<iframe[^>]+src\s*=\s*["'](https?://[^"']+)["']""")
+            .find(text)?.groupValues?.get(1)
+        if (iframeSrc != null &&
+            (iframeSrc.contains(".mp4") || iframeSrc.contains(".m3u8") ||
+                iframeSrc.contains("downloader.") || iframeSrc.contains("storage."))
+        ) {
+            return iframeSrc
+        }
         extractDirect(text)?.let { return it }
         for (plain in unpackPackedJs(text)) {
             extractDirect(plain)?.let { return it }
         }
         if (depth >= 1) return null
-        val chase = Regex("""<iframe[^>]+src\s*=\s*["'](https?://[^"']+)["']""")
-            .find(text)?.groupValues?.get(1)
+        val chase = iframeSrc
             ?: Regex("""https?://[^\s"'<>]+(?:/embed|/e/|/watch)[^\s"'<>]*""")
                 .find(text.replace("\\/", "/"))?.value
         if (chase != null && chase != url && !chase.contains("google") &&
@@ -478,11 +575,15 @@ class FasselHDProvider : MainAPI() {
         direct: String,
         referer: String,
         ua: String?,
-        callback: (ExtractorLink) -> Unit
+        callback: (ExtractorLink) -> Unit,
+        extra: Map<String, String> = emptyMap()
     ) {
         val headers = LinkedHashMap<String, String>()
-        if (asciiSafe(referer)) headers["Referer"] = referer
+        if (referer.isNotBlank() && asciiSafe(referer)) headers["Referer"] = referer
         headers["User-Agent"] = ua?.ifBlank { null } ?: browserUA
+        for ((k, v) in extra) {
+            if (asciiSafe(k) && asciiSafe(v)) headers[k] = v
+        }
         callback(
             newExtractorLink(
                 name, label, direct,
@@ -501,7 +602,8 @@ class FasselHDProvider : MainAPI() {
         referer: String?,
         label: String,
         ua: String?,
-        callback: (ExtractorLink) -> Unit
+        callback: (ExtractorLink) -> Unit,
+        extra: Map<String, String> = emptyMap()
     ): Int {
         val relayUrl = "$relayBase/relay/resolve?url=" +
             java.net.URLEncoder.encode(embed, "UTF-8") +
@@ -520,8 +622,10 @@ class FasselHDProvider : MainAPI() {
         for (i in 0 until resArr.length()) {
             val item = resArr.optJSONObject(i) ?: continue
             val link = item.optString("url")
-            if (link.isNotBlank()) {
-                emitDirect(label, link, embed, ua, callback)
+            if (link.isNotBlank() &&
+                probeMedia(link, embed, ua, extra) != 0
+            ) {
+                emitDirect(label, link, embed, ua, callback, extra)
                 emitted++
             }
         }
@@ -548,15 +652,29 @@ class FasselHDProvider : MainAPI() {
         val handled = HashSet<String>()
         val digQueue = ArrayList<ServerRow>()
 
-        // Phase A (no fetch): direct media rows, then extractor-known hosts.
+        // Phase A (no page fetch): direct-media rows are PROBED first —
+        // an .mp4 URL that answers with an HTML wrapper page is not a
+        // direct at all; it goes to the dig queue like any embed. Rows on
+        // extractor-known hosts go to the app's extractors.
+        var fake = 0
         for (row in servers) {
             if (isDirectMedia(row.link)) {
-                emitDirect(row.server, row.link, row.referer ?: mainUrl, row.userAgent, counting)
-                handled += row.link
+                val verdict = probeMedia(row.link, row.referer, row.userAgent, row.extraHeaders)
+                if (verdict == 0) {
+                    fake++
+                    digQueue += row
+                } else {
+                    emitDirect(
+                        row.server, row.link, row.referer ?: mainUrl,
+                        row.userAgent, counting, row.extraHeaders
+                    )
+                    handled += row.link
+                }
             }
         }
+        diag += "fake=$fake"
         for (row in servers) {
-            if (row.link in handled) continue
+            if (row.link in handled || row in digQueue) continue
             if (isExtractorKnown(row.link)) {
                 val ok = runCatching {
                     loadExtractor(row.link, row.referer ?: mainUrl, subtitleCallback, counting)
@@ -572,6 +690,7 @@ class FasselHDProvider : MainAPI() {
         // datacenter IPs by design; the phone is their intended client).
         // Brestj-class discipline: stop once enough playable links exist or
         // the time budget is spent; also try each row's tmp_link variant.
+        // Every dug candidate is probed before it is emitted.
         val dugOk = HashSet<String>()
         var digs = 0
         for (row in digQueue) {
@@ -579,10 +698,18 @@ class FasselHDProvider : MainAPI() {
             if (System.currentTimeMillis() - started > 12_000) break
             if (digs >= 5) break
             digs++
-            val direct = digForDirect(row.link, row.referer, row.userAgent)
-                ?: row.tmpLink?.let { digForDirect(it, row.referer, row.userAgent) }
+            var direct = digForDirect(row.link, row.referer, row.userAgent)
+            if (direct != null &&
+                probeMedia(direct, row.link, row.userAgent, row.extraHeaders) == 0
+            ) direct = null
+            if (direct == null && row.tmpLink != null) {
+                direct = digForDirect(row.tmpLink, row.referer, row.userAgent)
+                if (direct != null &&
+                    probeMedia(direct, row.tmpLink, row.userAgent, row.extraHeaders) == 0
+                ) direct = null
+            }
             if (direct != null) {
-                emitDirect(row.server, direct, row.link, row.userAgent, counting)
+                emitDirect(row.server, direct, row.link, row.userAgent, counting, row.extraHeaders)
                 dugOk += row.link
             }
         }
@@ -595,7 +722,9 @@ class FasselHDProvider : MainAPI() {
             if (relayed >= 3) break
             if (row.link in dugOk) continue
             if (System.currentTimeMillis() - started > 20_000) break
-            relayed += resolveViaRelay(row.link, row.referer, row.server, row.userAgent, counting)
+            relayed += resolveViaRelay(
+                row.link, row.referer, row.server, row.userAgent, counting, row.extraHeaders
+            )
         }
         diag += "relay=$relayed"
 

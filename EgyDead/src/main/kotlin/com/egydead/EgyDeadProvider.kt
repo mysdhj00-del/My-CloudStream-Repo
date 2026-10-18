@@ -169,7 +169,11 @@ class EgyDeadProvider : MainAPI() {
         if (title.isEmpty()) return null
         val url = "$mainUrl/title/$id"
         val poster = o.optString("poster").takeIf { it.isNotEmpty() }
-        return if (o.optString("type") == "series") {
+        // The operator mistypes part of the catalog: real series (Vikings,
+        // 6 seasons, 89 episode videos) arrive with type="movie". A title
+        // with seasons is a series whatever the type field claims.
+        val isSeries = o.optString("type") == "series" || o.optInt("seasons_count") > 0
+        return if (isSeries) {
             newTvSeriesSearchResponse(title, url, TvType.TvSeries) {
                 this.posterUrl = poster
             }
@@ -222,7 +226,9 @@ class EgyDeadProvider : MainAPI() {
             for (i in 0 until data.length()) {
                 data.optJSONObject(i)?.let { out += it }
             }
-            if (pag.optInt("current_page") >= pag.optInt("last_page")) break
+            // This API uses simple pagination (last_page/total are null):
+            // a full page means there may be more; a short page is the end.
+            if (data.length() < 100) break
             page++
         }
         return out
@@ -242,7 +248,13 @@ class EgyDeadProvider : MainAPI() {
         val year = t.optString("release_date").take(4).toIntOrNull()
         val tags = parseTags(t)
 
-        return if (t.optString("type") != "series") {
+        // Structural series test (the type field lies for part of the
+        // catalog — see titleCard): seasons in the payload or a seasons
+        // count make it a series regardless of the claimed type.
+        val seasonsData = json.optJSONObject("seasons")?.optJSONArray("data")
+        val isSeries = t.optString("type") == "series" ||
+            t.optInt("seasons_count") > 0 || (seasonsData?.length() ?: 0) > 0
+        return if (!isSeries) {
             newMovieLoadResponse(title, url, TvType.Movie, "ca://$id/0") {
                 this.posterUrl = poster
                 this.plot = plot
@@ -263,7 +275,7 @@ class EgyDeadProvider : MainAPI() {
                 .map { (epId, v) ->
                     val s = v.optInt("season_num", 1)
                     val e = v.optInt("episode_num", 1)
-                    newEpisode("ca://$id/$epId") {
+                    newEpisode("ca://$id/$epId/$s/$e") {
                         this.season = s
                         this.episode = e
                         this.name = "الحلقة $e"
@@ -308,17 +320,37 @@ class EgyDeadProvider : MainAPI() {
         val parts = data.removePrefix("ca://").split('/')
         val titleId = parts.getOrNull(0)?.toIntOrNull() ?: return false
         val episodeId = parts.getOrNull(1)?.toIntOrNull() ?: 0
+        val wantSeason = parts.getOrNull(2)?.toIntOrNull()
+        val wantEpisode = parts.getOrNull(3)?.toIntOrNull()
 
         val videos = titleVideos(titleId)
-        val targets = videos.filter { v ->
-            if (episodeId == 0) v.isNull("episode_id")
-            else !v.isNull("episode_id") && v.optInt("episode_id") == episodeId
-        }.sortedBy { it.optInt("order") }
-        diag += "vids:${videos.size}/${targets.size}"
+        // Matching cascade against the operator's messy linkage: exact
+        // episode_id first, then season/episode numbers; a "movie" whose
+        // rows all carry episode ids falls back to every row.
+        var mode = "id"
+        var targets = if (episodeId == 0) {
+            mode = "null"
+            videos.filter { it.isNull("episode_id") }
+        } else {
+            videos.filter { !it.isNull("episode_id") && it.optInt("episode_id") == episodeId }
+        }
+        if (targets.isEmpty() && wantSeason != null && wantEpisode != null) {
+            mode = "se"
+            targets = videos.filter {
+                it.optInt("season_num") == wantSeason && it.optInt("episode_num") == wantEpisode
+            }
+        }
+        if (targets.isEmpty() && episodeId == 0 && videos.isNotEmpty()) {
+            mode = "all"
+            targets = videos
+        }
+        val sortedTargets = targets.sortedBy { it.optInt("order") }
+        diag += "vids:${videos.size}/${sortedTargets.size}"
+        diag += "m:$mode"
 
         var dug = 0
         var extracted = 0
-        for (v in targets) {
+        for (v in sortedTargets) {
             val src = v.optString("src").trim()
             if (src.isEmpty()) continue
             val serverName = v.optString("name").trim()

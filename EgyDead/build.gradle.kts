@@ -1,5 +1,5 @@
 // EgyDead CloudStream plugin module.
-version = 16
+version = 17
 
 android {
     namespace = "com.egydead"

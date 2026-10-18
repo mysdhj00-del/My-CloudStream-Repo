@@ -23,6 +23,7 @@ import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.loadExtractor
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import org.json.JSONObject
+import java.net.URLEncoder
 
 /**
  * EgyDead provider for CloudStream 3 — v15, rebuilt on the operator's own
@@ -55,6 +56,13 @@ class EgyDeadProvider : MainAPI() {
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries, TvType.Anime)
     override val hasMainPage = true
     override val hasQuickSearch = false
+
+    // Stream-proxy relay (our own Render service). Playback goes through
+    // it because egybestvid's stream tokens validate the fetching
+    // identity's FULL header profile + IP (measured 2026-10-18), which no
+    // player can reproduce — the relay digs and fetches everything with
+    // one fixed identity and the phone streams from the relay only.
+    private val RELAY_BASE = "https://egydead-stremio.onrender.com"
 
     // A browser identity on every request (the provider's standing rule
     // since the v7/v8 CDN blocks): an ANDROID Chrome UA, matching the
@@ -366,6 +374,7 @@ class EgyDeadProvider : MainAPI() {
 
         var dug = 0
         var extracted = 0
+        var relayed = 0
         for (v in sortedTargets) {
             val src = v.optString("src").trim()
             if (src.isEmpty()) continue
@@ -384,6 +393,22 @@ class EgyDeadProvider : MainAPI() {
                 continue
             }
 
+            // v19 FIRST: play through the relay's stream proxy (see
+            // RELAY_BASE). The local dig below stays as a second entry.
+            var relayOk = false
+            val proxied = runCatching {
+                val relayUrl = RELAY_BASE + "/relay/vid?src=" +
+                    URLEncoder.encode(src, "UTF-8")
+                val respText = app.get(relayUrl, headers = browserHeaders).text
+                JSONObject(respText).optString("master")
+            }.getOrNull()
+            if (!proxied.isNullOrEmpty()) {
+                emit(serverName, proxied, ExtractorLinkType.M3U8, "$RELAY_BASE/")
+                relayOk = true
+                relayed++
+            }
+            val dispName = if (relayOk) "$serverName (مباشر)" else serverName
+
             // Dig the embed page locally: plain JW file:/sources first.
             val text = runCatching {
                 app.get(src, headers = browserHeaders, referer = "$mainUrl/").text
@@ -397,11 +422,11 @@ class EgyDeadProvider : MainAPI() {
                     .find(clean)?.value
                 when {
                     playlist != null -> {
-                        emit(serverName, playlist, ExtractorLinkType.M3U8, src)
+                        emit(dispName, playlist, ExtractorLinkType.M3U8, src)
                         emitted = true
                     }
                     file != null -> {
-                        emit(serverName, file, ExtractorLinkType.VIDEO, src)
+                        emit(dispName, file, ExtractorLinkType.VIDEO, src)
                         emitted = true
                     }
                 }
@@ -417,6 +442,7 @@ class EgyDeadProvider : MainAPI() {
             }
         }
         diag += "dig:$dug"
+        diag += "rel:$relayed"
         diag += "extr:$extracted"
         emitDebug(diag, callback)
         return true

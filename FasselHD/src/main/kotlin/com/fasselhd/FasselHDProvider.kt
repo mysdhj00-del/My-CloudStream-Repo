@@ -27,6 +27,9 @@ import com.lagradost.cloudstream3.utils.loadExtractor
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import org.json.JSONArray
 import org.json.JSONObject
+import java.util.concurrent.Callable
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 
 /**
  * FasselHD (fasselhd.com) provider for CloudStream 3.
@@ -506,13 +509,14 @@ class FasselHDProvider : MainAPI() {
         url: String,
         referer: String?,
         ua: String?,
-        extra: Map<String, String> = emptyMap()
+        extra: Map<String, String> = emptyMap(),
+        timeoutMs: Int = 6000
     ): Int {
         return try {
             val conn = (java.net.URL(url).openConnection() as? java.net.HttpURLConnection)
                 ?: return -1
-            conn.connectTimeout = 6000
-            conn.readTimeout = 6000
+            conn.connectTimeout = timeoutMs
+            conn.readTimeout = timeoutMs
             conn.setRequestProperty("Range", "bytes=0-511")
             conn.setRequestProperty("User-Agent", ua?.ifBlank { null } ?: browserUA)
             if (!referer.isNullOrBlank() && asciiSafe(referer)) {
@@ -594,6 +598,9 @@ class FasselHDProvider : MainAPI() {
     }
 
     private fun asciiSafe(v: String): Boolean = v.all { it.code < 128 }
+
+    private fun hostOf(url: String): String =
+        runCatching { java.net.URL(url).host ?: url }.getOrDefault(url)
 
     private suspend fun emitDirect(
         label: String,
@@ -677,39 +684,62 @@ class FasselHDProvider : MainAPI() {
         val handled = HashSet<String>()
         val digQueue = ArrayList<ServerRow>()
 
-        // Phase A (no page fetch): direct-media rows are PROBED first —
+        // Phase A: direct-media rows are PROBED before anyone trusts them —
         // an .mp4 URL that answers with an HTML wrapper page is not a
-        // direct at all; it goes to the dig queue like any embed. Rows on
-        // extractor-known hosts go to the app's extractors.
+        // direct at all; it goes to the dig queue like any embed. Probes
+        // run IN PARALLEL, one representative per host (quality siblings
+        // on one host share the verdict), under a hard 5 s wall: four
+        // sequential probes with 6 s timeouts starved every later phase
+        // on-device (measured 2026-10-18, The Odyssey: fake=4 dig=0
+        // relay=0 — the phases never got a turn).
         var fake = 0
-        for (row in servers) {
-            if (isDirectMedia(row.link)) {
-                val verdict = probeMedia(row.link, row.referer, row.userAgent, row.extraHeaders)
-                if (verdict == 0) {
-                    fake++
-                    digQueue += row
-                } else {
-                    emitDirect(
-                        row.server, row.link, row.referer ?: mainUrl,
-                        row.userAgent, counting, row.extraHeaders
-                    )
-                    handled += row.link
+        val directRows = servers.filter { isDirectMedia(it.link) }
+        val verdictByHost = HashMap<String, Int>()
+        if (directRows.isNotEmpty()) {
+            val reps = LinkedHashMap<String, ServerRow>()
+            for (row in directRows) reps.putIfAbsent(hostOf(row.link), row)
+            val pool = Executors.newFixedThreadPool(minOf(4, reps.size))
+            try {
+                val futures = reps.mapValues { (_, rep) ->
+                    pool.submit(Callable {
+                        probeMedia(rep.link, rep.referer, rep.userAgent, rep.extraHeaders, 4000)
+                    })
                 }
+                val deadline = System.currentTimeMillis() + 5000
+                for ((host, future) in futures) {
+                    val remain = deadline - System.currentTimeMillis()
+                    verdictByHost[host] = if (remain <= 0) -1 else try {
+                        future.get(remain, TimeUnit.MILLISECONDS)
+                    } catch (e: Exception) {
+                        -1
+                    }
+                }
+            } finally {
+                pool.shutdownNow()
+            }
+        }
+        for (row in directRows) {
+            val verdict = verdictByHost[hostOf(row.link)] ?: -1
+            if (verdict == 0) {
+                fake++
+                digQueue += row
+            } else {
+                emitDirect(
+                    row.server, row.link, row.referer ?: mainUrl,
+                    row.userAgent, counting, row.extraHeaders
+                )
+                handled += row.link
             }
         }
         diag += "fake=$fake"
+        // Extractor-known rows are tried AFTER the dig phase (below) so a
+        // slow extractor can never starve the digs again; failures there
+        // still fall through to the relay.
+        val extractorRows = ArrayList<ServerRow>()
         for (row in servers) {
             if (row.link in handled || row in digQueue) continue
-            if (isExtractorKnown(row.link)) {
-                val ok = runCatching {
-                    loadExtractor(row.link, row.referer ?: mainUrl, subtitleCallback, counting)
-                }.getOrDefault(false)
-                if (ok) handled += row.link else digQueue += row
-            } else {
-                digQueue += row
-            }
+            if (isExtractorKnown(row.link)) extractorRows += row else digQueue += row
         }
-        diag += "ext=$emitted"
 
         // Phase B: phone-side dig of the rest (the embed hosts wall off
         // datacenter IPs by design; the phone is their intended client).
@@ -721,8 +751,8 @@ class FasselHDProvider : MainAPI() {
         var digs = 0
         for (row in digQueue) {
             if (emitted >= 6) break
-            if (System.currentTimeMillis() - started > 12_000) break
-            if (digs >= 5) break
+            if (System.currentTimeMillis() - started > 14_000) break
+            if (digs >= 6) break
             digs++
             var rowEmitted = false
             val targets = listOfNotNull(row.link, row.tmpLink)
@@ -731,7 +761,7 @@ class FasselHDProvider : MainAPI() {
                 val candidates = digAllForDirects(target, row.referer, row.userAgent)
                 for (cand in candidates) {
                     if (emitted >= 6) break
-                    if (probeMedia(cand, target, row.userAgent, row.extraHeaders) == 0) continue
+                    if (probeMedia(cand, target, row.userAgent, row.extraHeaders, 4000) == 0) continue
                     emitDirect(row.server, cand, target, row.userAgent, counting, row.extraHeaders)
                     rowEmitted = true
                 }
@@ -740,18 +770,34 @@ class FasselHDProvider : MainAPI() {
         }
         diag += "dig=$digs"
 
+        // Phase A2: the app's extractors for extractor-known hosts.
+        val relayQueue = ArrayList<ServerRow>()
+        for (row in extractorRows) {
+            if (emitted >= 6) break
+            if (System.currentTimeMillis() - started > 16_000) {
+                relayQueue += row
+                continue
+            }
+            val ok = runCatching {
+                loadExtractor(row.link, row.referer ?: mainUrl, subtitleCallback, counting)
+            }.getOrDefault(false)
+            if (ok) handled += row.link else relayQueue += row
+        }
+        diag += "ext=$emitted"
+
         // Phase C: relay dig for whatever is still unresolved (the relay's
         // egress passes some gates the phone may not, and vice versa).
         var relayed = 0
-        for (row in digQueue) {
+        for (row in digQueue + relayQueue) {
             if (relayed >= 3) break
-            if (row.link in dugOk) continue
-            if (System.currentTimeMillis() - started > 20_000) break
+            if (row.link in dugOk || row.link in handled) continue
+            if (System.currentTimeMillis() - started > 24_000) break
             relayed += resolveViaRelay(
                 row.link, row.referer, row.server, row.userAgent, counting, row.extraHeaders
             )
         }
         diag += "relay=$relayed"
+        diag += "t=${(System.currentTimeMillis() - started) / 1000}s"
 
         if (emitted == 0) {
             emitDebug(diag, callback)

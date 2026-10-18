@@ -10,11 +10,7 @@ import com.lagradost.cloudstream3.SearchResponse
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.TvType
 import com.lagradost.cloudstream3.app
-import com.lagradost.cloudstream3.amap
-import com.lagradost.cloudstream3.fixUrl
-import com.lagradost.cloudstream3.fixUrlNull
 import com.lagradost.cloudstream3.mainPageOf
-import com.lagradost.cloudstream3.newAnimeSearchResponse
 import com.lagradost.cloudstream3.newEpisode
 import com.lagradost.cloudstream3.newHomePageResponse
 import com.lagradost.cloudstream3.newMovieLoadResponse
@@ -27,36 +23,42 @@ import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.loadExtractor
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import org.json.JSONObject
-import org.jsoup.nodes.Document
-import org.jsoup.nodes.Element
 
 /**
- * EgyDead provider for CloudStream 3.
+ * EgyDead provider for CloudStream 3 — v15, rebuilt on the operator's own
+ * app domain egydead.ca (an MTDb v4 instance) after tv10.egydead.live raised
+ * a full interactive Cloudflare challenge against every non-browser client
+ * (measured 2026-10-17/18: Deno, Render, sandbox impersonation, headless
+ * Chrome and GitHub Actions egress all answer 403; the .ca zone carries no
+ * such challenge and answers plain requests).
  *
- * Built against the live structure of https://tv10.egydead.live verified on 2026-10-15:
- * - Content cards are a bare <a> wrapping <img src> + <h1 class="BottomTitle"> +
- *   <span class="cat_name"> (in archives wrapped by li.movieItem).
- * - Posts live at /{slug}/, series at /serie/{slug}/, seasons at /season/{slug}/,
- *   episodes at /episode/{slug}/ (slug carries sXXeYY).
- * - Search is WordPress style: /?s={query}. Pagination is {base}?page={n}/.
- * - Watching is unlocked by POSTing View=1 to the same post URL (.watchNow form);
- *   the watch view exposes .serversList li[data-link] embeds and a player iframe
- *   under .watchAreaMaster .holder iframe.
+ * Chain verified live from the sandbox on 2026-10-18 before this build:
+ * - Bootstrap: GET / sets the guest session cookies and embeds
+ *   window.bootstrapData with a csrf_token. The JSON API answers 401 with
+ *   no cookies AND with cookies alone; cookies + X-XSRF-TOKEN (the decoded
+ *   XSRF cookie) + X-CSRF-TOKEN (bootstrap token) answer 200.
+ * - Catalog/search: GET /api/v1/titles?type=movie|series&query=&orderBy=
+ *   views|popularity&orderDirection=desc&page=&perPage= -> paginated JSON.
+ * - Detail: GET /api/v1/titles/{id} -> title + seasons skeleton.
+ * - Videos: GET /api/v1/videos?title_id={id}&perPage=100&page= -> every
+ *   server row inline (name, src, episode_id, season_num, episode_num).
+ *   Episodes are grouped client-side from these rows.
+ * - Playback: a video's src is an embed page (egybestvid.com class) whose
+ *   HTML carries a plain JW `file:` master.m3u8 — dug LOCALLY on the phone
+ *   (stream tokens may be IP-bound; nothing is dug server-side), with
+ *   CloudStream's built-in extractors as the fallback for other hosts.
  */
 class EgyDeadProvider : MainAPI() {
-    override var mainUrl = "https://tv10.egydead.live"
+    override var mainUrl = "https://egydead.ca"
     override var name = "EgyDead"
     override var lang = "ar"
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries, TvType.Anime)
     override val hasMainPage = true
     override val hasQuickSearch = false
 
-    // The site's CDN rejects the HTTP library's default user agent outright
-    // (HTTP 520, verified live 2026-10-15: okhttp UA gets 520 on GET and POST,
-    // a browser UA gets the real pages), so every request in this provider
-    // carries a browser header set. The identity is an ANDROID Chrome one:
-    // the app runs on phones behind mobile-carrier IPs, and a desktop
-    // identity arriving from a mobile network is itself a bot-score signal.
+    // A browser identity on every request (the provider's standing rule
+    // since the v7/v8 CDN blocks): an ANDROID Chrome UA, matching the
+    // phone + mobile-carrier reality of the app's traffic.
     private val browserHeaders = mapOf(
         "User-Agent" to "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
         "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
@@ -67,491 +69,191 @@ class EgyDeadProvider : MainAPI() {
         "Upgrade-Insecure-Requests" to "1"
     )
 
-    // Sections mirror the site's own menus (verified live 2026-10-15):
-    // the /h3/ home feed, the /page/movies/ archive, the movie categories
-    // (WordPress "category" taxonomy is movies-only on this site), the
-    // series categories under /series-category/, and the genre list under
-    // /type/ with the site's Arabic labels. Every section is a paginated
-    // archive ({base}?page={n}/, 48 cards per page).
     override val mainPage = mainPageOf(
-        "$mainUrl/h3/" to "المضاف حديثا",
-        "$mainUrl/page/movies/" to "أفلام",
-        "$mainUrl/category/english-movies/" to "أفلام أجنبية",
-        "$mainUrl/category/english-movies/%d8%a7%d9%81%d9%84%d8%a7%d9%85-%d8%a7%d8%ac%d9%86%d8%a8%d9%8a%d8%a9-%d9%85%d8%af%d8%a8%d9%84%d8%ac%d8%a9/" to "أفلام أجنبية مدبلجة",
-        "$mainUrl/category/%d8%a7%d9%81%d9%84%d8%a7%d9%85-%d9%83%d8%b1%d8%aa%d9%88%d9%86/" to "أفلام كرتون",
-        "$mainUrl/category/%d8%a7%d9%81%d9%84%d8%a7%d9%85-%d8%a7%d8%b3%d9%8a%d9%88%d9%8a%d8%a9/" to "أفلام آسيوية",
-        "$mainUrl/category/%d8%a7%d9%81%d9%84%d8%a7%d9%85-%d9%88%d8%ab%d8%a7%d8%a6%d9%82%d9%8a%d8%a9/" to "أفلام وثائقية",
-        "$mainUrl/category/hindi-movies/" to "أفلام هندية",
-        "$mainUrl/category/%d8%a7%d9%81%d9%84%d8%a7%d9%85-%d8%aa%d8%b1%d9%83%d9%8a%d8%a9/" to "أفلام تركية",
-        "$mainUrl/category/%d8%a7%d9%81%d9%84%d8%a7%d9%85-%d8%a7%d9%86%d9%85%d9%8a/" to "أفلام أنمي",
-        "$mainUrl/category/%d8%a7%d9%81%d9%84%d8%a7%d9%85-%d8%b9%d8%b1%d8%a8%d9%8a/" to "أفلام عربية",
-        "$mainUrl/category/%d8%b9%d8%b1%d9%88%d8%b6-%d9%88%d8%ad%d9%81%d9%84%d8%a7%d8%aa/" to "عروض وحفلات",
-        "$mainUrl/category/%d8%b1%d9%8a%d8%a7%d8%b6%d8%a9/" to "رياضة",
-        "$mainUrl/series-category/english-series/" to "مسلسلات أجنبية",
-        "$mainUrl/series-category/arabic-series/" to "مسلسلات عربية",
-        "$mainUrl/series-category/turkish-series/" to "مسلسلات تركية",
-        "$mainUrl/series-category/asian-series/" to "مسلسلات آسيوية",
-        "$mainUrl/series-category/anime-series/" to "مسلسلات أنمي",
-        "$mainUrl/series-category/cartoon-series/" to "مسلسلات كرتون",
-        "$mainUrl/series-category/indian-series/" to "مسلسلات هندية",
-        "$mainUrl/series-category/english-series-dubbed/" to "مسلسلات أجنبية مدبلجة",
-        "$mainUrl/series-category/tv-shows/" to "برامج تلفزيونية",
-        "$mainUrl/type/action/" to "أكشن",
-        "$mainUrl/type/thriller/" to "إثارة",
-        "$mainUrl/type/drama/" to "دراما",
-        "$mainUrl/type/comedy/" to "كوميديا",
-        "$mainUrl/type/horror/" to "رعب",
-        "$mainUrl/type/sci-fi/" to "خيال علمي",
-        "$mainUrl/type/romance/" to "رومانسي",
-        "$mainUrl/type/crime/" to "جريمة",
-        "$mainUrl/type/mystery/" to "غموض",
-        "$mainUrl/type/adventure/" to "مغامرة",
-        "$mainUrl/type/fantasy/" to "فانتازيا",
-        "$mainUrl/type/animation/" to "انيميشن",
-        "$mainUrl/type/war/" to "حربي",
-        "$mainUrl/type/family/" to "عائلي",
-        "$mainUrl/type/history/" to "تاريخي",
-        "$mainUrl/type/documentary/" to "وثائقي",
-        "$mainUrl/type/super-power/" to "قوة خارقة",
-        "$mainUrl/type/martial-arts/" to "فنون قتالية",
-        "$mainUrl/type/supernatural/" to "خارق للطبيعة",
-        "$mainUrl/type/shounen/" to "شونين",
-        "$mainUrl/type/isekai/" to "ايسيكاي",
-        "$mainUrl/type/school/" to "مدرسي",
-        "$mainUrl/type/sports/" to "رياضي",
-        "$mainUrl/type/classic-movies/" to "كلاسيك",
-        "$mainUrl/type/western/" to "ويسترن",
-        "$mainUrl/type/slice-of-life/" to "شريحة من الحياة",
+        "type=movie" to "أحدث الأفلام",
+        "type=series" to "أحدث المسلسلات",
+        "type=movie&orderBy=views&orderDirection=desc" to "أفلام الأكثر مشاهدة",
+        "type=series&orderBy=views&orderDirection=desc" to "مسلسلات الأكثر مشاهدة",
+        "orderBy=popularity&orderDirection=desc" to "الأكثر شعبية"
     )
 
-    // ---------- helpers ----------
+    // ---------- guest session ----------
 
-    private fun detectType(catName: String?, href: String): TvType {
-        val cat = catName.orEmpty()
-        return when {
-            cat.contains("انمي") || cat.contains("أنمي") || cat.contains("انميات") -> TvType.Anime
-            cat.contains("مسلسل") || cat.contains("مسلسلات") || cat.contains("برامج") ||
-                cat.contains("برنامج") -> TvType.TvSeries
+    @Volatile private var sessionCookies: Map<String, String> = emptyMap()
+    @Volatile private var csrfToken: String = ""
+    @Volatile private var sessionAtMs: Long = 0
 
-            cat.contains("افلام") || cat.contains("أفلام") || cat.contains("فيلم") -> TvType.Movie
-            href.contains("/episode/") || href.contains("/season/") ||
-                href.contains("/serie/") -> TvType.TvSeries
-
-            else -> TvType.Movie
-        }
+    private suspend fun ensureSession(force: Boolean = false) {
+        val fresh = sessionCookies.isNotEmpty() &&
+            System.currentTimeMillis() - sessionAtMs < 10 * 60 * 1000
+        if (!force && fresh) return
+        val resp = app.get("$mainUrl/", headers = browserHeaders)
+        sessionCookies = runCatching { resp.cookies }.getOrNull().orEmpty()
+        csrfToken = Regex(""""csrf_token":"([^"]+)"""").find(resp.text)
+            ?.groupValues?.getOrNull(1).orEmpty()
+        sessionAtMs = System.currentTimeMillis()
     }
 
-    /** Parse one content card anchor into a search response. */
-    private fun Element.toCard(): SearchResponse? {
-        val href = fixUrl(attr("href"))
-        if (!href.startsWith(mainUrl)) return null
-        // Skip taxonomy / utility links that are not content posts.
-        if (href.contains("/type/") || href.contains("/category/") ||
-            href.contains("/year/") || href.contains("/quality/") ||
-            href.contains("/country/") || href.contains("/language/")
-        ) return null
+    private fun apiHeaders(): Map<String, String> {
+        val xsrfRaw = sessionCookies.entries
+            .firstOrNull { it.key.contains("XSRF", ignoreCase = true) }?.value.orEmpty()
+        val xsrf = runCatching { java.net.URLDecoder.decode(xsrfRaw, "UTF-8") }
+            .getOrDefault(xsrfRaw)
+        return mapOf(
+            "User-Agent" to browserHeaders.getValue("User-Agent"),
+            "Accept" to "application/json",
+            "Accept-Language" to "ar-EG,ar;q=0.9,en-US;q=0.8,en;q=0.7",
+            "X-Requested-With" to "XMLHttpRequest",
+            "Referer" to "$mainUrl/",
+            "X-XSRF-TOKEN" to xsrf,
+            "X-CSRF-TOKEN" to csrfToken
+        )
+    }
 
-        val titleEl = selectFirst("h1.BottomTitle") ?: selectFirst(".BottomTitle")
-        val title = (titleEl?.text() ?: attr("title")).trim()
-        if (title.isBlank()) return null
+    /** One API GET with a single session-refresh retry on 401/419. */
+    private suspend fun apiGet(path: String): JSONObject? {
+        ensureSession()
+        var resp = runCatching {
+            app.get("$mainUrl$path", headers = apiHeaders(), cookies = sessionCookies)
+        }.getOrNull() ?: return null
+        if (resp.code == 401 || resp.code == 419) {
+            ensureSession(force = true)
+            resp = runCatching {
+                app.get("$mainUrl$path", headers = apiHeaders(), cookies = sessionCookies)
+            }.getOrNull() ?: return null
+        }
+        if (resp.code != 200) return null
+        return runCatching { JSONObject(resp.text) }.getOrNull()
+    }
 
-        val poster = fixUrlNull(selectFirst("img")?.attr("src"))
-        val catName = selectFirst("span.cat_name")?.text()
-        val year = Regex("""(19|20)\d{2}""").find(title)?.value?.toIntOrNull()
+    // ---------- cards / catalog ----------
 
-        return when (detectType(catName, href)) {
-            TvType.Anime -> newAnimeSearchResponse(title, href, TvType.Anime) {
+    private fun titleCard(o: JSONObject): SearchResponse? {
+        val id = o.optInt("id")
+        if (id == 0) return null
+        val title = o.optString("name").trim()
+        if (title.isEmpty()) return null
+        val url = "$mainUrl/title/$id"
+        val poster = o.optString("poster").takeIf { it.isNotEmpty() }
+        return if (o.optString("type") == "series") {
+            newTvSeriesSearchResponse(title, url, TvType.TvSeries) {
                 this.posterUrl = poster
-                this.year = year
             }
-            TvType.TvSeries -> newTvSeriesSearchResponse(title, href, TvType.TvSeries) {
+        } else {
+            newMovieSearchResponse(title, url, TvType.Movie) {
                 this.posterUrl = poster
-                this.year = year
-            }
-            else -> newMovieSearchResponse(title, href, TvType.Movie) {
-                this.posterUrl = poster
-                this.year = year
             }
         }
     }
 
-    /** All unique content cards on a listing page (home / category / search). */
-    private fun Document.parseCards(): List<SearchResponse> {
-        val seen = LinkedHashMap<String, SearchResponse>()
-        select("li.movieItem > a, a:has(.BottomTitle)").forEach { a ->
-            val item = runCatching { a.toCard() }.getOrNull() ?: return@forEach
-            seen.putIfAbsent(item.url, item)
+    private fun paginatedCards(json: JSONObject?): List<SearchResponse> {
+        val data = json?.optJSONObject("pagination")?.optJSONArray("data") ?: return emptyList()
+        val out = ArrayList<SearchResponse>(data.length())
+        for (i in 0 until data.length()) {
+            data.optJSONObject(i)?.let { titleCard(it)?.let { c -> out += c } }
         }
-        return seen.values.toList()
+        return out
     }
-
-    private fun Document.pageTitle(): String? =
-        selectFirst(".singleTitle span em")?.text()?.trim()?.ifBlank { null }
-            ?: selectFirst(".singleTitle")?.text()?.trim()?.ifBlank { null }
-            ?: selectFirst("h1")?.text()?.trim()?.ifBlank { null }
-
-    private fun Document.pagePoster(): String? =
-        fixUrlNull(selectFirst(".single-thumbnail img")?.attr("src"))
-            ?: fixUrlNull(selectFirst("meta[property=\"og:image\"]")?.attr("content"))
-
-    private fun Document.pagePlot(): String? =
-        selectFirst(".extra-content p")?.text()?.trim()?.ifBlank { null }
-            ?: selectFirst(".singleStory")?.text()?.trim()?.ifBlank { null }
-
-    private fun Document.pageYear(): Int? =
-        selectFirst(".LeftBox a[href*=\"/year/\"]")?.text()?.trim()?.toIntOrNull()
-
-    private fun Document.pageTags(): List<String> =
-        select(".LeftBox a[href*=\"/type/\"]").map { it.text().trim() }.filter { it.isNotBlank() }
-
-    private fun episodeNumberOf(href: String, text: String): Int? {
-        Regex("""e(\d{1,4})""").find(href.substringAfter("/episode/", ""))?.let {
-            return it.groupValues[1].toIntOrNull()
-        }
-        return Regex("""\d{1,4}""").findAll(text).lastOrNull()?.value?.toIntOrNull()
-    }
-
-    private fun seasonNumberOf(href: String, text: String = ""): Int? {
-        Regex("""-s(\d{1,3})""").find(href)?.let { return it.groupValues[1].toIntOrNull() }
-        // Arabic season posts carry the number in the slug/title instead:
-        // a plain digit ("الموسم 2") or an ordinal word ("الموسم الرابع").
-        val decoded = runCatching {
-            java.net.URLDecoder.decode("$href $text", "UTF-8")
-        }.getOrDefault(href)
-        Regex("""الموسم\s*(\d{1,3})""").find(decoded)?.let { return it.groupValues[1].toIntOrNull() }
-        if (decoded.contains("الموسم")) {
-            val ordinals = listOf(
-                "الحادي عشر" to 11, "الثاني عشر" to 12,
-                "الأول" to 1, "الاول" to 1, "الثاني" to 2, "الثالث" to 3,
-                "الرابع" to 4, "الخامس" to 5, "السادس" to 6, "السابع" to 7,
-                "الثامن" to 8, "التاسع" to 9, "العاشر" to 10
-            )
-            for ((word, n) in ordinals) if (decoded.contains(word)) return n
-        }
-        return null
-    }
-
-    /** True for URLs on this site's own domain. The site's header menu
-     *  links /season/ and /serie/ archives on the brand's old domain
-     *  (egydead.com); those must never be mistaken for a post's own
-     *  season/series links. */
-    private fun isSiteUrl(u: String): Boolean = u.startsWith(mainUrl)
-
-    /** The parent series page ("all seasons") linked from a season page, or
-     *  null when the post has none. Bare archive links are skipped. */
-    private fun Document.serieParentUrl(): String? =
-        select("a[href*=\"/serie/\"]")
-            .map { fixUrl(it.attr("href")) }
-            .firstOrNull {
-                isSiteUrl(it) && it.contains("/serie/") &&
-                    it.substringAfter("/serie/").isNotBlank()
-            }
-
-    /** Episode links listed on a season page, sorted ascending by episode number. */
-    private fun Document.parseEpisodes(seasonNumber: Int?): List<Episode> {
-        val byUrl = LinkedHashMap<String, Episode>()
-        select("a[href*=\"/episode/\"]").forEach { a ->
-            val href = fixUrl(a.attr("href"))
-            if (!isSiteUrl(href)) return@forEach
-            if (!href.contains("/episode/")) return@forEach
-            if (href.substringAfter("/episode/").isBlank()) return@forEach
-            val epNum = episodeNumberOf(href, a.text())
-            val ep = newEpisode(href, {
-                this.name = a.text().trim().ifBlank { epNum?.let { n -> "الحلقة $n" } }
-                this.season = seasonNumber
-                this.episode = epNum
-            })
-            byUrl.putIfAbsent(href, ep)
-        }
-        return byUrl.values.sortedBy { it.episode ?: Int.MAX_VALUE }
-    }
-
-    /**
-     * Fetches a site page as a parsed document. Since 2026-10-17 the site
-     * sits behind a Cloudflare fingerprint wall that refuses the app's
-     * direct requests (403 "Just a moment"), so pages are fetched through
-     * the relay's Chrome-impersonating /relay/page route first; the direct
-     * fetch remains as a fallback for the day the wall lifts.
-     */
-    private suspend fun fetchDocument(url: String): Document {
-        val relayUrl = "https://deno-relay.mysdhj00-del.deno.net/relay/page?url=" +
-            java.net.URLEncoder.encode(url, "UTF-8")
-        for (attempt in 1..2) {
-            val text = runCatching { app.get(relayUrl).text }.getOrNull()
-            val json = text?.let { runCatching { JSONObject(it) }.getOrNull() }
-            val html = json?.optString("text")?.takeIf { it.isNotBlank() }
-            if (json?.optBoolean("ok") == true && html != null) {
-                return org.jsoup.Jsoup.parse(html, url)
-            }
-            if (attempt == 1) Thread.sleep(2000)
-        }
-        return app.get(url, headers = browserHeaders).document
-    }
-
-    // ---------- MainAPI ----------
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        // Verified pagination pattern: {base}?page={n}/ — it holds for EVERY
-        // section (home feed, /page/movies/, /category/, /series-category/
-        // and /type/ archives alike; page 2+ returns fresh cards, e.g.
-        // /type/action/ runs to 100+ pages). v9: all sections paginate;
-        // v8 and earlier wrongly reported hasNext=false for the /type/ and
-        // other unlisted sections, truncating them to their first page.
-        val url = if (page <= 1) request.data else "${request.data}?page=$page/"
-        val document = fetchDocument(url)
-        val items = document.parseCards()
-        return newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
+        val json = apiGet("/api/v1/titles?${request.data}&perPage=24&page=$page")
+        val pag = json?.optJSONObject("pagination")
+        val hasNext = pag != null && pag.optInt("current_page") < pag.optInt("last_page")
+        return newHomePageResponse(request.name, paginatedCards(json), hasNext)
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
-        val url = "$mainUrl/?s=${java.net.URLEncoder.encode(query, "UTF-8")}"
-        return fetchDocument(url).parseCards()
+        val q = java.net.URLEncoder.encode(query, "UTF-8")
+        return paginatedCards(apiGet("/api/v1/titles?query=$q&perPage=30"))
     }
+
+    // ---------- videos ----------
+
+    /** Every server row of a title, all pages (row cap is a safety valve). */
+    private suspend fun titleVideos(titleId: Int): List<JSONObject> {
+        val out = ArrayList<JSONObject>()
+        var page = 1
+        while (page <= 10) {
+            val json = apiGet("/api/v1/videos?title_id=$titleId&perPage=100&page=$page") ?: break
+            val pag = json.optJSONObject("pagination") ?: break
+            val data = pag.optJSONArray("data") ?: break
+            for (i in 0 until data.length()) {
+                data.optJSONObject(i)?.let { out += it }
+            }
+            if (pag.optInt("current_page") >= pag.optInt("last_page")) break
+            page++
+        }
+        return out
+    }
+
+    // ---------- load ----------
 
     override suspend fun load(url: String): LoadResponse {
-        val document = fetchDocument(url)
+        val id = url.substringAfter("/title/").substringBefore('/').substringBefore('?')
+            .toIntOrNull() ?: throw ErrorLoadingException("Bad title url")
+        val json = apiGet("/api/v1/titles/$id") ?: throw ErrorLoadingException("Title fetch failed")
+        val t = json.optJSONObject("title") ?: throw ErrorLoadingException("No title data")
+        val title = t.optString("name").trim().ifEmpty { throw ErrorLoadingException("No title") }
+        val poster = t.optString("poster").takeIf { it.isNotEmpty() }
+        val plot = t.optString("description").takeIf { it.isNotEmpty() }
+        val year = t.optString("release_date").take(4).toIntOrNull()
+        val tags = parseTags(t)
 
-        return when {
-            url.contains("/season/") -> {
-                // v11: a season post is one slice of a show. When the season
-                // page links its parent series page ("all seasons"), open the
-                // series instead so the user gets EVERY season's episodes
-                // stacked in one list, not just this season's. Posts with no
-                // series page (single-post complete shows) keep the plain
-                // season list below, which is already complete for them.
-                val serieUrl = document.serieParentUrl()
-                if (serieUrl != null && serieUrl != url) {
-                    load(serieUrl)
-                } else {
-                    val title = document.pageTitle() ?: throw ErrorLoadingException("No title")
-                    newTvSeriesLoadResponse(title, url, TvType.TvSeries, document.parseEpisodes(seasonNumberOf(url))) {
-                        this.posterUrl = document.pagePoster()
-                        this.plot = document.pagePlot()
-                        this.year = document.pageYear()
-                        this.tags = document.pageTags()
+        return if (t.optString("type") != "series") {
+            newMovieLoadResponse(title, url, TvType.Movie, "ca://$id/0") {
+                this.posterUrl = poster
+                this.plot = plot
+                this.year = year
+                this.tags = tags
+            }
+        } else {
+            // Episodes are built from the title's video rows: each row
+            // carries its episode_id + season/episode numbers, so an
+            // episode exists exactly when it has at least one server.
+            val byEpisode = LinkedHashMap<Int, JSONObject>()
+            for (v in titleVideos(id)) {
+                if (v.isNull("episode_id")) continue
+                val epId = v.optInt("episode_id")
+                if (epId != 0 && !byEpisode.containsKey(epId)) byEpisode[epId] = v
+            }
+            val episodes = byEpisode.entries
+                .map { (epId, v) ->
+                    val s = v.optInt("season_num", 1)
+                    val e = v.optInt("episode_num", 1)
+                    newEpisode("ca://$id/$epId") {
+                        this.season = s
+                        this.episode = e
+                        this.name = "الحلقة $e"
                     }
                 }
-            }
-
-            url.contains("/serie/") -> {
-                val title = document.pageTitle() ?: throw ErrorLoadingException("No title")
-                val seasonLinks = LinkedHashMap<String, Int?>()
-                // Seasons are listed on the series page as cards; prefer card
-                // anchors so sidebar/feed links of other shows cannot leak
-                // in, and fall back to the plain sweep only when no card
-                // matches.
-                val seasonAnchors = document
-                    .select("li.movieItem > a[href*=\"/season/\"], a:has(.BottomTitle)[href*=\"/season/\"]")
-                    .ifEmpty { document.select("a[href*=\"/season/\"]") }
-                seasonAnchors.forEach { a ->
-                    val href = fixUrl(a.attr("href"))
-                    if (!isSiteUrl(href)) return@forEach
-                    if (!href.contains("/season/")) return@forEach
-                    if (href.contains("/feed")) return@forEach
-                    if (href.substringAfter("/season/").isBlank()) return@forEach
-                    seasonLinks.putIfAbsent(href, seasonNumberOf(href, a.text()))
-                }
-                val episodes = mutableListOf<Episode>()
-                if (seasonLinks.isEmpty()) {
-                    episodes += document.parseEpisodes(1)
-                } else {
-                    seasonLinks.entries.forEachIndexed { index, (seasonUrl, seasonNum) ->
-                        val seasonDoc = runCatching { fetchDocument(seasonUrl) }.getOrNull()
-                            ?: return@forEachIndexed
-                        episodes += seasonDoc.parseEpisodes(seasonNum ?: (index + 1))
-                    }
-                }
-                newTvSeriesLoadResponse(
-                    title, url, TvType.TvSeries,
-                    episodes.sortedWith(compareBy({ it.season ?: 1 }, { it.episode ?: Int.MAX_VALUE }))
-                ) {
-                    this.posterUrl = document.pagePoster()
-                    this.plot = document.pagePlot()
-                    this.year = document.pageYear()
-                    this.tags = document.pageTags()
-                }
-            }
-
-            url.contains("/episode/") -> {
-                // An episode page on this site belongs to a season; jump to the
-                // season (or series) page so the user gets the full episode list.
-                val seasonUrl = document.select("a[href*=\"/season/\"]")
-                    .map { fixUrl(it.attr("href")) }
-                    .firstOrNull { isSiteUrl(it) && it.contains("/season/") }
-                val serieUrl = document.serieParentUrl()
-                when {
-                    seasonUrl != null && seasonUrl != url -> load(seasonUrl)
-                    serieUrl != null && serieUrl != url -> load(serieUrl)
-                    else -> {
-                        val title = document.pageTitle() ?: throw ErrorLoadingException("No title")
-                        val single = newEpisode(url, {
-                            this.name = title
-                            this.season = seasonNumberOf(url)
-                            this.episode = episodeNumberOf(url, title)
-                        })
-                        newTvSeriesLoadResponse(title, url, TvType.TvSeries, listOf(single)) {
-                            this.posterUrl = document.pagePoster()
-                            this.plot = document.pagePlot()
-                            this.year = document.pageYear()
-                            this.tags = document.pageTags()
-                        }
-                    }
-                }
-            }
-
-            else -> {
-                val title = document.pageTitle() ?: throw ErrorLoadingException("No title")
-                newMovieLoadResponse(title, url, TvType.Movie, url) {
-                    this.posterUrl = document.pagePoster()
-                    this.plot = document.pagePlot()
-                    this.year = document.pageYear()
-                    this.tags = document.pageTags()
-                }
+                .sortedWith(compareBy({ it.season ?: 1 }, { it.episode ?: 1 }))
+            if (episodes.isEmpty()) throw ErrorLoadingException("No episodes with servers yet")
+            newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
+                this.posterUrl = poster
+                this.plot = plot
+                this.year = year
+                this.tags = tags
             }
         }
     }
 
-    /** Set by loadViaRelay when the relay's own origin fetches were
-     * answered 403 (the site's wall is up): the local chain cannot do
-     * better, so loadLinks skips it. */
-    @Volatile private var originBlocked = false
-
-    /**
-     * Asks the relay server (the Stremio addon service) to perform the watch
-     * unlock for [data] server-side and feeds what it returns — the MegaMax
-     * mirror list, else the raw embeds — to the built-in extractors.
-     * Returns true when at least one playable link was emitted.
-     */
-    private suspend fun loadViaRelay(
-        data: String,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit,
-        diag: MutableList<String>
-    ): Boolean {
-        val relayUrl = "https://deno-relay.mysdhj00-del.deno.net/relay/egydead?url=" +
-            java.net.URLEncoder.encode(data, "UTF-8")
-        var text: String? = null
-        for (attempt in 1..2) {
-            text = runCatching { app.get(relayUrl).text }.getOrNull()
-            if (text != null) break
-            Thread.sleep(2000)
-        }
-        val body = text ?: run {
-            diag += "relay:fetch-fail"
-            return false
-        }
-        val json = runCatching { JSONObject(body) }.getOrNull() ?: run {
-            diag += "relay:bad-json"
-            return false
-        }
-        if (!json.optBoolean("ok")) {
-            val rd = json.optJSONObject("diag")
-            if (rd != null && (rd.optInt("getCode") == 403 || rd.optInt("postCode") == 403)) {
-                diag += "relay:BLOCKED-403"
-                originBlocked = true
-            } else {
-                diag += "relay:not-ok"
-            }
-            return false
-        }
-        var found = false
-        // v14: PARALLEL mirror pass (the AnimeZid v8/v11 lesson, panel-
-        // confirmed for this shape too). v12/v13 walked the ranked
-        // mirrors SEQUENTIALLY - one extractor round-trip each - so a
-        // few dead hosts burned the whole wait. Now the ranked,
-        // de-duplicated list is tried in windows of 5 concurrent
-        // attempts (amap), at most 2 attempts per host (duplicates of
-        // a dead host cannot eat the budget), still stopping at 6
-        // emitted links / 12 attempts, under a 14 s pass deadline.
-        val emitted = java.util.concurrent.atomic.AtomicInteger(0)
-        val counting: (ExtractorLink) -> Unit = { link ->
-            emitted.incrementAndGet()
-            callback(link)
-        }
-        val mirrors = json.optJSONArray("mirrors")
-        diag += "relay:mirrors=${mirrors?.length() ?: 0}"
-        if (mirrors != null) {
-            val mirrorList = (0 until mirrors.length())
-                .map { mirrors.optString(it) }
-                .filter { it.isNotBlank() }
-                .distinct()
-                .sortedBy { mirrorRank(it) }
-            diag += "relay:mirrorsDedup=${mirrorList.size}"
-            val attempts = java.util.concurrent.atomic.AtomicInteger(0)
-            val perHost = java.util.concurrent.ConcurrentHashMap<String, Int>()
-            val foundAny = java.util.concurrent.atomic.AtomicBoolean(false)
-            val passStart = System.currentTimeMillis()
-            var idx = 0
-            while (idx < mirrorList.size) {
-                if (emitted.get() >= 6 || attempts.get() >= 12) break
-                if (System.currentTimeMillis() - passStart > 14_000) {
-                    diag += "pass:deadline"
-                    break
-                }
-                val window = mirrorList.subList(idx, minOf(idx + 5, mirrorList.size))
-                idx += window.size
-                window.amap { link ->
-                    if (emitted.get() < 6 && attempts.get() < 12) {
-                        val hostKey = runCatching { java.net.URL(link).host }.getOrNull() ?: link
-                        val used = perHost.merge(hostKey, 1) { x, y -> x + y } ?: 1
-                        if (used <= 2) {
-                            attempts.incrementAndGet()
-                            if (loadExtractor(link, data, subtitleCallback, counting)) {
-                                foundAny.set(true)
-                            }
-                        }
-                    }
+    private fun parseTags(t: JSONObject): List<String> {
+        val g = t.opt("genre") ?: return emptyList()
+        return when (g) {
+            is String -> g.split(',').map { it.trim() }.filter { it.isNotEmpty() }
+            is org.json.JSONArray -> (0 until g.length()).mapNotNull { i ->
+                val item = g.opt(i)
+                when (item) {
+                    is String -> item
+                    is JSONObject -> item.optString("name").takeIf { it.isNotEmpty() }
+                    else -> null
                 }
             }
-            found = foundAny.get()
-            diag += "pass:par"
-        }
-        if (!found) {
-            val relayEmbeds = json.optJSONArray("embeds")
-            diag += "relay:embeds=${relayEmbeds?.length() ?: 0}"
-            if (relayEmbeds != null) {
-                for (i in 0 until relayEmbeds.length()) {
-                    if (emitted.get() >= 6) break
-                    val embed = relayEmbeds.optString(i)
-                    if (embed.isBlank()) continue
-                    if (loadExtractor(embed, data, subtitleCallback, counting)) {
-                        found = true
-                        continue
-                    }
-                    if (loadFromMegaMax(embed, data, subtitleCallback, counting, diag)) {
-                        found = true
-                    }
-                }
-            }
-        }
-        if (found) diag += "relay:hit"
-        return found
-    }
-
-    /** v12: fastest/most reliable mirror hosts first for the early-stop pass. */
-    private fun mirrorRank(url: String): Int {
-        val h = url.lowercase()
-        return when {
-            h.contains("voe.") -> 0
-            h.contains("vidmoly") -> 1
-            h.contains("streamwish") || h.contains("streamhg") -> 2
-            h.contains("mixdrop") -> 3
-            h.contains("doodstream") || h.contains("dood.") -> 4
-            h.contains("uqload") -> 5
-            h.contains("vidhide") || h.contains("earnvids") -> 6
-            h.contains("vidara") -> 7
-            h.contains("byse") -> 8
-            else -> 9
+            else -> emptyList()
         }
     }
 
-    private fun collectEmbeds(document: Document, into: LinkedHashSet<String>) {
-        document.select(".serversList li").forEach { li ->
-            li.attr("data-link").trim().takeIf { it.isNotBlank() }?.let { into.add(fixUrl(it)) }
-        }
-        document.selectFirst(".watchAreaMaster .holder iframe")?.attr("src")
-            ?.trim()?.takeIf { it.isNotBlank() }?.let { into.add(fixUrl(it)) }
-    }
+    // ---------- links ----------
 
     override suspend fun loadLinks(
         data: String,
@@ -559,108 +261,86 @@ class EgyDeadProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val embeds = LinkedHashSet<String>()
-        // Field diagnostics: each stage appends a short marker; if nothing
-        // playable is found, the markers are surfaced as one debug source so
-        // the exact failing stage can be read off the player's source list.
         val diag = mutableListOf<String>()
+        val parts = data.removePrefix("ca://").split('/')
+        val titleId = parts.getOrNull(0)?.toIntOrNull() ?: return false
+        val episodeId = parts.getOrNull(1)?.toIntOrNull() ?: 0
 
-        // v8: server-side relay first. The phone's own requests to the site
-        // pass the CDN (HTTP 200) but receive a watch page stripped of its
-        // server list (observed on-device: warm=200 | post=200 | embeds=0),
-        // while the identical flow succeeds from the relay server. The relay
-        // (free tier) can be asleep, so one retry is allowed inside
-        // loadViaRelay before falling back to the local chain below.
-        if (loadViaRelay(data, subtitleCallback, callback, diag)) return true
+        val videos = titleVideos(titleId)
+        val targets = videos.filter { v ->
+            if (episodeId == 0) v.isNull("episode_id")
+            else !v.isNull("episode_id") && v.optInt("episode_id") == episodeId
+        }.sortedBy { it.optInt("order") }
+        diag += "vids:${videos.size}/${targets.size}"
 
-        // v14: when the relay's own origin fetches were answered 403
-        // (the site's wall is up), the local chain below cannot succeed
-        // either - the app's client is the most-blocked of all - so
-        // skip its minutes of retries and surface the diagnostics now.
-        if (originBlocked) {
-            diag += "local:skipped-blocked"
-            emitDebug(diag, callback)
-            return true
-        }
+        var dug = 0
+        var extracted = 0
+        for (v in targets) {
+            val src = v.optString("src").trim()
+            if (src.isEmpty()) continue
+            val serverName = v.optString("name").trim()
+                .ifEmpty { src.substringAfter("://").substringBefore('/') }
 
-        // v7: visit the page first like a real browser (this also picks up
-        // the CDN's bot-management cookie for the session), then unlock the
-        // watch view with the View=1 POST. The CDN's bot score is
-        // probabilistic, so the POST is retried a few times before giving
-        // up; the HTTP statuses are recorded in the diagnostics.
-        val warm = runCatching { app.get(data, headers = browserHeaders) }
-        diag += "warm=${warm.getOrNull()?.code ?: "err"}"
+            // A direct file handed over as-is.
+            if (src.contains(".m3u8")) {
+                callback(newExtractorLink(serverName, serverName, src, ExtractorLinkType.M3U8) {
+                    this.referer = "$mainUrl/"
+                    this.quality = Qualities.Unknown.value
+                })
+                dug++
+                continue
+            }
+            if (src.contains(".mp4")) {
+                callback(newExtractorLink(serverName, serverName, src, ExtractorLinkType.VIDEO) {
+                    this.referer = "$mainUrl/"
+                    this.quality = Qualities.Unknown.value
+                })
+                dug++
+                continue
+            }
 
-        var postCode = -1
-        for (attempt in 1..4) {
-            val doc = runCatching {
-                val res = app.post(data, data = mapOf("View" to "1"), headers = browserHeaders, referer = data)
-                postCode = res.code
-                res.document
+            // Dig the embed page locally: plain JW file:/sources first.
+            val text = runCatching {
+                app.get(src, headers = browserHeaders, referer = "$mainUrl/").text
             }.getOrNull()
-            if (doc != null) collectEmbeds(doc, embeds)
-            if (embeds.isNotEmpty()) break
-            if (attempt < 4) Thread.sleep(800)
-        }
-        diag += "post=$postCode"
-
-        if (embeds.isEmpty()) {
-            runCatching { app.get(data, headers = browserHeaders).document }.getOrNull()?.let { collectEmbeds(it, embeds) }
-        }
-        diag += "embeds=${embeds.size}"
-        if (embeds.isEmpty()) {
-            emitDebug(diag, callback)
-            return true
-        }
-
-        var found = false
-        for (embed in embeds) {
-            if (loadExtractor(embed, data, subtitleCallback, callback)) {
-                found = true
-                diag += "direct-extractor:hit"
-                continue
-            }
-            // The site's default host ("MegaMax") has no built-in extractor: its
-            // player is an Inertia app whose deferred "streams" prop lists the
-            // real mirrors on well-known hosts. Resolve those instead.
-            if (loadFromMegaMax(embed, data, subtitleCallback, callback, diag)) {
-                found = true
-                continue
-            }
-
-            // Last resort: scan the embed page directly for a playable file.
-            val pageText = runCatching { app.get(embed, headers = browserHeaders, referer = data).text }.getOrNull()
-            if (pageText != null) {
-                val playlist = Regex("""https?://[^\s"'<>]+\.m3u8[^\s"'<>]*""").find(pageText)?.value
-                val file = Regex("""https?://[^\s"'<>]+\.mp4[^\s"'<>]*""").find(pageText)?.value
+            var emitted = false
+            if (text != null) {
+                val clean = text.replace("\\/", "/")
+                val playlist = Regex("""https?://[^\s"'<>]+\.m3u8[^\s"'<>]*""")
+                    .find(clean)?.value
+                val file = Regex("""https?://[^\s"'<>]+\.mp4[^\s"'<>]*""")
+                    .find(clean)?.value
                 when {
                     playlist != null -> {
-                        callback(
-                            newExtractorLink(name, name, playlist, ExtractorLinkType.M3U8) {
-                                this.referer = data
-                                this.quality = Qualities.Unknown.value
-                            }
-                        )
-                        found = true
+                        callback(newExtractorLink(serverName, serverName, playlist, ExtractorLinkType.M3U8) {
+                            this.referer = src
+                            this.quality = Qualities.Unknown.value
+                        })
+                        emitted = true
                     }
                     file != null -> {
-                        callback(
-                            newExtractorLink(name, name, file, ExtractorLinkType.VIDEO) {
-                                this.referer = data
-                                this.quality = Qualities.Unknown.value
-                            }
-                        )
-                        found = true
+                        callback(newExtractorLink(serverName, serverName, file, ExtractorLinkType.VIDEO) {
+                            this.referer = src
+                            this.quality = Qualities.Unknown.value
+                        })
+                        emitted = true
                     }
                 }
             }
-            diag += "scan:miss"
+            if (emitted) {
+                dug++
+            } else {
+                // Fallback: CloudStream's built-in extractors know many hosts.
+                val ok = runCatching {
+                    loadExtractor(src, "$mainUrl/", subtitleCallback, callback)
+                }.getOrDefault(false)
+                if (ok) extracted++
+            }
         }
-        if (!found) {
-            emitDebug(diag, callback)
-            return true
-        }
-        return found
+        diag += "dig:$dug"
+        diag += "extr:$extracted"
+        emitDebug(diag, callback)
+        return true
     }
 
     /** Emits the collected stage markers as one playable debug source. */
@@ -677,103 +357,5 @@ class EgyDeadProvider : MainAPI() {
                 }
             )
         }
-    }
-
-    /**
-     * Resolves a "MegaMax" embed (the /iframe/{id} page the site uses as its
-     * default server). The page is an Inertia/Vue app: the initial HTML only
-     * carries video metadata plus an asset "version"; the actual sources live
-     * in a deferred "streams" prop that the player fetches with an Inertia
-     * partial reload. That prop lists, per quality, mirror links on well-known
-     * hosts (Voe, VidMoly, MixDrop, Doodstream, StreamWish, Uqload, VidHide,
-     * ...) — all understood by CloudStream's built-in extractors.
-     * Verified live against the real host on 2026-10-15.
-     */
-    private suspend fun loadFromMegaMax(
-        embed: String,
-        referer: String,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit,
-        diag: MutableList<String>
-    ): Boolean {
-        val pageText = runCatching { app.get(embed, headers = browserHeaders, referer = referer).text }.getOrNull()
-        if (pageText == null) {
-            diag += "mm-page:fetch-fail"
-            return false
-        }
-        val pageJsonText = Regex(
-            """<script[^>]*data-page[^>]*>(\{.*?\})</script>""",
-            RegexOption.DOT_MATCHES_ALL
-        ).find(pageText)?.groupValues?.get(1)
-        if (pageJsonText == null) {
-            diag += "mm-json:missing"
-            return false
-        }
-        val pageJson = runCatching { JSONObject(pageJsonText) }.getOrNull()
-        if (pageJson == null) {
-            diag += "mm-json:parse-fail"
-            return false
-        }
-        val version = pageJson.optString("version")
-        if (version.isBlank()) {
-            diag += "mm-version:blank"
-            return false
-        }
-        val component = pageJson.optString("component").ifBlank { "files/mirror/video" }
-
-        val streamsText = runCatching {
-            app.get(
-                embed,
-                referer = embed,
-                headers = browserHeaders + mapOf(
-                    "X-Inertia" to "true",
-                    "X-Inertia-Version" to version,
-                    "X-Inertia-Partial-Component" to component,
-                    "X-Inertia-Partial-Data" to "streams",
-                    "X-Requested-With" to "XMLHttpRequest"
-                )
-            ).text
-        }.getOrNull()
-        if (streamsText == null) {
-            diag += "mm-streams:fetch-fail"
-            return false
-        }
-
-        val streams = runCatching {
-            JSONObject(streamsText).getJSONObject("props").getJSONObject("streams")
-        }.getOrNull()
-        if (streams == null) {
-            diag += "mm-streams:parse-fail"
-            return false
-        }
-        if (streams.optString("status") != "success") {
-            diag += "mm-streams:${streams.optString("status").ifBlank { "?" }}"
-            return false
-        }
-        val qualities = streams.optJSONArray("data")
-        if (qualities == null) {
-            diag += "mm-data:missing"
-            return false
-        }
-
-        var mirrorCount = 0
-        var hits = 0
-        var found = false
-        for (i in 0 until qualities.length()) {
-            val mirrors = qualities.optJSONObject(i)?.optJSONArray("mirrors") ?: continue
-            for (j in 0 until mirrors.length()) {
-                var link = mirrors.optJSONObject(j)?.optString("link").orEmpty()
-                if (link.startsWith("//")) link = "https:$link"
-                if (link.isBlank()) continue
-                mirrorCount++
-                if (loadExtractor(link, embed, subtitleCallback, callback)) {
-                    found = true
-                    hits++
-                }
-            }
-        }
-        diag += "mm-mirrors=$mirrorCount"
-        diag += "mm-hits=$hits"
-        return found
     }
 }

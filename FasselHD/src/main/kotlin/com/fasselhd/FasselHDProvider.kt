@@ -417,21 +417,42 @@ class FasselHDProvider : MainAPI() {
         return clean.endsWith(".m3u8") || clean.endsWith(".mp4")
     }
 
+    /** Unescapes \/ sequences repeatedly (API list bodies double-escape). */
+    private fun unescapeSlashes(text: String): String {
+        var t = text
+        var guard = 0
+        while (t.contains("\\/") && guard < 5) {
+            t = t.replace("\\/", "/")
+            guard++
+        }
+        return t
+    }
+
     /**
      * Scans a page/JSON text for a direct media URL (JW file:, an ArtPlayer
      * videoUrl, or a bare .m3u8/.mp4). Mirrors the relay's resolver scan.
      */
-    private fun extractDirect(text: String): String? {
-        val clean = text.replace("\\/", "/")
-        Regex("""file\s*:\s*["'](https?://[^"']+)["']""").find(clean)?.let {
-            return it.groupValues[1]
+    private fun extractDirect(text: String): String? = extractAllDirects(text).firstOrNull()
+
+    /** All direct media URLs in the text, in order, deduped (cap 4). */
+    private fun extractAllDirects(text: String): List<String> {
+        val clean = unescapeSlashes(text)
+        val out = LinkedHashSet<String>()
+        // Swept URLs can carry a trailing backslash where the source text
+        // escaped the closing quote (stringified JSON inside JSON).
+        fun add(u: String) {
+            val t = u.trimEnd('\\')
+            if (t.isNotBlank()) out += t
         }
-        Regex("""videoUrl\s*=\s*"(https?://[^"]+)"""").find(clean)?.let {
-            return it.groupValues[1]
+        Regex("""file\s*:\s*["'](https?://[^"']+)["']""").findAll(clean).forEach {
+            add(it.groupValues[1])
         }
-        Regex("""https?://[^\s"'<>]+\.m3u8[^\s"'<>]*""").find(clean)?.let { return it.value }
-        Regex("""https?://[^\s"'<>]+\.mp4[^\s"'<>]*""").find(clean)?.let { return it.value }
-        return null
+        Regex("""videoUrl\s*=\s*"(https?://[^"]+)"""").findAll(clean).forEach {
+            add(it.groupValues[1])
+        }
+        Regex("""https?://[^\s"'<>]+\.m3u8[^\s"'<>]*""").findAll(clean).forEach { add(it.value) }
+        Regex("""https?://[^\s"'<>]+\.mp4[^\s"'<>]*""").findAll(clean).forEach { add(it.value) }
+        return out.take(4)
     }
 
     // Dean Edwards packer unpacker (same proven port as Brestj/MyCima):
@@ -527,45 +548,49 @@ class FasselHDProvider : MainAPI() {
     }
 
     /**
-     * Phone-side dig: fetch an embed/API page with the row's own identity,
-     * then — in order — a media-bearing iframe src (the seriesmp4 wrapper
-     * hides a Yandex-Disk downloader URL in a hidden iframe; it is the
-     * real file), the raw-text scan, the unpacked packed-JS scan, and one
-     * iframe/embed chase (vidsrc / WordPress player pages / API endpoints
-     * that answer with an embed reference).
+     * Phone-side dig: fetch an embed/API page with the row's own identity
+     * and collect every direct it yields — a media-bearing iframe src (the
+     * seriesmp4 wrapper hides a Yandex-Disk downloader URL in a hidden
+     * iframe; it is the real file), all raw-text matches, all unpacked
+     * packed-JS matches, and — when nothing was found — one iframe/embed
+     * chase (vidsrc / WordPress player pages / the embed siblings inside
+     * API server lists such as badmoussi's, whose "data" items point at
+     * 3iskk.xyz embed pages next to a direct master.m3u8).
      */
-    private suspend fun digForDirect(
+    private suspend fun digAllForDirects(
         url: String,
         referer: String?,
         ua: String?,
         depth: Int = 0
-    ): String? {
+    ): List<String> {
         val rawText = runCatching {
             app.get(url, headers = pageHeaders(ua, referer)).text
-        }.getOrNull() ?: return null
+        }.getOrNull() ?: return emptyList()
         val text = rawText.replace("&amp;", "&")
+        val out = LinkedHashSet<String>()
         val iframeSrc = Regex("""<iframe[^>]+src\s*=\s*["'](https?://[^"']+)["']""")
             .find(text)?.groupValues?.get(1)
         if (iframeSrc != null &&
             (iframeSrc.contains(".mp4") || iframeSrc.contains(".m3u8") ||
                 iframeSrc.contains("downloader.") || iframeSrc.contains("storage."))
         ) {
-            return iframeSrc
+            out += iframeSrc
         }
-        extractDirect(text)?.let { return it }
+        out += extractAllDirects(text)
         for (plain in unpackPackedJs(text)) {
-            extractDirect(plain)?.let { return it }
+            out += extractAllDirects(plain)
         }
-        if (depth >= 1) return null
-        val chase = iframeSrc
-            ?: Regex("""https?://[^\s"'<>]+(?:/embed|/e/|/watch)[^\s"'<>]*""")
-                .find(text.replace("\\/", "/"))?.value
-        if (chase != null && chase != url && !chase.contains("google") &&
-            !chase.contains("facebook") && !chase.contains("doubleclick")
-        ) {
-            return digForDirect(chase, url, ua, depth + 1)
+        if (out.isEmpty() && depth < 1) {
+            val chase = iframeSrc
+                ?: Regex("""https?://[^\s"'<>]+(?:/embed|/e/|/watch)[^\s"'<>]*""")
+                    .find(unescapeSlashes(text))?.value
+            if (chase != null && chase != url && !chase.contains("google") &&
+                !chase.contains("facebook") && !chase.contains("doubleclick")
+            ) {
+                out += digAllForDirects(chase, url, ua, depth + 1)
+            }
         }
-        return null
+        return out.take(4)
     }
 
     private fun asciiSafe(v: String): Boolean = v.all { it.code < 128 }
@@ -690,7 +715,8 @@ class FasselHDProvider : MainAPI() {
         // datacenter IPs by design; the phone is their intended client).
         // Brestj-class discipline: stop once enough playable links exist or
         // the time budget is spent; also try each row's tmp_link variant.
-        // Every dug candidate is probed before it is emitted.
+        // Every dug candidate is probed before it is emitted, and a row
+        // may yield several directs (API server lists carry siblings).
         val dugOk = HashSet<String>()
         var digs = 0
         for (row in digQueue) {
@@ -698,20 +724,19 @@ class FasselHDProvider : MainAPI() {
             if (System.currentTimeMillis() - started > 12_000) break
             if (digs >= 5) break
             digs++
-            var direct = digForDirect(row.link, row.referer, row.userAgent)
-            if (direct != null &&
-                probeMedia(direct, row.link, row.userAgent, row.extraHeaders) == 0
-            ) direct = null
-            if (direct == null && row.tmpLink != null) {
-                direct = digForDirect(row.tmpLink, row.referer, row.userAgent)
-                if (direct != null &&
-                    probeMedia(direct, row.tmpLink, row.userAgent, row.extraHeaders) == 0
-                ) direct = null
+            var rowEmitted = false
+            val targets = listOfNotNull(row.link, row.tmpLink)
+            for ((ti, target) in targets.withIndex()) {
+                if (rowEmitted && ti > 0) break
+                val candidates = digAllForDirects(target, row.referer, row.userAgent)
+                for (cand in candidates) {
+                    if (emitted >= 6) break
+                    if (probeMedia(cand, target, row.userAgent, row.extraHeaders) == 0) continue
+                    emitDirect(row.server, cand, target, row.userAgent, counting, row.extraHeaders)
+                    rowEmitted = true
+                }
             }
-            if (direct != null) {
-                emitDirect(row.server, direct, row.link, row.userAgent, counting, row.extraHeaders)
-                dugOk += row.link
-            }
+            if (rowEmitted) dugOk += row.link
         }
         diag += "dig=$digs"
 

@@ -83,20 +83,46 @@ class EgyDeadProvider : MainAPI() {
     @Volatile private var csrfToken: String = ""
     @Volatile private var sessionAtMs: Long = 0
 
+    // v16: the session is carried MANUALLY. The raw Set-Cookie name=value
+    // pairs from the bootstrap response are replayed verbatim in a Cookie
+    // header built by hand — the v15 build passed the parsed cookie map to
+    // the HTTP layer, whose parse/re-encode round trip can mangle values
+    // (percent-encoding / base64 padding), silently breaking the Laravel
+    // session + XSRF match on the phone while every desktop-class client
+    // in the sandbox passed. Stage markers are kept for the on-screen
+    // diagnostic (see getMainPage).
+    @Volatile private var rawCookieHeader: String = ""
+    @Volatile private var bootDiag: String = "-"
+    @Volatile private var lastApiDiag: String = "-"
+
     private suspend fun ensureSession(force: Boolean = false) {
-        val fresh = sessionCookies.isNotEmpty() &&
+        val fresh = rawCookieHeader.isNotEmpty() &&
             System.currentTimeMillis() - sessionAtMs < 10 * 60 * 1000
         if (!force && fresh) return
         val resp = app.get("$mainUrl/", headers = browserHeaders)
+        val setCookies = runCatching { resp.headers.values("Set-Cookie") }
+            .getOrDefault(emptyList())
+        var pairs = setCookies.map { it.substringBefore(';').trim() }
+            .filter { it.contains('=') }
         sessionCookies = runCatching { resp.cookies }.getOrNull().orEmpty()
+        var fromMap = false
+        if (pairs.isEmpty() && sessionCookies.isNotEmpty()) {
+            pairs = sessionCookies.entries.map { "${it.key}=${it.value}" }
+            fromMap = true
+        }
+        rawCookieHeader = pairs.joinToString("; ")
         csrfToken = Regex(""""csrf_token":"([^"]+)"""").find(resp.text)
             ?.groupValues?.getOrNull(1).orEmpty()
+        bootDiag = "c${resp.code}|ck${pairs.size}${if (fromMap) "m" else ""}" +
+            "|csrf${if (csrfToken.isNotEmpty()) 1 else 0}" +
+            "|bd${if (resp.text.contains("bootstrapData")) 1 else 0}|len${resp.text.length}"
         sessionAtMs = System.currentTimeMillis()
     }
 
     private fun apiHeaders(): Map<String, String> {
-        val xsrfRaw = sessionCookies.entries
-            .firstOrNull { it.key.contains("XSRF", ignoreCase = true) }?.value.orEmpty()
+        val xsrfRaw = rawCookieHeader.split(';').map { it.trim() }
+            .firstOrNull { it.startsWith("XSRF-TOKEN=", ignoreCase = true) }
+            ?.substringAfter('=').orEmpty()
         val xsrf = runCatching { java.net.URLDecoder.decode(xsrfRaw, "UTF-8") }
             .getOrDefault(xsrfRaw)
         return mapOf(
@@ -106,7 +132,8 @@ class EgyDeadProvider : MainAPI() {
             "X-Requested-With" to "XMLHttpRequest",
             "Referer" to "$mainUrl/",
             "X-XSRF-TOKEN" to xsrf,
-            "X-CSRF-TOKEN" to csrfToken
+            "X-CSRF-TOKEN" to csrfToken,
+            "Cookie" to rawCookieHeader
         )
     }
 
@@ -114,16 +141,23 @@ class EgyDeadProvider : MainAPI() {
     private suspend fun apiGet(path: String): JSONObject? {
         ensureSession()
         var resp = runCatching {
-            app.get("$mainUrl$path", headers = apiHeaders(), cookies = sessionCookies)
-        }.getOrNull() ?: return null
+            app.get("$mainUrl$path", headers = apiHeaders())
+        }.getOrNull() ?: run { lastApiDiag = "exc"; return null }
+        lastApiDiag = apiDiagOf(resp)
         if (resp.code == 401 || resp.code == 419) {
             ensureSession(force = true)
             resp = runCatching {
-                app.get("$mainUrl$path", headers = apiHeaders(), cookies = sessionCookies)
-            }.getOrNull() ?: return null
+                app.get("$mainUrl$path", headers = apiHeaders())
+            }.getOrNull() ?: run { lastApiDiag = "exc2"; return null }
+            lastApiDiag = apiDiagOf(resp) + "r"
         }
         if (resp.code != 200) return null
         return runCatching { JSONObject(resp.text) }.getOrNull()
+    }
+
+    private fun apiDiagOf(resp: com.lagradost.nicehttp.NiceResponse): String {
+        val cfm = runCatching { resp.headers["cf-mitigated"] }.getOrNull()
+        return "c${resp.code}|cfm${if (cfm != null) 1 else 0}"
     }
 
     // ---------- cards / catalog ----------
@@ -159,7 +193,15 @@ class EgyDeadProvider : MainAPI() {
         val json = apiGet("/api/v1/titles?${request.data}&perPage=24&page=$page")
         val pag = json?.optJSONObject("pagination")
         val hasNext = pag != null && pag.optInt("current_page") < pag.optInt("last_page")
-        return newHomePageResponse(request.name, paginatedCards(json), hasNext)
+        val items = paginatedCards(json)
+        // v16 diagnostic: an empty first page must SAY why on screen —
+        // v15 failed silently on-device and the stage codes below are the
+        // one-screenshot discriminator (bootstrap vs API, cookies issued
+        // or not, csrf/bootstrapData present or not, cf-mitigated or not).
+        if (items.isEmpty() && page == 1) {
+            throw ErrorLoadingException("EGY-DIAG boot[$bootDiag] api[$lastApiDiag]")
+        }
+        return newHomePageResponse(request.name, items, hasNext)
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
@@ -191,7 +233,8 @@ class EgyDeadProvider : MainAPI() {
     override suspend fun load(url: String): LoadResponse {
         val id = url.substringAfter("/title/").substringBefore('/').substringBefore('?')
             .toIntOrNull() ?: throw ErrorLoadingException("Bad title url")
-        val json = apiGet("/api/v1/titles/$id") ?: throw ErrorLoadingException("Title fetch failed")
+        val json = apiGet("/api/v1/titles/$id")
+            ?: throw ErrorLoadingException("Title fetch failed EGY-DIAG boot[$bootDiag] api[$lastApiDiag]")
         val t = json.optJSONObject("title") ?: throw ErrorLoadingException("No title data")
         val title = t.optString("name").trim().ifEmpty { throw ErrorLoadingException("No title") }
         val poster = t.optString("poster").takeIf { it.isNotEmpty() }

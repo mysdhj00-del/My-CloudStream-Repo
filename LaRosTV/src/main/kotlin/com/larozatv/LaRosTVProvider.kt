@@ -46,8 +46,8 @@ import java.util.concurrent.TimeUnit
  *   series    the listing card's flat /{slug}/ URL is a soft-404 shell;
  *             the real series page is /series/{slug} — its article
  *             cards are the LATEST season's episodes. Every season
- *             lives at /season/{slug}-season-{n} with clean episode
- *             cards of its own (probe 1..12, stop at 3 straight 404s).
+ *             lives at /season/{slug}-season-{n} with episode cards
+ *             of its own (all 12 probed in parallel at load time).
  *   episode   post /{epSlug}/ links back to /series/{slug} and to its
  *             own /watch/{epSlug}/servers
  *   servers   /watch/{slug}/servers holds the full watch list as
@@ -87,8 +87,7 @@ class LaRosTVProvider : MainAPI() {
         "/films" to "أفلام",
         "/seriestv" to "مسلسلات",
         "/category/%D8%A7%D9%86%D9%85%D9%8A" to "أنمي",
-        "/category/%D9%85%D8%B3%D9%84%D8%B3%D9%84%D8%A7%D8%AA-%D8%AA%D8%B1%D9%83%D9%8A" to "مسلسلات تركي",
-        "/category/%D8%A7%D9%81%D9%84%D8%A7%D9%85-%D8%A7%D8%AC%D9%86%D8%A8%D9%8A" to "أفلام أجنبي"
+        "/category/%D9%85%D8%B3%D9%84%D8%B3%D9%84%D8%A7%D8%AA-%D8%AA%D8%B1%D9%83%D9%8A" to "مسلسلات تركي"
     )
 
     // ------------------------------------------------------------------
@@ -236,6 +235,68 @@ class LaRosTVProvider : MainAPI() {
         }
     }
 
+    /** Arabic ordinal words for seasons, as used in the site's card titles. */
+    private val seasonOrdinals = mapOf(
+        "الأول" to 1, "الاول" to 1, "الثاني" to 2, "الثالث" to 3, "الرابع" to 4,
+        "الخامس" to 5, "السادس" to 6, "السابع" to 7, "الثامن" to 8, "التاسع" to 9,
+        "العاشر" to 10, "الحادي عشر" to 11, "الثاني عشر" to 12
+    )
+
+    /** Season number from a card title: "الموسم 10" or "الموسم العاشر". */
+    private fun seasonFromTitle(title: String): Int? {
+        val t = latinDigits(title)
+        Regex("""الموسم\s*(\d+)""").find(t)?.let {
+            return it.groupValues[1].toIntOrNull()
+        }
+        val m = Regex("""الموسم\s+(\S+(?:\s+عشر)?)""").find(title) ?: return null
+        return seasonOrdinals[m.groupValues[1].trim()]
+    }
+
+    /**
+     * Blocking document fetch for the parallel season probes (the app
+     * fetcher is suspend-only). Returns (HTTP code, parsed document).
+     */
+    private fun fetchDocument(url: String): Pair<Int, Document?> {
+        var conn: java.net.HttpURLConnection? = null
+        return try {
+            conn = java.net.URL(url).openConnection() as java.net.HttpURLConnection
+            conn.instanceFollowRedirects = true
+            conn.connectTimeout = 6000
+            conn.readTimeout = 6000
+            for ((k, v) in browserHeaders) conn.setRequestProperty(k, v)
+            val code = conn.responseCode
+            if (code != 200) {
+                code to null
+            } else {
+                val raw = conn.inputStream.readBytes().toString(Charsets.UTF_8)
+                code to org.jsoup.Jsoup.parse(raw, url)
+            }
+        } catch (e: Exception) {
+            -1 to null
+        } finally {
+            runCatching { conn?.disconnect() }
+        }
+    }
+
+    /** Episode cards of one season page, following its pagination (≤3 pages). */
+    private fun seasonCards(seasonUrl: String): List<EpCard> {
+        val (code, first) = fetchDocument(seasonUrl)
+        if (code != 200 || first == null) return emptyList()
+        val out = ArrayList<EpCard>()
+        out += parseEpisodeCards(first)
+        if (out.isEmpty()) return out
+        var maxPage = 1
+        for (a in first.select("a[href]")) {
+            val m = Regex("""/page/(\d+)""").find(a.attr("href")) ?: continue
+            maxPage = maxOf(maxPage, m.groupValues[1].toIntOrNull() ?: 1)
+        }
+        for (p in 2..minOf(maxPage, 3)) {
+            val (_, d) = fetchDocument("$seasonUrl/page/$p")
+            if (d != null) out += parseEpisodeCards(d)
+        }
+        return out
+    }
+
     private suspend fun loadSeries(seriesUrl: String): LoadResponse {
         val slug = slugOf(seriesUrl)
         val doc = app.get(seriesUrl, headers = browserHeaders).document
@@ -246,28 +307,34 @@ class LaRosTVProvider : MainAPI() {
             if (!seen.add(card.href)) return
             bySeason.getOrPut(season) { ArrayList() } += card
         }
-        // Probe the season pages; 404 templates say "غير موجودة".
-        var misses = 0
+        // Probe ALL season pages IN PARALLEL (v1 probed sequentially and
+        // stopped at 3 straight misses — a series whose early seasons the
+        // operator dropped but whose latest exists, e.g. 9-1-1 season 10,
+        // lost its season attribution and could lose episodes entirely).
+        val pool = Executors.newFixedThreadPool(5)
+        val probed = try {
+            val futures = (1..12).map { n ->
+                pool.submit(Callable { n to seasonCards("$mainUrl/season/$slug-season-$n") })
+            }
+            futures.map { runCatching { it.get(15, TimeUnit.SECONDS) }.getOrNull() }
+                .filterNotNull()
+        } finally {
+            pool.shutdownNow()
+        }
         var lastSeason = 0
-        for (n in 1..12) {
-            if (misses >= 3) break
-            val res = runCatching {
-                app.get("$mainUrl/season/$slug-season-$n", headers = browserHeaders)
-            }.getOrNull()
-            val cards = if (res == null || res.code != 200) emptyList()
-                else parseEpisodeCards(res.document)
-            if (cards.isEmpty()) {
-                misses++
-            } else {
-                misses = 0
-                lastSeason = n
+        for ((n, cards) in probed) {
+            if (cards.isNotEmpty()) {
+                lastSeason = maxOf(lastSeason, n)
                 cards.forEach { add(n, it) }
             }
         }
-        // The series page's own cards are the latest season's episodes.
-        val ownCards = parseEpisodeCards(doc)
-        val ownSeason = if (lastSeason > 0) lastSeason else 1
-        ownCards.forEach { add(ownSeason, it) }
+        // The series page's own cards are the latest season's episodes;
+        // their titles carry the season ("الموسم 10" / "الموسم العاشر").
+        for (card in parseEpisodeCards(doc)) {
+            val s = seasonFromTitle(card.title)
+                ?: if (lastSeason > 0) lastSeason else 1
+            add(s, card)
+        }
         if (bySeason.isEmpty()) throw ErrorLoadingException("No episodes found")
         val episodes = ArrayList<Episode>()
         var poster: String? = null
@@ -622,8 +689,9 @@ class LaRosTVProvider : MainAPI() {
     // ------------------------------------------------------------------
     // loadLinks — data is the title's /watch/{slug}/servers URL.
     //
-    // Phase A: extractor-known hosts (Doodstream, MixDrop) in site
-    //   order, stop-early at 6 emitted links or 14 s.
+    // Phase A: extractors, fastest class first — up to 3 MixDrop rows
+    //   (stop at 2 links / 6 s), then Doodstream + remaining MixDrop
+    //   until 5 links total or 11 s.
     // Phase B: phone digs for the rest and extractor failures (the
     //   MixDrop wurl is IP-bound — dug and played from the phone's IP);
     //   candidates get ONE parallel per-host probe round before emit.
@@ -660,12 +728,17 @@ class LaRosTVProvider : MainAPI() {
         }
         diag += "srv=${rows.size}"
 
-        // Phase A — extractors first.
+        // Phase A — extractors, FASTEST CLASS FIRST (v2: v1 walked the
+        // site order and stacked up to six multi-request Doodstream
+        // extractor rounds before the list filled — the viewer waited
+        // ~15 s+ for playback. The MixDrop extractor resolves in ONE
+        // page fetch + unpack, so its rows go first, then Doodstream
+        // until 5 links total exist, inside an 11 s budget.)
         var extOk = 0
         val handled = HashSet<String>()
-        for (row in rows) {
-            if (emitted >= 6 || elapsed() > 14000) break
-            if (!isExtractorKnown(hostOf(row.url))) continue
+        val attempted = HashSet<String>()
+        suspend fun tryExtractor(row: Row): Boolean {
+            attempted += row.url
             val before = emitted
             runCatching {
                 loadExtractor(row.url, data, subtitleCallback) { link ->
@@ -673,10 +746,25 @@ class LaRosTVProvider : MainAPI() {
                     callback(link)
                 }
             }
-            if (emitted > before) {
+            val ok = emitted > before
+            if (ok) {
                 extOk++
                 handled += row.url
             }
+            return ok
+        }
+        var mixTried = 0
+        for (row in rows) {
+            if (emitted >= 2 || elapsed() > 6000 || mixTried >= 3) break
+            if (!hostOf(row.url).contains("mixdrop")) continue
+            mixTried++
+            tryExtractor(row)
+        }
+        for (row in rows) {
+            if (emitted >= 5 || elapsed() > 11000) break
+            if (!isExtractorKnown(hostOf(row.url))) continue
+            if (row.url in attempted) continue
+            tryExtractor(row)
         }
         diag += "ext=$extOk"
 

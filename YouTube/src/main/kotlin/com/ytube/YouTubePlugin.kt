@@ -68,6 +68,40 @@ object YtAuthUi {
             }
             layout.addView(input)
 
+            // Native credential bridge (his request): two NATIVE
+            // fields that accept typing AND paste sit above the
+            // WebView; a fill button writes the value into the
+            // Google page itself via JS. The password is never
+            // stored or sent anywhere — it only fills the official
+            // page's field, exactly like typing it there.
+            val emailField = EditText(ctx).apply {
+                hint = "الإيميل (اكتب أو الصق هنا)"
+                inputType = android.text.InputType.TYPE_CLASS_TEXT or
+                    android.text.InputType.TYPE_TEXT_VARIATION_EMAIL_ADDRESS
+                visibility = android.view.View.GONE
+            }
+            layout.addView(emailField)
+            val passField = EditText(ctx).apply {
+                hint = "كلمة السر (اكتب أو الصق هنا)"
+                inputType = android.text.InputType.TYPE_CLASS_TEXT or
+                    android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD
+                visibility = android.view.View.GONE
+            }
+            layout.addView(passField)
+            val fillRow = LinearLayout(ctx).apply {
+                orientation = LinearLayout.HORIZONTAL
+                visibility = android.view.View.GONE
+            }
+            val btnEmail = android.widget.Button(ctx).apply {
+                text = "تعبئة الإيميل"
+            }
+            val btnPass = android.widget.Button(ctx).apply {
+                text = "تعبئة كلمة السر"
+            }
+            fillRow.addView(btnEmail)
+            fillRow.addView(btnPass)
+            layout.addView(fillRow)
+
             // The login WebView lives INSIDE this same dialog from
             // the start (hidden). Opening a SECOND dialog for it made
             // the soft keyboard never appear on the login page —
@@ -85,7 +119,7 @@ object YtAuthUi {
                 false
             }
             wv.layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, 1400
+                LinearLayout.LayoutParams.MATCH_PARENT, 1000
             )
             wv.visibility = android.view.View.GONE
             layout.addView(wv)
@@ -121,6 +155,50 @@ object YtAuthUi {
                 }
             }
 
+            // Fill a field on the Google page with a value from the
+            // native bridge fields (typing/paste happens natively).
+            fun fillInto(selector: String, value: String, label: String, after: () -> Unit) {
+                val js = "(function(){var el=document.querySelector('" + selector + "');" +
+                    "if(!el)return 'nf';" +
+                    "var st=Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,'value').set;" +
+                    "st.call(el," + org.json.JSONObject.quote(value) + ");" +
+                    "el.dispatchEvent(new Event('input',{bubbles:true}));" +
+                    "el.dispatchEvent(new Event('change',{bubbles:true}));" +
+                    "el.focus();return 'ok';})()"
+                wv.evaluateJavascript(js) { res ->
+                    if (res != null && res.contains("ok")) {
+                        Toast.makeText(
+                            ctx, "تمت تعبئة $label ✓ — دوس «التالي» في الصفحة",
+                            Toast.LENGTH_LONG
+                        ).show()
+                        after()
+                    } else {
+                        Toast.makeText(
+                            ctx, "خانة $label مش ظاهرة لسه — استنى الصفحة تحمّل",
+                            Toast.LENGTH_LONG
+                        ).show()
+                    }
+                }
+            }
+            btnEmail.setOnClickListener {
+                val v = emailField.text.toString().trim()
+                if (v.isEmpty()) {
+                    Toast.makeText(ctx, "الصق الإيميل في المربع الأول", Toast.LENGTH_SHORT).show()
+                } else {
+                    fillInto("input[type=email]", v, "الإيميل") {}
+                }
+            }
+            btnPass.setOnClickListener {
+                val v = passField.text.toString()
+                if (v.isEmpty()) {
+                    Toast.makeText(ctx, "الصق كلمة السر في المربع التاني", Toast.LENGTH_SHORT).show()
+                } else {
+                    fillInto("input[type=password]", v, "كلمة السر") {
+                        passField.setText("")
+                    }
+                }
+            }
+
             dialog.setOnShowListener {
                 dialog.window?.clearFlags(
                     WindowManager.LayoutParams.FLAG_ALT_FOCUSABLE_IM
@@ -139,6 +217,9 @@ object YtAuthUi {
                     .setOnClickListener {
                         status.visibility = android.view.View.GONE
                         input.visibility = android.view.View.GONE
+                        emailField.visibility = android.view.View.VISIBLE
+                        passField.visibility = android.view.View.VISIBLE
+                        fillRow.visibility = android.view.View.VISIBLE
                         wv.visibility = android.view.View.VISIBLE
                         dialog.window?.clearFlags(
                             WindowManager.LayoutParams.FLAG_ALT_FOCUSABLE_IM

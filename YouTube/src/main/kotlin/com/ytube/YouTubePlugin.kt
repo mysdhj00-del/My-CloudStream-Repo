@@ -6,6 +6,7 @@ import android.content.SharedPreferences
 import android.webkit.CookieManager
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.view.WindowManager
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.TextView
@@ -92,6 +93,15 @@ object YtAuthUi {
             wv.settings.javaScriptEnabled = true
             wv.settings.domStorageEnabled = true
             runCatching { CookieManager.getInstance().setAcceptThirdPartyCookies(wv, true) }
+            // A WebView inside a dialog does not grab touch focus by
+            // itself on several OEM skins — without it the soft
+            // keyboard never opens when the user taps a field.
+            wv.isFocusable = true
+            wv.isFocusableInTouchMode = true
+            wv.setOnTouchListener { v, _ ->
+                (v as WebView).requestFocusFromTouch()
+                false
+            }
             val dialog = AlertDialog.Builder(ctx)
                 .setView(wv)
                 .setNegativeButton("إغلاق", null)
@@ -111,6 +121,17 @@ object YtAuthUi {
                         }
                     }
                 }
+            }
+            dialog.setOnShowListener {
+                dialog.window?.setSoftInputMode(
+                    WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE or
+                        WindowManager.LayoutParams.SOFT_INPUT_STATE_VISIBLE
+                )
+                dialog.window?.setLayout(
+                    WindowManager.LayoutParams.MATCH_PARENT,
+                    WindowManager.LayoutParams.MATCH_PARENT
+                )
+                wv.requestFocusFromTouch()
             }
             dialog.show()
             wv.loadUrl(

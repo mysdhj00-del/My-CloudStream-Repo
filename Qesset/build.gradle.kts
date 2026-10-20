@@ -1,12 +1,12 @@
 // Qesset CloudStream plugin module.
-version = 1
+version = 2
 
 android {
     namespace = "com.qesset"
 }
 
 cloudstream {
-    description = "Qesset (قصة عشق) - Turkish series and movies subtitled in Arabic (qesset.net)"
+    description = "Qesset (قصة عشق) - Turkish series and movies subtitled in Arabic (qesset.net) + dubbed series (k.3chk.net)"
     authors = listOf("Saher")
 
     /**

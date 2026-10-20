@@ -548,17 +548,43 @@ class TurkDubProvider : MainAPI() {
     // Playback helpers (ported from the proven providers)
     // ------------------------------------------------------------------
 
-    private fun fetchDoc(url: String, referer: String? = null): Document? = runCatching {
-        kotlinx.coroutines.runBlocking {
-            app.get(url, headers = pageHeaders(null, referer)).document
+    /** Raw HTTP GET (no coroutines) — callable from any thread/context. */
+    private fun httpGetText(url: String, referer: String?): String? {
+        var conn: java.net.HttpURLConnection? = null
+        return try {
+            conn = java.net.URL(url).openConnection() as java.net.HttpURLConnection
+            conn.instanceFollowRedirects = true
+            conn.connectTimeout = 15000
+            conn.readTimeout = 25000
+            for ((k, v) in pageHeaders(null, referer)) {
+                conn.setRequestProperty(k, v)
+            }
+            val code = conn.responseCode
+            if (code !in 200..299) {
+                null
+            } else {
+                val raw = conn.inputStream
+                val stream = if ((conn.contentEncoding ?: "").contains("gzip")) {
+                    java.util.zip.GZIPInputStream(raw)
+                } else {
+                    raw
+                }
+                stream.bufferedReader(Charsets.UTF_8).readText()
+            }
+        } catch (e: Exception) {
+            null
+        } finally {
+            runCatching { conn?.disconnect() }
         }
-    }.getOrNull()
+    }
 
-    private fun fetchText(url: String, referer: String? = null): String? = runCatching {
-        kotlinx.coroutines.runBlocking {
-            app.get(url, headers = pageHeaders(null, referer)).text
-        }
-    }.getOrNull()
+    private fun fetchDoc(url: String, referer: String? = null): Document? {
+        val text = httpGetText(url, referer) ?: return null
+        return runCatching { org.jsoup.Jsoup.parse(text, url) }.getOrNull()
+    }
+
+    private fun fetchText(url: String, referer: String? = null): String? =
+        httpGetText(url, referer)
 
     private fun pageHeaders(ua: String?, referer: String?): Map<String, String> {
         val h = LinkedHashMap<String, String>()

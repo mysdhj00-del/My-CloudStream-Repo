@@ -80,10 +80,12 @@ class TurkDubProvider : MainAPI() {
     )
 
     override val mainPage = mainPageOf(
-        "fosta-river" to "فوستا — أحدث الحلقات المدبلجة",
-        "fosta-series" to "فوستا — مسلسلات تركية مدبلجة",
-        "chk-series" to "قصة عشق — مسلسلات مدبلجة",
-        "brst-river" to "برستيج — أحدث الحلقات المدبلجة"
+        "fosta-top" to "الأكثر مشاهدة",
+        "fosta-river" to "أحدث الحلقات المدبلجة — فوستا",
+        "fosta-series" to "مسلسلات تركية مدبلجة — فوستا",
+        "fosta-rating" to "الأعلى تقييمًا",
+        "chk-series" to "مسلسلات مدبلجة — قصة عشق",
+        "brst-river" to "أحدث الحلقات المدبلجة — برستيج"
     )
 
     // ------------------------------------------------------------------
@@ -189,18 +191,18 @@ class TurkDubProvider : MainAPI() {
     }
 
     /** Fosta's dubbed-series index: the submenu under the parent category link. */
-    private fun fostaSeriesIndex(doc: Document): List<SearchResponse> {
+    private fun fostaSeriesIndex(doc: Document): List<Pair<String, String>> {
         val parent = doc.select("a[href*=moslslat-turkia-modblga]").firstOrNull()
             ?: return emptyList()
         val li = parent.parents().firstOrNull { it.tagName() == "li" } ?: return emptyList()
-        val out = ArrayList<SearchResponse>()
+        val out = ArrayList<Pair<String, String>>()
         for (a in li.select("ul.dropdown-menu a[href]")) {
             val href = a.attr("abs:href").ifBlank { a.attr("href") }
             if (!href.contains("category.php?cat=")) continue
             if (href.contains("moslslat-turkia-modblga")) continue
             val t = a.text().replace(Regex("""\s+"""), " ").trim()
             if (t.isBlank()) continue
-            out += newTvSeriesSearchResponse(t, href, TvType.TvSeries) {}
+            out += t to href
         }
         return out
     }
@@ -214,6 +216,16 @@ class TurkDubProvider : MainAPI() {
         request: MainPageRequest
     ): HomePageResponse {
         return when (request.data) {
+            "fosta-top", "fosta-rating" -> {
+                val sort = if (request.data == "fosta-top") "views" else "rating"
+                val url = "$fosta/category.php?cat=moslslat-turkia-modblga" +
+                    "&sortby=$sort&page=$page"
+                val doc = app.get(url, headers = browserHeaders).document
+                val cards = melodyCards(doc)
+                val hasNext = cards.size >= 12 &&
+                    doc.select("a[href*=page=${page + 1}]").isNotEmpty()
+                newHomePageResponse(request.name, cards.map { melodySeriesResponse(it) }, hasNext)
+            }
             "fosta-river" -> {
                 val url = "$fosta/category.php?cat=moslslat-turkia-modblga&page=$page"
                 val doc = app.get(url, headers = browserHeaders).document
@@ -228,7 +240,18 @@ class TurkDubProvider : MainAPI() {
                     "$fosta/category.php?cat=moslslat-turkia-modblga",
                     headers = browserHeaders
                 ).document
-                newHomePageResponse(request.name, fostaSeriesIndex(doc), false)
+                val pairs = fostaSeriesIndex(doc)
+                // Netflix-feel: every series card gets the poster of its
+                // latest episode (one parallel fetch round).
+                val docs = fetchPages(pairs.map { it.second })
+                val items = pairs.mapIndexed { i, (nm, u) ->
+                    val poster = docs.getOrNull(i)
+                        ?.let { melodyCards(it).firstOrNull()?.poster }
+                    newTvSeriesSearchResponse(nm, u, TvType.TvSeries) {
+                        this.posterUrl = poster
+                    }
+                }
+                newHomePageResponse(request.name, items, false)
             }
             "chk-series" -> {
                 val url = if (page <= 1) {
@@ -363,6 +386,7 @@ class TurkDubProvider : MainAPI() {
             eps
         ) {
             this.posterUrl = poster
+            this.backgroundPosterUrl = poster
         }
     }
 
@@ -385,11 +409,11 @@ class TurkDubProvider : MainAPI() {
 
         if (isFosta) {
             val idx = fostaSeriesIndex(doc)
-            val match = idx.firstOrNull {
-                normName(it.name) == normName(seriesName) ||
-                    normName(it.name).contains(normName(seriesName))
+            val match = idx.firstOrNull { (nm, _) ->
+                normName(nm) == normName(seriesName) ||
+                    normName(nm).contains(normName(seriesName))
             }
-            if (match != null) return loadMelodyCategory(match.url)
+            if (match != null) return loadMelodyCategory(match.second)
         }
 
         val enc = java.net.URLEncoder.encode(seriesName, "UTF-8")
@@ -416,6 +440,7 @@ class TurkDubProvider : MainAPI() {
         val eps = episodesFromCards(uniq, poster)
         return newTvSeriesLoadResponse(seriesName, watchUrl, TvType.TvSeries, eps) {
             this.posterUrl = poster
+            this.backgroundPosterUrl = poster
         }
     }
 
@@ -485,6 +510,7 @@ class TurkDubProvider : MainAPI() {
                 )
             ) {
                 this.posterUrl = og(doc, "image")
+                this.backgroundPosterUrl = og(doc, "image")
                 this.plot = og(doc, "description")
             }
         }
@@ -513,6 +539,7 @@ class TurkDubProvider : MainAPI() {
                 eps
             ) {
                 this.posterUrl = og(doc, "image")
+                this.backgroundPosterUrl = og(doc, "image")
                 this.plot = og(doc, "description")
             }
         }
@@ -530,6 +557,7 @@ class TurkDubProvider : MainAPI() {
             eps
         ) {
             this.posterUrl = og(doc, "image")
+            this.backgroundPosterUrl = og(doc, "image")
             this.plot = og(doc, "description")
         }
     }

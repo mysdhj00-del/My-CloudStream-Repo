@@ -73,6 +73,25 @@ import java.util.concurrent.TimeUnit
  * maintenance page) but the provider never needs it: the payload is
  * decoded from the post page directly. A DEBUG pseudo-link with
  * stage counters is emitted when nothing resolves.
+ *
+ * DUBBED lane (v2, k.3chk.net — the operator's sister site, theme
+ * 3sknewv3; qesset.net itself carries NO dubbed catalog, measured):
+ * the dubbed archive is /genre/serie-mudblij-q104/ (17 pages, cards
+ * are <div class="EpisodeBlock"> → /video/tvshows/{slug}/, poster in
+ * img[data-img], title in .EpisodeBlockTitle). Series pages carry og
+ * meta and episode links /video/ep/{stem}-season-{s}-episode-{e}/.
+ * The episode page's shortlink gives the post id (?p={pid}); the
+ * player slots are GET /embed/{n}/{pid}/2/ WITH the episode page as
+ * referer (referer-gated: a bare hit returns a gate page) and each
+ * filled slot's iframe is the real host embed — census across 4
+ * series: exactly 2 servers everywhere, nume=1 → miravd.com,
+ * nume=2 → mwdy.cc. Both hosts are Cloudflare-challenged for every
+ * datacenter client and answer "Embeds disabled" when unframed, so
+ * the embeds are dug ON THE PHONE with the /embed/ page as referer
+ * (the exact frame chain a browser runs); a DEBUG line reports the
+ * per-host outcome (cf / disabled / ok / nodirect) when nothing
+ * resolves. The camalk.net "prepare/watch" pages in the visitor
+ * flow are a monetization wrapper around the same /embed/ iframes.
  */
 class QessetProvider : MainAPI() {
     override var mainUrl = "https://qesset.net"
@@ -82,6 +101,7 @@ class QessetProvider : MainAPI() {
     override val hasMainPage = true
 
     private val relayBase = "https://egydead-stremio.onrender.com"
+    private val dubBase = "https://k.3chk.net"
 
     private val browserUA =
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
@@ -96,7 +116,8 @@ class QessetProvider : MainAPI() {
         "/" to "الرئيسية",
         "/son-bolumler/" to "آخر الحلقات",
         "/category/alarshif/" to "مسلسلات",
-        "/category/yeni-filmler/" to "أفلام"
+        "/category/yeni-filmler/" to "أفلام",
+        "/dubbed/" to "مسلسلات مدبلجة"
     )
 
     // ------------------------------------------------------------------
@@ -146,7 +167,46 @@ class QessetProvider : MainAPI() {
         return out
     }
 
+    /** Dubbed cards on k.3chk.net: EpisodeBlock → /video/tvshows|movies/. */
+    private fun parseDubCards(doc: Document): List<SearchResponse> {
+        val out = ArrayList<SearchResponse>()
+        for (block in doc.select("div.EpisodeBlock")) {
+            val a = block.selectFirst("a[href]") ?: continue
+            val href = a.attr("abs:href").ifBlank { a.attr("href") }
+            val isMovie = href.contains("/video/movies/")
+            if (!isMovie && !href.contains("/video/tvshows/")) continue
+            val title = block.selectFirst(".EpisodeBlockTitle")?.text()?.trim()
+                .orEmpty()
+            if (title.isBlank()) continue
+            val img = block.selectFirst("img")
+            val poster = img?.attr("data-img")?.ifBlank { null }
+                ?: img?.attr("abs:src")?.ifBlank { null }
+            out += if (isMovie) {
+                newMovieSearchResponse(title, href, TvType.Movie) {
+                    this.posterUrl = poster
+                }
+            } else {
+                newTvSeriesSearchResponse(title, href, TvType.TvSeries) {
+                    this.posterUrl = poster
+                }
+            }
+        }
+        return out
+    }
+
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
+        if (request.data == "/dubbed/") {
+            val base = "$dubBase/genre/serie-mudblij-q104/"
+            val url = if (page <= 1) base else base + "page/$page/"
+            val doc = app.get(url, headers = browserHeaders).document
+            val hasNext = doc.select("a[href]").any {
+                it.attr("href").contains("/page/${page + 1}/")
+            }
+            return newHomePageResponse(
+                listOf(HomePageList(request.name, parseDubCards(doc))),
+                hasNext
+            )
+        }
         val paginated = request.data.startsWith("/category/")
         if (!paginated && page > 1) {
             return newHomePageResponse(listOf(HomePageList(request.name, emptyList())), false)
@@ -219,6 +279,7 @@ class QessetProvider : MainAPI() {
     }
 
     override suspend fun load(url: String): LoadResponse {
+        if (url.contains("3chk.net")) return loadDub(url)
         if (url.contains("/yeni-show/")) return loadSeries(url, null)
         val doc = app.get(url, headers = browserHeaders).document
         if (url.contains("/clarus/")) {
@@ -254,6 +315,97 @@ class QessetProvider : MainAPI() {
         val title = cleanTitle(og(doc, "title") ?: doc.title())
         val poster = og(doc, "image")
         val episodes = buildEpisodes(episodeLinks(doc), poster)
+        if (episodes.isEmpty()) throw ErrorLoadingException("No episodes found")
+        return newTvSeriesLoadResponse(title, showUrl, TvType.TvSeries, episodes) {
+            this.posterUrl = poster
+            this.plot = og(doc, "description")
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Dubbed lane load (k.3chk.net)
+    // ------------------------------------------------------------------
+
+    private val dubEpRegex = Regex("""-season-(\d+)-episode-(\d+)""")
+
+    private fun dubStemOf(u: String): String =
+        u.trimEnd('/').substringAfterLast('/')
+            .replace(Regex("""-season-\d+-episode-\d+.*$"""), "")
+
+    /** Own-series episode links on a 3chk page (dominant stem group). */
+    private fun dubEpisodeLinks(doc: Document): List<String> {
+        val seen = LinkedHashSet<String>()
+        for (a in doc.select("a[href]")) {
+            val href = a.attr("abs:href").ifBlank { a.attr("href") }
+            if (href.contains("/video/ep/") && dubEpRegex.containsMatchIn(href)) {
+                seen += href
+            }
+        }
+        val dominant = seen.groupBy { dubStemOf(it) }
+            .maxByOrNull { it.value.size }?.key ?: return emptyList()
+        return seen.filter { dubStemOf(it) == dominant }.sortedBy { u ->
+            val m = dubEpRegex.find(u)
+            val s = m?.groupValues?.get(1)?.toIntOrNull() ?: 1
+            val e = m?.groupValues?.get(2)?.toIntOrNull() ?: Int.MAX_VALUE
+            s * 10000 + e
+        }
+    }
+
+    private fun buildDubEpisodes(links: List<String>, poster: String?): List<Episode> =
+        links.mapIndexed { i, href ->
+            val m = dubEpRegex.find(href)
+            val s = m?.groupValues?.get(1)?.toIntOrNull() ?: 1
+            val e = m?.groupValues?.get(2)?.toIntOrNull() ?: (i + 1)
+            newEpisode(href) {
+                this.name = "الحلقة $e"
+                this.season = s
+                this.episode = e
+                this.posterUrl = poster
+            }
+        }
+
+    private fun cleanDubTitle(raw: String): String =
+        raw.replace(Regex("""\s*موقع قصة عشق.*$"""), "")
+            .replace(Regex("""\s*-\s*قصة عشق.*$"""), "").trim()
+
+    private suspend fun loadDub(url: String): LoadResponse {
+        if (url.contains("/video/movies/")) {
+            val doc = app.get(url, headers = browserHeaders).document
+            val title = cleanDubTitle(og(doc, "title") ?: doc.title())
+            return newMovieLoadResponse(title, url, TvType.Movie, url) {
+                this.posterUrl = og(doc, "image")
+                this.plot = og(doc, "description")
+            }
+        }
+        if (url.contains("/video/ep/")) {
+            // Episode page: reroute to its series when the series link
+            // is identifiable by the show name, else use sibling links.
+            val doc = app.get(url, headers = browserHeaders).document
+            val rawTitle = cleanDubTitle(og(doc, "title") ?: doc.title())
+            val seriesName = rawTitle
+                .replace(Regex("""\s*الحلقة\s*\d+.*$"""), "").trim()
+            val showLink = doc.select("a[href]").firstOrNull { a ->
+                val h = a.attr("abs:href").ifBlank { a.attr("href") }
+                h.contains("/video/tvshows/") &&
+                    a.attr("title").contains(seriesName.removePrefix("مسلسل").trim())
+            }?.let { it.attr("abs:href").ifBlank { it.attr("href") } }
+            if (showLink != null) return loadDubSeries(showLink)
+            val poster = og(doc, "image")
+            val episodes = buildDubEpisodes(dubEpisodeLinks(doc), poster)
+            if (episodes.isEmpty()) throw ErrorLoadingException("No episodes found")
+            return newTvSeriesLoadResponse(seriesName, url, TvType.TvSeries, episodes) {
+                this.posterUrl = poster
+                this.plot = og(doc, "description")
+            }
+        }
+        return loadDubSeries(url)
+    }
+
+    private suspend fun loadDubSeries(showUrl: String): LoadResponse {
+        val doc = app.get(showUrl, headers = browserHeaders).document
+        val title = cleanDubTitle(og(doc, "title") ?: doc.title())
+        val poster = og(doc, "image")
+        val episodes = buildDubEpisodes(dubEpisodeLinks(doc), poster)
         if (episodes.isEmpty()) throw ErrorLoadingException("No episodes found")
         return newTvSeriesLoadResponse(title, showUrl, TvType.TvSeries, episodes) {
             this.posterUrl = poster
@@ -620,8 +772,139 @@ class QessetProvider : MainAPI() {
     }
 
     // ------------------------------------------------------------------
+    // Dubbed lane playback (k.3chk.net): the episode page's shortlink
+    // gives the post id; player slots live at /embed/{n}/{pid}/2/ and
+    // answer only with the episode page as referer. Filled slots hold
+    // an iframe to the real host embed (miravd / mwdy in the census),
+    // which is dug on the phone with the /embed/ page as referer —
+    // the same frame chain a browser runs. Per-host outcome codes go
+    // into the DEBUG line (cf = Cloudflare challenge page, disabled =
+    // the host's "Embeds disabled" gate, nodirect = player HTML but
+    // no direct found, err = fetch failed).
+    // ------------------------------------------------------------------
+
+    private suspend fun digDubHost(
+        embedUrl: String,
+        embedPageUrl: String
+    ): Pair<List<String>, String> {
+        val body = runCatching {
+            app.get(embedUrl, headers = pageHeaders(null, embedPageUrl)).text
+        }.getOrNull() ?: return emptyList<String>() to "err"
+        if (body.contains("Just a moment", ignoreCase = true) ||
+            body.contains("challenges.cloudflare.com")
+        ) return emptyList<String>() to "cf"
+        if (body.contains("Embeds disabled", ignoreCase = true)) {
+            return emptyList<String>() to "disabled"
+        }
+        val out = LinkedHashSet<String>()
+        out += extractAllDirects(body)
+        if (out.isEmpty()) {
+            for (unpacked in unpackPackedJs(body)) {
+                out += extractAllDirects(unpacked)
+                if (out.isNotEmpty()) break
+            }
+        }
+        if (out.isEmpty()) {
+            val src = Regex("""<iframe[^>]+src\s*=\s*["']([^"']+)["']""")
+                .find(body)?.groupValues?.get(1)
+            if (!src.isNullOrBlank() && !src.startsWith("about:") &&
+                (src.startsWith("http") || src.startsWith("//"))
+            ) {
+                val abs = if (src.startsWith("//")) "https:$src" else src
+                val inner = runCatching {
+                    app.get(abs, headers = pageHeaders(null, embedUrl)).text
+                }.getOrNull()
+                if (inner != null) {
+                    out += extractAllDirects(inner)
+                    if (out.isEmpty()) {
+                        for (unpacked in unpackPackedJs(inner)) {
+                            out += extractAllDirects(unpacked)
+                            if (out.isNotEmpty()) break
+                        }
+                    }
+                }
+            }
+        }
+        return out.take(3) to if (out.isEmpty()) "nodirect" else "ok${out.size}"
+    }
+
+    private suspend fun loadLinksDub(
+        data: String,
+        callback: (ExtractorLink) -> Unit
+    ) {
+        val startedAt = System.currentTimeMillis()
+        fun elapsed() = System.currentTimeMillis() - startedAt
+        val diag = ArrayList<String>()
+        diag += "QessetDUB"
+        var emitted = 0
+
+        val html = runCatching {
+            app.get(data, headers = browserHeaders).text
+        }.getOrNull() ?: run {
+            diag += "page=ERR"
+            emitDebug(diag, callback)
+            return
+        }
+        val pid = Regex("""rel=["']shortlink["'] href=["'][^"']*\?p=(\d+)""")
+            .find(html)?.groupValues?.get(1)
+            ?: Regex("""\?p=(\d+)""").find(html)?.groupValues?.get(1)
+            ?: run {
+                diag += "pid=NONE"
+                emitDebug(diag, callback)
+                return
+            }
+        diag += "pid=$pid"
+
+        // Enumerate player slots (census: 2 filled, rest empty).
+        val typeFlag = if (data.contains("/video/movies/")) "1" else "2"
+        val slots = ArrayList<Pair<String, String>>() // embedPageUrl → hostEmbedUrl
+        var emptyStreak = 0
+        for (n in 1..6) {
+            if (elapsed() > 10000) break
+            val embedPage = "$dubBase/embed/$n/$pid/$typeFlag/"
+            val pageHtml = runCatching {
+                app.get(embedPage, headers = pageHeaders(null, data)).text
+            }.getOrNull()
+            val src = pageHtml?.let {
+                Regex("""<iframe[^>]+src\s*=\s*["']([^"']+)["']""")
+                    .find(it)?.groupValues?.get(1)
+            }?.ifBlank { null }
+            if (src == null) {
+                emptyStreak++
+                if (n >= 2 && emptyStreak >= 2) break
+            } else {
+                emptyStreak = 0
+                slots += embedPage to src
+            }
+        }
+        diag += "srv=${slots.size}"
+
+        // Dig each host embed on the phone (frame referer chain).
+        val dug = ArrayList<DugCandidate>()
+        val digCodes = ArrayList<String>()
+        for ((embedPage, hostEmbed) in slots) {
+            if (elapsed() > 16000) break
+            val (links, code) = runCatching { digDubHost(hostEmbed, embedPage) }
+                .getOrDefault(emptyList<String>() to "err")
+            digCodes += "${hostOf(hostEmbed)}:$code"
+            for (link in links) {
+                dug += DugCandidate("مدبلج — ${hostOf(hostEmbed)}", link, hostEmbed)
+            }
+        }
+        diag += "dig=[${digCodes.joinToString(",")}]"
+        for (cand in probeCandidates(dug)) {
+            if (emitted >= 3) break
+            emitDirect(cand.label, cand.url, cand.referer, null, callback)
+            emitted++
+        }
+        diag += "t=${elapsed() / 1000}s"
+        if (emitted == 0) emitDebug(diag, callback)
+    }
+
+    // ------------------------------------------------------------------
     // loadLinks — data is the post URL (episode or movie).
     //
+    // Dubbed (3chk) data goes to loadLinksDub. Otherwise:
     // Phase A: dig the operator's custom HLS hosts on the phone in
     //   priority order (Arab HD, Red HD, estream, …), candidates get
     //   one parallel per-host probe round; stop at 3 dug links / 9 s.
@@ -635,6 +918,10 @@ class QessetProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
+        if (data.contains("3chk.net")) {
+            loadLinksDub(data, callback)
+            return true
+        }
         val startedAt = System.currentTimeMillis()
         fun elapsed() = System.currentTimeMillis() - startedAt
         var emitted = 0

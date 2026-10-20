@@ -715,14 +715,38 @@ class YouTubeProvider : MainAPI() {
             emitDebug(listOf("YouTube", "no-id"), callback)
             return true
         }
-        var emitted = 0
+        val raw = ArrayList<ExtractorLink>()
         runCatching {
             loadExtractor(watchUrl(id), data, subtitleCallback) { link ->
-                emitted++
-                callback(link)
+                raw += link
             }
         }
-        if (emitted == 0) emitDebug(listOf("YouTube", "ext=0", "id=$id"), callback)
+        if (raw.isEmpty()) {
+            emitDebug(listOf("YouTube", "ext=0", "id=$id"), callback)
+            return true
+        }
+        // Originals first (playback), then clearly labeled DIRECT
+        // DOWNLOAD copies of the same direct files — the app's
+        // download button next to each saves the file itself.
+        for (link in raw) callback(link)
+        for (link in raw) {
+            val isAudio = link.url.contains("mime=audio") ||
+                link.name.contains("audio", ignoreCase = true)
+            val label = when {
+                isAudio -> "⬇ تحميل الأغنية — صوت فقط"
+                link.quality in 100..4320 -> "⬇ تحميل مباشر — ${link.quality}p"
+                else -> "⬇ تحميل مباشر"
+            }
+            runCatching {
+                callback(
+                    newExtractorLink(name, label, link.url, link.type) {
+                        this.referer = link.referer
+                        this.quality = link.quality
+                        this.headers = link.headers
+                    }
+                )
+            }
+        }
         return true
     }
 }

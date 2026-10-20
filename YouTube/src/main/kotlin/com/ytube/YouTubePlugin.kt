@@ -67,12 +67,33 @@ object YtAuthUi {
                 maxLines = 4
             }
             layout.addView(input)
-            AlertDialog.Builder(ctx)
+
+            // The login WebView lives INSIDE this same dialog from
+            // the start (hidden). Opening a SECOND dialog for it made
+            // the soft keyboard never appear on the login page —
+            // a fresh dialog window loses the IME binding, and
+            // AlertDialog's FLAG_ALT_FOCUSABLE_IM blocks the rest.
+            // One window throughout + clearing that flag fixes it.
+            val wv = WebView(ctx)
+            wv.settings.javaScriptEnabled = true
+            wv.settings.domStorageEnabled = true
+            runCatching { CookieManager.getInstance().setAcceptThirdPartyCookies(wv, true) }
+            wv.isFocusable = true
+            wv.isFocusableInTouchMode = true
+            wv.setOnTouchListener { v, _ ->
+                (v as WebView).requestFocusFromTouch()
+                false
+            }
+            wv.layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, 1400
+            )
+            wv.visibility = android.view.View.GONE
+            layout.addView(wv)
+
+            val dialog = AlertDialog.Builder(ctx)
                 .setTitle("حساب يوتيوب")
                 .setView(layout)
-                .setPositiveButton("فتح تسجيل الدخول") { _, _ ->
-                    openWebLogin(ctx, prefs)
-                }
+                .setPositiveButton("فتح تسجيل الدخول", null)
                 .setNeutralButton("حفظ الكوكيز") { _, _ ->
                     YtAuth.save(prefs, input.text.toString())
                     Toast.makeText(ctx, "تم الحفظ", Toast.LENGTH_SHORT).show()
@@ -81,31 +102,8 @@ object YtAuthUi {
                     YtAuth.clear(prefs)
                     Toast.makeText(ctx, "تم تسجيل الخروج", Toast.LENGTH_SHORT).show()
                 }
-                .show()
-        }.onFailure {
-            Toast.makeText(ctx, "تعذر فتح الإعدادات", Toast.LENGTH_SHORT).show()
-        }
-    }
-
-    private fun openWebLogin(ctx: Context, prefs: SharedPreferences) {
-        runCatching {
-            val wv = WebView(ctx)
-            wv.settings.javaScriptEnabled = true
-            wv.settings.domStorageEnabled = true
-            runCatching { CookieManager.getInstance().setAcceptThirdPartyCookies(wv, true) }
-            // A WebView inside a dialog does not grab touch focus by
-            // itself on several OEM skins — without it the soft
-            // keyboard never opens when the user taps a field.
-            wv.isFocusable = true
-            wv.isFocusableInTouchMode = true
-            wv.setOnTouchListener { v, _ ->
-                (v as WebView).requestFocusFromTouch()
-                false
-            }
-            val dialog = AlertDialog.Builder(ctx)
-                .setView(wv)
-                .setNegativeButton("إغلاق", null)
                 .create()
+
             wv.webViewClient = object : WebViewClient() {
                 override fun onPageFinished(view: WebView?, url: String?) {
                     if (url != null && url.startsWith("https://www.youtube.com")) {
@@ -122,7 +120,11 @@ object YtAuthUi {
                     }
                 }
             }
+
             dialog.setOnShowListener {
+                dialog.window?.clearFlags(
+                    WindowManager.LayoutParams.FLAG_ALT_FOCUSABLE_IM
+                )
                 dialog.window?.setSoftInputMode(
                     WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE or
                         WindowManager.LayoutParams.SOFT_INPUT_STATE_VISIBLE
@@ -131,15 +133,26 @@ object YtAuthUi {
                     WindowManager.LayoutParams.MATCH_PARENT,
                     WindowManager.LayoutParams.MATCH_PARENT
                 )
-                wv.requestFocusFromTouch()
+                // Override so the button swaps the view in-place
+                // instead of dismissing the dialog.
+                dialog.getButton(AlertDialog.BUTTON_POSITIVE)
+                    .setOnClickListener {
+                        status.visibility = android.view.View.GONE
+                        input.visibility = android.view.View.GONE
+                        wv.visibility = android.view.View.VISIBLE
+                        dialog.window?.clearFlags(
+                            WindowManager.LayoutParams.FLAG_ALT_FOCUSABLE_IM
+                        )
+                        wv.requestFocusFromTouch()
+                        wv.loadUrl(
+                            "https://accounts.google.com/ServiceLogin?service=youtube" +
+                                "&continue=https%3A%2F%2Fwww.youtube.com%2F"
+                        )
+                    }
             }
             dialog.show()
-            wv.loadUrl(
-                "https://accounts.google.com/ServiceLogin?service=youtube" +
-                    "&continue=https%3A%2F%2Fwww.youtube.com%2F"
-            )
         }.onFailure {
-            Toast.makeText(ctx, "تعذر فتح صفحة الدخول", Toast.LENGTH_SHORT).show()
+            Toast.makeText(ctx, "تعذر فتح الإعدادات", Toast.LENGTH_SHORT).show()
         }
     }
 }

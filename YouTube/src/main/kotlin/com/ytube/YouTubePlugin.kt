@@ -88,19 +88,16 @@ object YtAuthUi {
                 visibility = android.view.View.GONE
             }
             layout.addView(passField)
-            val fillRow = LinearLayout(ctx).apply {
-                orientation = LinearLayout.HORIZONTAL
+            val btnLogin = android.widget.Button(ctx).apply {
+                text = "تسجيل الدخول"
                 visibility = android.view.View.GONE
             }
-            val btnEmail = android.widget.Button(ctx).apply {
-                text = "تعبئة الإيميل"
+            layout.addView(btnLogin)
+            val hint = TextView(ctx).apply {
+                text = "الصق الإيميل وكلمة السر في المربعات اللي فوق، ودوس «تسجيل الدخول» — الإضافة هتملّي صفحة جوجل وتدوس التالي بنفسها. الصفحة اللي تحت للعرض والتأكيد بس."
+                visibility = android.view.View.GONE
             }
-            val btnPass = android.widget.Button(ctx).apply {
-                text = "تعبئة كلمة السر"
-            }
-            fillRow.addView(btnEmail)
-            fillRow.addView(btnPass)
-            layout.addView(fillRow)
+            layout.addView(hint)
 
             // The login WebView lives INSIDE this same dialog from
             // the start (hidden). Opening a SECOND dialog for it made
@@ -119,7 +116,7 @@ object YtAuthUi {
                 false
             }
             wv.layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, 1000
+                LinearLayout.LayoutParams.MATCH_PARENT, 850
             )
             wv.visibility = android.view.View.GONE
             layout.addView(wv)
@@ -138,6 +135,71 @@ object YtAuthUi {
                 }
                 .create()
 
+            // ---- Auto-drive: the user NEVER types on the page. ----
+            // He pastes email + password into the native fields and
+            // taps ONE button; the plugin fills the official Google
+            // page via JS and clicks its Next buttons itself. The
+            // password is never stored or sent anywhere else.
+            var autoSteps = 0
+            fun fillInto(selector: String, value: String, then: () -> Unit) {
+                val js = "(function(){var el=document.querySelector('" + selector + "');" +
+                    "if(!el)return 'nf';" +
+                    "var st=Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,'value').set;" +
+                    "st.call(el," + org.json.JSONObject.quote(value) + ");" +
+                    "el.dispatchEvent(new Event('input',{bubbles:true}));" +
+                    "el.dispatchEvent(new Event('change',{bubbles:true}));" +
+                    "el.focus();return 'ok';})()"
+                wv.evaluateJavascript(js) { res ->
+                    if (res != null && res.contains("ok")) then()
+                }
+            }
+            fun clickNext(id: String) {
+                val js = "(function(){var b=document.querySelector('#" + id + "');" +
+                    "if(!b){var els=document.querySelectorAll('button,[role=button]');" +
+                    "for(var i=0;i<els.length;i++){var t=els[i].textContent||'';" +
+                    "if(t.indexOf('Next')>=0||t.indexOf('التالي')>=0){b=els[i];break;}}}" +
+                    "if(b){b.click();return 'ok';}return 'nf';})()"
+                wv.evaluateJavascript(js, null)
+            }
+            fun drive() {
+                if (autoSteps >= 10) return
+                val probe = "(function(){var p=document.querySelector('input[type=password]');" +
+                    "if(p)return 'pass';var e=document.querySelector('input[type=email]');" +
+                    "if(e)return 'email';return 'other';})()"
+                wv.evaluateJavascript(probe) { res ->
+                    when {
+                        res != null && res.contains("pass") -> {
+                            val v = passField.text.toString()
+                            if (v.isEmpty()) {
+                                hint.text = "الصق كلمة السر في المربع التاني وبعدين دوس «تسجيل الدخول»"
+                            } else {
+                                autoSteps++
+                                hint.text = "بندخّل كلمة السر…"
+                                fillInto("input[type=password]", v) {
+                                    passField.setText("")
+                                    clickNext("passwordNext")
+                                }
+                            }
+                        }
+                        res != null && res.contains("email") -> {
+                            val v = emailField.text.toString().trim()
+                            if (v.isEmpty()) {
+                                hint.text = "الصق الإيميل في المربع الأول وبعدين دوس «تسجيل الدخول»"
+                            } else {
+                                autoSteps++
+                                hint.text = "بندخّل الإيميل…"
+                                fillInto("input[type=email]", v) {
+                                    clickNext("identifierNext")
+                                }
+                            }
+                        }
+                        else -> {
+                            hint.text = "لو جوجل طلب خطوة تأكيد (زي الموافقة من تليفونك)، كمّلها في الصفحة اللي تحت وبعدين دوس «تسجيل الدخول» تاني"
+                        }
+                    }
+                }
+            }
+
             wv.webViewClient = object : WebViewClient() {
                 override fun onPageFinished(view: WebView?, url: String?) {
                     if (url != null && url.startsWith("https://www.youtube.com")) {
@@ -150,52 +212,23 @@ object YtAuthUi {
                                 Toast.LENGTH_LONG
                             ).show()
                             runCatching { dialog.dismiss() }
+                            return
                         }
                     }
+                    if (wv.visibility == android.view.View.VISIBLE) drive()
                 }
             }
 
-            // Fill a field on the Google page with a value from the
-            // native bridge fields (typing/paste happens natively).
-            fun fillInto(selector: String, value: String, label: String, after: () -> Unit) {
-                val js = "(function(){var el=document.querySelector('" + selector + "');" +
-                    "if(!el)return 'nf';" +
-                    "var st=Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,'value').set;" +
-                    "st.call(el," + org.json.JSONObject.quote(value) + ");" +
-                    "el.dispatchEvent(new Event('input',{bubbles:true}));" +
-                    "el.dispatchEvent(new Event('change',{bubbles:true}));" +
-                    "el.focus();return 'ok';})()"
-                wv.evaluateJavascript(js) { res ->
-                    if (res != null && res.contains("ok")) {
-                        Toast.makeText(
-                            ctx, "تمت تعبئة $label ✓ — دوس «التالي» في الصفحة",
-                            Toast.LENGTH_LONG
-                        ).show()
-                        after()
-                    } else {
-                        Toast.makeText(
-                            ctx, "خانة $label مش ظاهرة لسه — استنى الصفحة تحمّل",
-                            Toast.LENGTH_LONG
-                        ).show()
-                    }
-                }
-            }
-            btnEmail.setOnClickListener {
-                val v = emailField.text.toString().trim()
-                if (v.isEmpty()) {
-                    Toast.makeText(ctx, "الصق الإيميل في المربع الأول", Toast.LENGTH_SHORT).show()
+            btnLogin.setOnClickListener {
+                if (emailField.text.toString().isBlank() &&
+                    passField.text.toString().isEmpty()
+                ) {
+                    Toast.makeText(
+                        ctx, "الصق الإيميل وكلمة السر في المربعات الأول",
+                        Toast.LENGTH_SHORT
+                    ).show()
                 } else {
-                    fillInto("input[type=email]", v, "الإيميل") {}
-                }
-            }
-            btnPass.setOnClickListener {
-                val v = passField.text.toString()
-                if (v.isEmpty()) {
-                    Toast.makeText(ctx, "الصق كلمة السر في المربع التاني", Toast.LENGTH_SHORT).show()
-                } else {
-                    fillInto("input[type=password]", v, "كلمة السر") {
-                        passField.setText("")
-                    }
+                    drive()
                 }
             }
 
@@ -219,7 +252,8 @@ object YtAuthUi {
                         input.visibility = android.view.View.GONE
                         emailField.visibility = android.view.View.VISIBLE
                         passField.visibility = android.view.View.VISIBLE
-                        fillRow.visibility = android.view.View.VISIBLE
+                        btnLogin.visibility = android.view.View.VISIBLE
+                        hint.visibility = android.view.View.VISIBLE
                         wv.visibility = android.view.View.VISIBLE
                         dialog.window?.clearFlags(
                             WindowManager.LayoutParams.FLAG_ALT_FOCUSABLE_IM

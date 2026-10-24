@@ -435,7 +435,7 @@ class MovizLandProvider : MainAPI() {
                 host.contains("upbom") -> {
                     val directs = digUpbom(src, watchUrl)
                     for (d in directs) {
-                        emitDirect(d.second, d.first, src, counting)
+                        emitDirect(d.first, d.second, src, counting)
                         upCount++
                     }
                 }

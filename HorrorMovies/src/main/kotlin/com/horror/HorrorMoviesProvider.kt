@@ -82,7 +82,11 @@ class HorrorMoviesProvider : MainAPI() {
         "myc:https://vid.mycima.cc/categories-cimawbas.php?cat=horror-movies" to
             "أفلام رعب — ماي سيما",
         "lar:https://larozatv.com/category/%D8%B1%D8%B9%D8%A8" to
-            "أفلام رعب — لاروز"
+            "أفلام رعب — لاروز",
+        "top:https://topcinema.film/genre/%D8%B1%D8%B9%D8%A8/" to
+            "أفلام رعب — توب سينما",
+        "af:https://aflamstream.com/category/%D8%A3%D9%81%D9%84%D8%A7%D9%85-%D8%B1%D8%B9%D8%A8-%D9%85%D8%AA%D8%B1%D8%AC%D9%85%D8%A9-%D9%88%D8%AC%D8%AF%D9%8A%D8%AF%D8%A9/" to
+            "أفلام رعب — أفلام ستريم"
     )
 
     private fun cleanHtml(s: String): String =
@@ -91,7 +95,7 @@ class HorrorMoviesProvider : MainAPI() {
     private fun cleanMovieTitle(raw: String): String {
         var t = cleanHtml(raw).removePrefix("مشاهدة").trim()
             .removePrefix("فيلم").trim()
-        t = t.replace(Regex("""\s*[-|]\s*(MovizLand|موفيز لاند|Egybest|ايجى بست|MyCima|ماي سيما|LaRosTV|لاروز).*${'$'}""", RegexOption.IGNORE_CASE), "").trim()
+        t = t.replace(Regex("""\s*[-|]\s*(MovizLand|موفيز لاند|Egybest|ايجى بست|MyCima|ماي سيما|LaRosTV|لاروز|توب سينما|TopCinema|سلسلة افلام الرعب|أفلام ستريم).*${'$'}""", RegexOption.IGNORE_CASE), "").trim()
         return t
     }
 
@@ -119,6 +123,8 @@ class HorrorMoviesProvider : MainAPI() {
         val url = when (lane) {
             "moviz" -> if (page <= 1) base else base + "page/$page/"
             "eg" -> if (page <= 1) base else base + "page/$page/"
+            "top" -> if (page <= 1) base else base + "page/$page/"
+            "af" -> if (page <= 1) base else base + "page/$page/"
             "myc" -> if (page <= 1) base else base + "&page=$page"
             "lar" -> if (page <= 1) base else base + "/page/$page"
             else -> base
@@ -127,11 +133,11 @@ class HorrorMoviesProvider : MainAPI() {
             app.get(url, headers = browserHeaders).document
         }.getOrNull() ?: return newHomePageResponse(emptyList(), false)
         val cards = when (lane) {
-            "moviz", "eg", "myc", "lar" -> parseLaneCards(lane, doc)
+            "moviz", "eg", "myc", "lar", "top", "af" -> parseLaneCards(lane, doc)
             else -> emptyList()
         }
         val hasNext = when (lane) {
-            "moviz", "eg" -> doc.select("a[href*=/page/${page + 1}/]").isNotEmpty()
+            "moviz", "eg", "top", "af" -> doc.select("a[href*=/page/${page + 1}/]").isNotEmpty()
             "myc" -> doc.select("a[href*=page=${page + 1}]").isNotEmpty()
             "lar" -> doc.select("a[href]").any {
                 it.attr("href").contains("/page/${page + 1}")
@@ -190,6 +196,29 @@ class HorrorMoviesProvider : MainAPI() {
                 }?.ifBlank { null }
                 movieCard(title, href, poster)?.let { out += it }
             }
+            "top" -> for (a in doc.select("a.recent--block")) {
+                val href = a.attr("href")
+                val title = a.attr("title")
+                if (!isMovieTitle(title)) continue
+                val img = a.selectFirst("img")
+                val poster = img?.attr("data-src")?.ifBlank { null }
+                    ?: img?.attr("src")?.ifBlank { null }
+                val rating = a.selectFirst("li.imdbRating")?.text()?.trim()
+                val shown = if (!rating.isNullOrBlank()) {
+                    cleanMovieTitle(title) + " ★ $rating"
+                } else {
+                    title
+                }
+                movieCard(shown, href, poster)?.let { out += it }
+            }
+            "af" -> for (div in doc.select("div.ht_grid_1_4")) {
+                val a = div.selectFirst("a.thumbnail-link") ?: continue
+                val href = a.attr("href")
+                val img = div.selectFirst("img")
+                val poster = img?.attr("src")?.ifBlank { null }
+                val title = div.selectFirst("h2.entry-title a")?.text().orEmpty()
+                movieCard(title, href, poster)?.let { out += it }
+            }
         }
         return out
     }
@@ -204,7 +233,9 @@ class HorrorMoviesProvider : MainAPI() {
             "https://www.moviz.land/?s=$q" to "moviz",
             "https://egibest.life/?s=$q" to "eg",
             "https://vid.mycima.cc/search.php?keywords=$q" to "myc",
-            "https://larozatv.com/search?q=$q" to "lar"
+            "https://larozatv.com/search?q=$q" to "lar",
+            "https://topcinema.film/?s=$q" to "top",
+            "https://aflamstream.com/?s=$q" to "af"
         )
         for ((url, lane) in jobs) {
             runCatching {
@@ -247,6 +278,26 @@ class HorrorMoviesProvider : MainAPI() {
                             it.attr("abs:src").ifBlank { it.attr("src") }
                         }?.ifBlank { null }
                         movieCard(title, a.attr("abs:href").ifBlank { a.attr("href") }, poster)
+                    }
+                    "top" -> doc.select("a.recent--block").mapNotNull { a ->
+                        val title = a.attr("title")
+                        if (!isMovieTitle(title)) return@mapNotNull null
+                        val img = a.selectFirst("img")
+                        val poster = img?.attr("data-src")?.ifBlank { null }
+                            ?: img?.attr("src")?.ifBlank { null }
+                        val rating = a.selectFirst("li.imdbRating")?.text()?.trim()
+                        val shown = if (!rating.isNullOrBlank()) {
+                            cleanMovieTitle(title) + " ★ $rating"
+                        } else {
+                            title
+                        }
+                        movieCard(shown, a.attr("href"), poster)
+                    }
+                    "af" -> doc.select("div.ht_grid_1_4").mapNotNull { div ->
+                        val a = div.selectFirst("a.thumbnail-link") ?: return@mapNotNull null
+                        val img = div.selectFirst("img")
+                        val title = div.selectFirst("h2.entry-title a")?.text().orEmpty()
+                        movieCard(title, a.attr("href"), img?.attr("src"))
                     }
                     else -> emptyList()
                 }
@@ -325,6 +376,33 @@ class HorrorMoviesProvider : MainAPI() {
                 val slug = url.trimEnd('/').substringAfterLast('/')
                 val servers = "https://larozatv.com/watch/$slug/servers"
                 newMovieLoadResponse(title.ifBlank { "LaRosTV" }, url, TvType.Movie, servers) {
+                    this.posterUrl = poster
+                    this.backgroundPosterUrl = poster
+                    this.plot = desc
+                }
+            }
+            url.contains("topcinema") -> {
+                val doc = runCatching {
+                    app.get(url, headers = browserHeaders).document
+                }.getOrNull()
+                val title = cleanMovieTitle(og(doc ?: return movieFallback(url), "title") ?: "")
+                val poster = doc?.let { og(it, "image") }
+                val desc = doc?.let { og(it, "description") }
+                val watch = url.trimEnd('/') + "/watch/"
+                newMovieLoadResponse(title.ifBlank { "TopCinema" }, url, TvType.Movie, watch) {
+                    this.posterUrl = poster
+                    this.backgroundPosterUrl = poster
+                    this.plot = desc
+                }
+            }
+            url.contains("aflamstream") -> {
+                val doc = runCatching {
+                    app.get(url, headers = browserHeaders).document
+                }.getOrNull()
+                val title = cleanMovieTitle(og(doc ?: return movieFallback(url), "title") ?: "")
+                val poster = doc?.let { og(it, "image") }
+                val desc = doc?.let { og(it, "description") }
+                newMovieLoadResponse(title.ifBlank { "AflamStream" }, url, TvType.Movie, url) {
                     this.posterUrl = poster
                     this.backgroundPosterUrl = poster
                     this.plot = desc
@@ -605,6 +683,8 @@ class HorrorMoviesProvider : MainAPI() {
             data.contains("egibest") -> loadLinksEgyBest(data, subtitleCallback, callback, ::elapsed)
             data.contains("mycima") -> loadLinksMyCima(data, subtitleCallback, callback, ::elapsed)
             data.contains("larozatv") -> loadLinksLaRos(data, subtitleCallback, callback, ::elapsed)
+            data.contains("topcinema") -> loadLinksTop(data, subtitleCallback, callback, ::elapsed)
+            data.contains("aflamstream") -> loadLinksAf(data, subtitleCallback, callback, ::elapsed)
             else -> {
                 emitDebug(listOf("Horror", "unknown-lane"), callback)
                 true
@@ -845,5 +925,133 @@ class HorrorMoviesProvider : MainAPI() {
                 allowDebug = emitted == 0)
         }
         return true
+    }
+
+    /** Raw form POST (no coroutine deps): TopCinema's server switch. */
+    private fun httpPostForm(
+        url: String,
+        fields: Map<String, String>,
+        referer: String
+    ): String? {
+        return runCatching {
+            val body = fields.entries.joinToString("&") { (k, v) ->
+                java.net.URLEncoder.encode(k, "UTF-8") + "=" +
+                    java.net.URLEncoder.encode(v, "UTF-8")
+            }
+            val conn = java.net.URL(url).openConnection()
+                as java.net.HttpURLConnection
+            conn.requestMethod = "POST"
+            conn.doOutput = true
+            conn.connectTimeout = 15000
+            conn.readTimeout = 15000
+            conn.setRequestProperty("User-Agent", browserUA)
+            conn.setRequestProperty("Referer", asciiSafe(referer))
+            conn.setRequestProperty("X-Requested-With", "XMLHttpRequest")
+            conn.setRequestProperty(
+                "Content-Type", "application/x-www-form-urlencoded"
+            )
+            conn.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
+            val stream = if (conn.responseCode in 200..299) {
+                conn.inputStream
+            } else {
+                conn.errorStream
+            } ?: return@runCatching null
+            stream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+        }.getOrNull()
+    }
+
+    /**
+     * TopCinema lane: watch page → li.server--item (data-id,
+     * data-server) → POST Single/Server.php (Referer = watch page,
+     * XHR) → iframe embed → shared chain. The active server's
+     * iframe is also on the watch page itself (server 0).
+     */
+    private suspend fun loadLinksTop(
+        data: String,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit,
+        elapsed: () -> Long
+    ): Boolean {
+        val watchUrl = data
+        val doc = runCatching {
+            app.get(watchUrl, headers = browserHeaders).document
+        }.getOrNull()
+        if (doc == null) {
+            emitDebug(listOf("Horror·Top", "watch-fail"), callback)
+            return true
+        }
+        val embeds = LinkedHashSet<String>()
+        doc.select("iframe[src]").forEach {
+            val src = it.attr("src").trim()
+            if (src.startsWith("http") && !src.contains("topcinema")) {
+                embeds += src
+            }
+        }
+        var postId: String? = null
+        val items = ArrayList<Pair<String, String>>()
+        for (li in doc.select("li.server--item")) {
+            val id = li.attr("data-id")
+            val idx = li.attr("data-server")
+            if (id.isNotBlank() && idx.isNotBlank()) {
+                postId = id
+                items += id to idx
+            }
+        }
+        if (postId != null) {
+            for ((id, idx) in items) {
+                if (elapsed() > 12000) break
+                val html = httpPostForm(
+                    "https://topcinema.film/wp-content/themes/movies2023/Ajaxat/Single/Server.php",
+                    mapOf("id" to id, "i" to idx),
+                    watchUrl
+                ) ?: continue
+                val iframe = Regex("""<iframe[^>]*src="([^"]+)"""")
+                    .find(html)?.groupValues?.get(1)
+                if (iframe != null && iframe.startsWith("http") &&
+                    !iframe.contains("topcinema")
+                ) {
+                    embeds += iframe
+                }
+            }
+        }
+        return runChain(embeds.toList(), watchUrl, subtitleCallback, callback, elapsed, "Top")
+    }
+
+    /**
+     * AflamStream lane: post URL's trailing segment is the post id →
+     * /watch/?id={id} → .server-btn[data-url] (5 servers) →
+     * shared chain.
+     */
+    private suspend fun loadLinksAf(
+        data: String,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit,
+        elapsed: () -> Long
+    ): Boolean {
+        val postId = data.trimEnd('/').substringAfterLast('/')
+        if (postId.isBlank() || postId == data.trimEnd('/')) {
+            emitDebug(listOf("Horror·Af", "id-missing"), callback)
+            return true
+        }
+        val watchUrl = "https://aflamstream.com/watch/?id=$postId"
+        val doc = runCatching {
+            app.get(watchUrl, headers = browserHeaders).document
+        }.getOrNull()
+        if (doc == null) {
+            emitDebug(listOf("Horror·Af", "watch-fail"), callback)
+            return true
+        }
+        val embeds = LinkedHashSet<String>()
+        doc.select(".server-btn[data-url]").forEach {
+            val u = it.attr("data-url").trim()
+            if (u.startsWith("http")) embeds += u
+        }
+        doc.select("iframe[src]").forEach {
+            val src = it.attr("src").trim()
+            if (src.startsWith("http") && !src.contains("aflamstream")) {
+                embeds += src
+            }
+        }
+        return runChain(embeds.toList(), watchUrl, subtitleCallback, callback, elapsed, "Af")
     }
 }

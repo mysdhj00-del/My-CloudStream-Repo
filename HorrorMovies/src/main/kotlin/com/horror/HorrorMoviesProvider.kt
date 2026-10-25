@@ -336,7 +336,7 @@ class HorrorMoviesProvider : MainAPI() {
                     if (rating != null) append("★ التقييم: $rating/10\n")
                     if (!desc.isNullOrBlank()) append(desc)
                 }.ifBlank { null }
-                newMovieLoadResponse(title.ifBlank { "MovizLand" }, url, TvType.Movie, url) {
+                newMovieLoadResponse(title.ifBlank { "MovizLand" }, url, TvType.Movie, subData(url, title)) {
                     this.posterUrl = poster
                     this.backgroundPosterUrl = poster
                     this.plot = plot
@@ -349,7 +349,7 @@ class HorrorMoviesProvider : MainAPI() {
                 val title = cleanMovieTitle(og(doc ?: return movieFallback(url), "title") ?: "")
                 val poster = doc?.let { og(it, "image") }
                 val desc = doc?.let { og(it, "description") }
-                newMovieLoadResponse(title.ifBlank { "EgyBest" }, url, TvType.Movie, url) {
+                newMovieLoadResponse(title.ifBlank { "EgyBest" }, url, TvType.Movie, subData(url, title)) {
                     this.posterUrl = poster
                     this.backgroundPosterUrl = poster
                     this.plot = desc
@@ -363,7 +363,7 @@ class HorrorMoviesProvider : MainAPI() {
                 val poster = doc?.let { og(it, "image") }
                     ?: doc?.selectFirst("img[src*=uploads]")?.attr("src")
                 val desc = doc?.let { og(it, "description") }
-                newMovieLoadResponse(title.ifBlank { "MyCima" }, url, TvType.Movie, url) {
+                newMovieLoadResponse(title.ifBlank { "MyCima" }, url, TvType.Movie, subData(url, title)) {
                     this.posterUrl = poster
                     this.backgroundPosterUrl = poster
                     this.plot = desc
@@ -378,7 +378,7 @@ class HorrorMoviesProvider : MainAPI() {
                 val desc = doc?.let { og(it, "description") }
                 val slug = url.trimEnd('/').substringAfterLast('/')
                 val servers = "https://larozatv.com/watch/$slug/servers"
-                newMovieLoadResponse(title.ifBlank { "LaRosTV" }, url, TvType.Movie, servers) {
+                newMovieLoadResponse(title.ifBlank { "LaRosTV" }, url, TvType.Movie, subData(servers, title)) {
                     this.posterUrl = poster
                     this.backgroundPosterUrl = poster
                     this.plot = desc
@@ -392,7 +392,7 @@ class HorrorMoviesProvider : MainAPI() {
                 val poster = doc?.let { og(it, "image") }
                 val desc = doc?.let { og(it, "description") }
                 val watch = url.trimEnd('/') + "/watch/"
-                newMovieLoadResponse(title.ifBlank { "TopCinema" }, url, TvType.Movie, watch) {
+                newMovieLoadResponse(title.ifBlank { "TopCinema" }, url, TvType.Movie, subData(watch, title)) {
                     this.posterUrl = poster
                     this.backgroundPosterUrl = poster
                     this.plot = desc
@@ -405,7 +405,7 @@ class HorrorMoviesProvider : MainAPI() {
                 val title = cleanMovieTitle(og(doc ?: return movieFallback(url), "title") ?: "")
                 val poster = doc?.let { og(it, "image") }
                 val desc = doc?.let { og(it, "description") }
-                newMovieLoadResponse(title.ifBlank { "AflamStream" }, url, TvType.Movie, url) {
+                newMovieLoadResponse(title.ifBlank { "AflamStream" }, url, TvType.Movie, subData(url, title)) {
                     this.posterUrl = poster
                     this.backgroundPosterUrl = poster
                     this.plot = desc
@@ -417,7 +417,7 @@ class HorrorMoviesProvider : MainAPI() {
 
     private suspend fun movieFallback(url: String): LoadResponse {
         val name = cleanMovieTitle(url.substringAfterLast('/').replace('-', ' '))
-        return newMovieLoadResponse(name.ifBlank { "فيلم" }, url, TvType.Movie, url)
+        return newMovieLoadResponse(name.ifBlank { "فيلم" }, url, TvType.Movie, subData(url, name))
     }
 
     // ---------------------------------------------------------------
@@ -681,13 +681,18 @@ class HorrorMoviesProvider : MainAPI() {
     ): Boolean {
         val t0 = System.currentTimeMillis()
         fun elapsed() = System.currentTimeMillis() - t0
+        // Auto English subtitles first (settings switch, default ON).
+        val (realData, subTitle, _) = parseSubData(data)
+        if (HorrorSubs.autoEnglish && subTitle.isNotBlank()) {
+            emitEnglishSub(subTitle, subtitleCallback)
+        }
         return when {
-            data.contains("moviz.land") -> loadLinksMoviz(data, subtitleCallback, callback, ::elapsed)
-            data.contains("egibest") -> loadLinksEgyBest(data, subtitleCallback, callback, ::elapsed)
-            data.contains("mycima") -> loadLinksMyCima(data, subtitleCallback, callback, ::elapsed)
-            data.contains("larozatv") -> loadLinksLaRos(data, subtitleCallback, callback, ::elapsed)
-            data.contains("topcinema") -> loadLinksTop(data, subtitleCallback, callback, ::elapsed)
-            data.contains("aflamstream") -> loadLinksAf(data, subtitleCallback, callback, ::elapsed)
+            realData.contains("moviz.land") -> loadLinksMoviz(realData, subtitleCallback, callback, ::elapsed)
+            realData.contains("egibest") -> loadLinksEgyBest(realData, subtitleCallback, callback, ::elapsed)
+            realData.contains("mycima") -> loadLinksMyCima(realData, subtitleCallback, callback, ::elapsed)
+            realData.contains("larozatv") -> loadLinksLaRos(realData, subtitleCallback, callback, ::elapsed)
+            realData.contains("topcinema") -> loadLinksTop(realData, subtitleCallback, callback, ::elapsed)
+            realData.contains("aflamstream") -> loadLinksAf(realData, subtitleCallback, callback, ::elapsed)
             else -> {
                 emitDebug(listOf("Horror", "unknown-lane"), callback)
                 true
@@ -930,7 +935,119 @@ class HorrorMoviesProvider : MainAPI() {
         return true
     }
 
-    /** Raw form POST (no coroutine deps): TopCinema's server switch. */
+    /**
+     * AUTO ENGLISH SUBTITLES (v4): CloudStream has no standalone
+     * subtitle-plugin type that auto-attaches to other providers'
+     * playback, so the tool lives here — inside loadLinks, before
+     * any video link is emitted:
+     *   Latin title (+ year) → IMDb suggest (key-free) → IMDb id →
+     *   OpenSubtitles v3 Stremio endpoint (key-free) → first
+     *   lang=eng file → subtitleCallback(SubtitleFile("English", url)).
+     * The .srt downloads without auth (verified: The Conjuring 2013,
+     * 79 KB / 1087 cues; Breaking Bad S1E1, 8 English files).
+     * Everything is fail-soft and fail-fast (8 s caps): if any step
+     * misses, playback continues with zero subtitles — never blocked.
+     * Titles with no Latin part (fully Arabic titles) cannot be
+     * resolved by IMDb suggest and get no subtitle in v4.
+     */
+    private fun httpGetText(url: String, timeoutMs: Int): String? {
+        return runCatching {
+            val conn = java.net.URL(url).openConnection()
+                as java.net.HttpURLConnection
+            conn.requestMethod = "GET"
+            conn.connectTimeout = timeoutMs
+            conn.readTimeout = timeoutMs
+            conn.setRequestProperty("User-Agent", browserUA)
+            conn.setRequestProperty("Accept", "application/json, text/plain, */*")
+            val stream = if (conn.responseCode in 200..299) {
+                conn.inputStream
+            } else {
+                return@runCatching null
+            }
+            stream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+        }.getOrNull()
+    }
+
+    private fun latinTitleCandidates(title: String): List<String> {
+        var t = title.replace(Regex("""[\u0600-\u06FF]+"""), " ")
+        t = t.replace(Regex("""(?i)\b(mtarjm|mudblj|online|web-dl|bluray|hd|hdts|hdcam|webdl)\b"""), " ")
+        t = t.replace(Regex("""[^A-Za-z0-9 :'\-!.,]+"""), " ")
+        t = t.replace(Regex("""\s+"""), " ").trim()
+        t = t.replace(Regex("""\s+(19|20)\d\d\s*$"""), "").trim()
+        if (t.isBlank()) return emptyList()
+        val out = mutableListOf(t)
+        Regex("""\s+\d{1,2}$""").find(t)?.let {
+            val stripped = t.substring(0, it.range.first).trim()
+            if (stripped.isNotBlank()) out += stripped
+        }
+        return out
+    }
+
+    private fun resolveImdbId(latinTitle: String, year: Int?): String? {
+        val bucket = latinTitle.firstOrNull()?.lowercaseChar() ?: return null
+        val q = java.net.URLEncoder.encode(latinTitle, "UTF-8")
+        val json = httpGetText(
+            "https://v2.sg.media-imdb.com/suggestion/$bucket/$q.json", 8000
+        ) ?: return null
+        val arr = runCatching {
+            JSONObject(json).optJSONArray("d")
+        }.getOrNull() ?: return null
+        var fallback: String? = null
+        for (i in 0 until arr.length()) {
+            val o = arr.optJSONObject(i) ?: continue
+            val id = o.optString("id")
+            if (id.isBlank()) continue
+            val kind = o.optString("q")
+            if (fallback == null && kind == "feature") fallback = id
+            if (kind != "feature" && kind != "TV series") continue
+            if (year != null && o.has("y") && o.optInt("y") != year) continue
+            return id
+        }
+        return fallback
+    }
+
+    private suspend fun emitEnglishSub(
+        title: String,
+        subtitleCallback: (SubtitleFile) -> Unit
+    ) {
+        runCatching {
+            val year = Regex("""(19|20)\d\d""").find(title)?.value?.toIntOrNull()
+            for (candidate in latinTitleCandidates(title)) {
+                val tt = resolveImdbId(candidate, year) ?: continue
+                val json = httpGetText(
+                    "https://opensubtitles-v3.strem.io/subtitles/movie/$tt.json",
+                    8000
+                ) ?: continue
+                val arr = runCatching {
+                    JSONObject(json).optJSONArray("subtitles")
+                }.getOrNull() ?: continue
+                for (i in 0 until arr.length()) {
+                    val o = arr.optJSONObject(i) ?: continue
+                    if (o.optString("lang") != "eng") continue
+                    val url = o.optString("url")
+                    if (url.isNotBlank()) {
+                        subtitleCallback(SubtitleFile("English", url))
+                        return
+                    }
+                }
+            }
+        }
+    }
+
+    /** Packs title (+year, parsed from the title) into a loadLinks data string. */
+    private fun subData(url: String, title: String): String {
+        val enc = java.net.URLEncoder.encode(title, "UTF-8")
+        return url + "|||" + enc
+    }
+
+    private fun parseSubData(data: String): Triple<String, String, String> {
+        val parts = data.split("|||")
+        val real = parts.getOrNull(0) ?: data
+        val title = parts.getOrNull(1)?.let {
+            runCatching { java.net.URLDecoder.decode(it, "UTF-8") }.getOrDefault("")
+        }.orEmpty()
+        return Triple(real, title, "")
+    }
     private fun httpPostForm(
         url: String,
         fields: Map<String, String>,

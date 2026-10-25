@@ -43,6 +43,9 @@ import org.jsoup.nodes.Document
  *   lists the embeds (iframe srcs + /e/ + /embed/ URLs);
  *   chain = extractors → digs → relay.
  * - LAROSTV (larozatv.com): /category/رعب renders article.ay-card
+ *   (movie-badged cards only). CATEGORY pages paginate with ?page=N
+ *   (NOT /page/N — the /page/N path returns a stale 10-card set;
+ *   ?page=2/?page=3 verified 20 NEW cards each, zero overlap).
  *   (movie-badged cards only); movie posts open the servers page
  *   /watch/{slug}/servers with [data-server-url] buttons (19 per
  *   title on the confirmed v2 chain: MixDrop-first + early stop).
@@ -126,7 +129,7 @@ class HorrorMoviesProvider : MainAPI() {
             "top" -> if (page <= 1) base else base + "page/$page/"
             "af" -> if (page <= 1) base else base + "page/$page/"
             "myc" -> if (page <= 1) base else base + "&page=$page"
-            "lar" -> if (page <= 1) base else base + "/page/$page"
+            "lar" -> if (page <= 1) base else base + "?page=$page"
             else -> base
         }
         val doc = runCatching {
@@ -140,7 +143,7 @@ class HorrorMoviesProvider : MainAPI() {
             "moviz", "eg", "top", "af" -> doc.select("a[href*=/page/${page + 1}/]").isNotEmpty()
             "myc" -> doc.select("a[href*=page=${page + 1}]").isNotEmpty()
             "lar" -> doc.select("a[href]").any {
-                it.attr("href").contains("/page/${page + 1}")
+                it.attr("href").contains("?page=${page + 1}")
             }
             else -> false
         }

@@ -936,7 +936,7 @@ class HorrorMoviesProvider : MainAPI() {
     }
 
     /**
-     * AUTO ENGLISH SUBTITLES (v4): CloudStream has no standalone
+     * AUTO ENGLISH SUBTITLES (v6 = v3 + subs + settings switch): CloudStream has no standalone
      * subtitle-plugin type that auto-attaches to other providers'
      * playback, so the tool lives here — inside loadLinks, before
      * any video link is emitted:

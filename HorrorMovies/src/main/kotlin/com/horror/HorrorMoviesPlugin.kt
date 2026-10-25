@@ -10,7 +10,7 @@ import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
 
 /**
- * Auto English subtitles switch (v4 settings): volatile so the
+ * Auto English subtitles switch (v6 settings): volatile so the
  * provider reads it without a Context; persisted so it survives
  * app restarts (restored in load()).
  */

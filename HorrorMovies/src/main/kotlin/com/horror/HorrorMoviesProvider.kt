@@ -936,7 +936,7 @@ class HorrorMoviesProvider : MainAPI() {
     }
 
     /**
-     * AUTO ENGLISH SUBTITLES (v6 = v3 + subs + settings switch): CloudStream has no standalone
+     * AUTO ENGLISH SUBTITLES (v7 = v6 + sync-first ranking): CloudStream has no standalone
      * subtitle-plugin type that auto-attaches to other providers'
      * playback, so the tool lives here — inside loadLinks, before
      * any video link is emitted:
@@ -1021,14 +1021,31 @@ class HorrorMoviesProvider : MainAPI() {
                 val arr = runCatching {
                     JSONObject(json).optJSONArray("subtitles")
                 }.getOrNull() ?: continue
+                // Sync-first ranking (v7): don't take the first eng file.
+                // A subtitle timed for 25fps on a 23.976fps stream drifts
+                // more and more as the film plays — the classic desync.
+                // Prefer 23.976fps BluRay/WEB UTF-8 files, which match
+                // the standard movie streams best.
+                var bestUrl = ""
+                var bestScore = -1
                 for (i in 0 until arr.length()) {
                     val o = arr.optJSONObject(i) ?: continue
                     if (o.optString("lang") != "eng") continue
                     val url = o.optString("url")
-                    if (url.isNotBlank()) {
-                        subtitleCallback(SubtitleFile("English", url))
-                        return
+                    if (url.isBlank()) continue
+                    var score = 0
+                    if (o.optInt("fpsMilli", 0) == 23976) score += 3
+                    val fmt = o.optString("releaseFormat")
+                    if (fmt == "BluRay" || fmt == "WEB") score += 2
+                    if (o.optString("SubEncoding") == "UTF-8") score += 1
+                    if (score > bestScore) {
+                        bestScore = score
+                        bestUrl = url
                     }
+                }
+                if (bestUrl.isNotBlank()) {
+                    subtitleCallback(SubtitleFile("English", bestUrl))
+                    return
                 }
             }
         }

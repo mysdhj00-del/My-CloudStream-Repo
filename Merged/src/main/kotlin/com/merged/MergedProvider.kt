@@ -26,7 +26,12 @@ import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 
 /**
- * Merged (مدمج) v6 — DIRECT STREAMING ONLY, no torrents.
+ * Merged (مدمج) v7 — DIRECT STREAMING ONLY, no torrents.
+ * v7 change: 9anime links now come in pairs — Direct with the full
+ * browser header profile, plus a relay-proxied copy (/relay/hls) —
+ * because the phone's bare /stream/ request is denied while the same
+ * URL plays fine in a full browser context (verified 2026-10-27:
+ * Chojo ep 4 to 00:18/23:30).
  * Lanes (both chains verified live 2026-10-27):
  *
  * - CINEBY (cineby.ws): /tv/{slug}/episode/{s}/{e} (XHR headers)
@@ -80,6 +85,18 @@ class MergedProvider : MainAPI() {
         "Accept-Language" to "ar-EG,ar;q=0.9,en-US;q=0.8,en;q=0.7"
     )
     private val relayBase = "https://egydead-stremio.onrender.com"
+
+    /** Full browser header profile for media links (matches the relay's
+     * proven BROWSER_HEADERS set: UA+Referer alone got 403 from a CDN
+     * in the 2026-10-18 vidtest probe; the full set got 200). */
+    private val streamHeaders = mapOf(
+        "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
+        "sec-ch-ua" to "\"Chromium\";v=\"126\", \"Google Chrome\";v=\"126\", \"Not-A.Brand\";v=\"24\"",
+        "sec-ch-ua-mobile" to "?0",
+        "sec-ch-ua-platform" to "\"Windows\"",
+        "Accept" to "*/*",
+        "Accept-Language" to "ar-EG,ar;q=0.9,en;q=0.7"
+    )
 
     override val mainPage = mainPageOf(
         "cb:https://cineby.ws/" to "الأكثر مشاهدة — Cineby",
@@ -349,6 +366,26 @@ class MergedProvider : MainAPI() {
         }.getOrNull()
     }
 
+    /** Pure-Kotlin base64url encode (no padding), matching the relay's
+     * b64e: same alphabet the /relay/hls route decodes with b64d. */
+    private fun encodeBase64Url(input: String): String {
+        val table = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+        val bytes = input.toByteArray(Charsets.UTF_8)
+        val out = StringBuilder()
+        var i = 0
+        while (i < bytes.size) {
+            val b0 = bytes[i].toInt() and 0xFF
+            val b1 = if (i + 1 < bytes.size) bytes[i + 1].toInt() and 0xFF else 0
+            val b2 = if (i + 2 < bytes.size) bytes[i + 2].toInt() and 0xFF else 0
+            out.append(table[b0 shr 2])
+            out.append(table[((b0 and 3) shl 4) or (b1 shr 4)])
+            if (i + 1 < bytes.size) out.append(table[((b1 and 15) shl 2) or (b2 shr 6)])
+            if (i + 2 < bytes.size) out.append(table[b2 and 63])
+            i += 3
+        }
+        return out.toString()
+    }
+
     private suspend fun loadLinksAnime9(
         epUrl: String,
         subtitleCallback: (SubtitleFile) -> Unit,
@@ -391,8 +428,23 @@ class MergedProvider : MainAPI() {
                 if (!play.contains("/play/")) continue
                 val stream = play.replace("/play/", "/stream/")
                 val typ = item.attr("data-type").ifBlank { "sub" }.uppercase()
+                // v7: the phone's bare request is denied (browser context
+                // plays fine, 00:18/23:30 verified 2026-10-27). Emit the
+                // direct link WITH the full browser header profile, plus
+                // a relay-proxied copy (relay fetches with the same full
+                // profile and pipes the bytes) as the fallback link.
                 callback(
                     newExtractorLink("9anime", "$typ · Direct", stream, ExtractorLinkType.VIDEO) {
+                        this.referer = play
+                        this.quality = Qualities.Unknown.value
+                        this.headers = streamHeaders
+                    }
+                )
+                emitted++
+                val relayUrl = "$relayBase/relay/hls?u=${encodeBase64Url(stream)}" +
+                    "&r=${encodeBase64Url(play)}"
+                callback(
+                    newExtractorLink("9anime", "$typ · Relay", relayUrl, ExtractorLinkType.VIDEO) {
                         this.referer = play
                         this.quality = Qualities.Unknown.value
                     }

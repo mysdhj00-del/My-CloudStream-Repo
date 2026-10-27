@@ -145,12 +145,20 @@ class MergedProvider : MainAPI() {
     private fun ytsHomeCards(doc: Document): List<SearchResponse> {
         val out = mutableListOf<SearchResponse>()
         val seen = HashSet<String>()
+        // Title links carry the correct spelling ("Avatar: Fire and
+        // Ash"); the wrap link only has an img whose alt appends
+        // " download" (and sometimes a misspelled slug form).
         for (a in doc.select("a[href*=/movies/]")) {
             val href = a.attr("href")
             if (href.isBlank() || !seen.add(href)) continue
             val img = a.selectFirst("img")
-            val title = img?.attr("alt")?.trim().orEmpty()
-                .ifBlank { a.text().trim() }
+            var title = if (a.hasClass("browse-movie-title")) {
+                a.text().trim()
+            } else {
+                img?.attr("alt")?.trim().orEmpty()
+            }.ifBlank { a.text().trim() }
+            title = title.removeSuffix(" download").trim()
+            title = title.replace(Regex("""\s*\(\d{4}\)\s*$"""), "").trim()
             if (title.isBlank()) continue
             val r = newMovieSearchResponse(title, href, TvType.Movie)
             img?.attr("src")?.let { if (it.isNotBlank()) r.posterUrl = it }
@@ -289,7 +297,7 @@ class MergedProvider : MainAPI() {
         var plot = doc?.selectFirst("meta[property=og:description]")?.attr("content")
         if (title.isBlank()) title = slugTitle
         val year = parseYear(title).ifBlank { slugYear }
-        if (poster.isNullOrBlank() || plot.isNullOrBlank()) {
+        if (poster.isNullOrBlank() || plot.isNullOrBlank() || title == slugTitle) {
             runCatching {
                 val apiBase = if (url.endsWith("/")) url else "$url/"
                 val q = java.net.URLEncoder.encode(slugTitle, "UTF-8")
@@ -327,6 +335,15 @@ class MergedProvider : MainAPI() {
                             }
                         }
                     }
+                }
+            }
+        }
+        // TMDB search cannot fix a misspelled slug ("B Hubali");
+        // IMDb suggest is fuzzy and returns the correct spelling.
+        if (title == slugTitle) {
+            runCatching {
+                resolveImdbTitle(slugTitle, year.toIntOrNull())?.let {
+                    title = it
                 }
             }
         }
@@ -391,6 +408,34 @@ class MergedProvider : MainAPI() {
             if (fallback == null) fallback = id
             if (year != null && y != year) continue
             if (qkind == "feature" || qkind == "TV series") return id
+        }
+        return fallback
+    }
+
+    /** Fuzzy title resolution: IMDb suggest finds the correct
+     * spelling even when the site's own slug is misspelled
+     * (verified: "B Hubali The Epic" -> "Baahubali: The Epic"). */
+    private fun resolveImdbTitle(latinTitle: String, year: Int?): String? {
+        val bucket = latinTitle.firstOrNull()?.lowercaseChar() ?: return null
+        val q = java.net.URLEncoder.encode(latinTitle, "UTF-8")
+        val json = httpGetText(
+            "https://v2.sg.media-imdb.com/suggestion/$bucket/$q.json", 8000
+        ) ?: return null
+        val arr = runCatching {
+            JSONObject(json).optJSONArray("d")
+        }.getOrNull() ?: return null
+        var fallback: String? = null
+        for (i in 0 until arr.length()) {
+            val o = arr.optJSONObject(i) ?: continue
+            val id = o.optString("id")
+            if (!id.startsWith("tt")) continue
+            val label = o.optString("l")
+            if (label.isBlank()) continue
+            val qkind = o.optString("q")
+            val y = o.optInt("y", -1)
+            if (fallback == null) fallback = label
+            if (year != null && y != year) continue
+            if (qkind == "feature" || qkind == "TV series") return label
         }
         return fallback
     }
@@ -647,24 +692,49 @@ class MergedProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit,
         elapsed: () -> Long
     ): Boolean {
-        val apiUrl = movieUrl.trimEnd('/') + "?api=torrents&mode=movie" +
-            "&name=" + java.net.URLEncoder.encode(title, "UTF-8") +
-            "&year=" + java.net.URLEncoder.encode(year, "UTF-8") +
-            "&quality=all"
-        val json = runCatching {
-            app.get(apiUrl, headers = browserHeaders).text
-        }.getOrNull()
-        val hits = runCatching {
-            JSONObject(json ?: "").optJSONArray("hits")
-        }.getOrNull()
+        // Torrent search needs the FULL correct title: a misspelled
+        // slug title returns zero hits (verified on Baahubali).
+        // Retry chain: given title -> IMDb fuzzy title -> cleaned
+        // title (punctuation stripped). First non-empty hit list wins.
+        val attempts = mutableListOf<String>()
+        if (title.isNotBlank()) attempts += title
+        if (title.isNotBlank()) {
+            runCatching {
+                resolveImdbTitle(title, year.toIntOrNull())?.let {
+                    if (!attempts.contains(it)) attempts += it
+                }
+            }
+        }
+        val cleaned = title.replace(Regex("""[^A-Za-z0-9 ]"""), " ")
+            .replace(Regex("""\s+"""), " ").trim()
+        if (cleaned.isNotBlank() && !attempts.contains(cleaned)) attempts += cleaned
+        val apiBase = if (movieUrl.endsWith("/")) movieUrl else "$movieUrl/"
+        var hits: org.json.JSONArray? = null
+        for (name in attempts) {
+            val apiUrl = apiBase + "?api=torrents&mode=movie" +
+                "&name=" + java.net.URLEncoder.encode(name, "UTF-8") +
+                "&year=" + java.net.URLEncoder.encode(year, "UTF-8") +
+                "&quality=all"
+            val json = runCatching {
+                app.get(apiUrl, headers = browserHeaders).text
+            }.getOrNull()
+            val arr = runCatching {
+                JSONObject(json ?: "").optJSONArray("hits")
+            }.getOrNull()
+            if (arr != null && arr.length() > 0) {
+                hits = arr
+                break
+            }
+        }
         if (hits == null || hits.length() == 0) {
             emitDebug(listOf("Merged·Yts", "no-hits"), callback)
             return true
         }
+        val hitsArr = hits
         data class Tor(val magnet: String, val seeds: Int, val label: String, val q: Int)
         val tors = mutableListOf<Tor>()
-        for (i in 0 until hits.length()) {
-            val o = hits.optJSONObject(i) ?: continue
+        for (i in 0 until hitsArr.length()) {
+            val o = hitsArr.optJSONObject(i) ?: continue
             val magnet = o.optString("magnetUrl")
             if (!magnet.startsWith("magnet:")) continue
             val t = o.optString("title")

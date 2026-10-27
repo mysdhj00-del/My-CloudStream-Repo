@@ -208,6 +208,27 @@ class MergedProvider : MainAPI() {
         return Regex("""(19|20)\d\d""").find(title)?.value ?: ""
     }
 
+    /** Slug "avatar-fire-and-ash-2025" -> ("Avatar Fire And Ash", "2025"). */
+    private fun slugTitleYear(url: String): Pair<String, String> {
+        val slug = url.trimEnd('/').substringAfterLast('/').substringBefore('?')
+        val year = Regex("""(19|20)\d\d$""").find(slug)?.value ?: ""
+        val words = if (year.isNotBlank()) slug.removeSuffix("-$year") else slug
+        val title = words.split("-").filter { it.isNotBlank() }.joinToString(" ") {
+            it.replaceFirstChar { c -> c.uppercase() }
+        }
+        return Pair(title, year)
+    }
+
+    /** Every .episode-item carries its season + episode numbers. */
+    private fun parseCinebyEpisodes(doc: Document): List<Triple<Int, Int, String?>> {
+        return doc.select(".episode-item[data-season][data-episode]").mapNotNull { el ->
+            val s = el.attr("data-season").toIntOrNull() ?: return@mapNotNull null
+            val e = el.attr("data-episode").toIntOrNull() ?: return@mapNotNull null
+            val epTitle = el.selectFirst(".episode-title")?.text()?.trim()
+            Triple(s, e, epTitle)
+        }.sortedWith(compareBy({ it.first }, { it.second }))
+    }
+
     private suspend fun loadCinebyMovie(url: String): LoadResponse? {
         val doc = runCatching {
             app.get(url, headers = browserHeaders).document
@@ -231,13 +252,7 @@ class MergedProvider : MainAPI() {
         val poster = doc.selectFirst("meta[property=og:image]")?.attr("content")
         // ONE ordered list: every .episode-item carries its season
         // + episode numbers, even though the site shows per-season tabs.
-        val items = doc.select(".episode-item[data-season][data-episode]")
-        val parsed = items.mapNotNull { el ->
-            val s = el.attr("data-season").toIntOrNull() ?: return@mapNotNull null
-            val e = el.attr("data-episode").toIntOrNull() ?: return@mapNotNull null
-            val epTitle = el.selectFirst(".episode-title")?.text()?.trim()
-            Triple(s, e, epTitle)
-        }.sortedWith(compareBy({ it.first }, { it.second }))
+        val parsed = parseCinebyEpisodes(doc)
         val base = url.trimEnd('/')
         val year = parseYear(title)
         val eps = parsed.map { (s, e, epTitle) ->
@@ -259,14 +274,64 @@ class MergedProvider : MainAPI() {
     }
 
     private suspend fun loadYtsMovie(url: String): LoadResponse? {
+        // YTS movie pages are a JS shell: NO og:title / og:image in
+        // the HTML (verified 2026-10-27) — the real data comes from
+        // the site's own ?api=search (TMDB-backed). So: slug-derived
+        // title/year always, og meta when present, TMDB poster/plot
+        // via the search API, and NEVER null when the slug parses.
+        val (slugTitle, slugYear) = slugTitleYear(url)
         val doc = runCatching {
             app.get(url, headers = browserHeaders).document
-        }.getOrNull() ?: return null
-        val title = doc.selectFirst("meta[property=og:title]")?.attr("content")
-            ?.trim().orEmpty().ifBlank { return null }
-        val poster = doc.selectFirst("meta[property=og:image]")?.attr("content")
-        val plot = doc.selectFirst("meta[property=og:description]")?.attr("content")
-        return newMovieLoadResponse(title, url, TvType.Movie, subData("yt", url, title, parseYear(title))) {
+        }.getOrNull()
+        var title = doc?.selectFirst("meta[property=og:title]")?.attr("content")
+            ?.trim().orEmpty()
+        var poster = doc?.selectFirst("meta[property=og:image]")?.attr("content")
+        var plot = doc?.selectFirst("meta[property=og:description]")?.attr("content")
+        if (title.isBlank()) title = slugTitle
+        val year = parseYear(title).ifBlank { slugYear }
+        if (poster.isNullOrBlank() || plot.isNullOrBlank()) {
+            runCatching {
+                val apiBase = if (url.endsWith("/")) url else "$url/"
+                val q = java.net.URLEncoder.encode(slugTitle, "UTF-8")
+                val json = app.get(
+                    apiBase + "?api=search&mode=movie&q=$q&page=1",
+                    headers = browserHeaders
+                ).text
+                val arr = JSONObject(json).optJSONArray("results")
+                if (arr != null) {
+                    var pick: JSONObject? = null
+                    for (i in 0 until arr.length()) {
+                        val o = arr.optJSONObject(i) ?: continue
+                        if (year.isNotBlank() &&
+                            o.optString("release_date").startsWith(year)
+                        ) {
+                            pick = o
+                            break
+                        }
+                        if (pick == null) pick = o
+                    }
+                    pick?.let { o ->
+                        if (poster.isNullOrBlank()) {
+                            o.optString("poster_path").takeIf { it.isNotBlank() }?.let {
+                                poster = "https://image.tmdb.org/t/p/w780$it"
+                            }
+                        }
+                        if (plot.isNullOrBlank()) {
+                            o.optString("overview").takeIf { it.isNotBlank() }?.let {
+                                plot = it
+                            }
+                        }
+                        if (title == slugTitle) {
+                            o.optString("title").takeIf { it.isNotBlank() }?.let {
+                                title = it
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if (title.isBlank()) return null
+        return newMovieLoadResponse(title, url, TvType.Movie, subData("yt", url, title, year)) {
             if (!poster.isNullOrBlank()) this.posterUrl = poster
             if (!plot.isNullOrBlank()) this.plot = plot
         }
@@ -416,19 +481,60 @@ class MergedProvider : MainAPI() {
     ): Boolean {
         val t0 = System.currentTimeMillis()
         fun elapsed() = System.currentTimeMillis() - t0
-        val parts = data.split("|||")
-        val lane = parts.getOrNull(0) ?: ""
-        val realUrl = parts.getOrNull(1) ?: data
-        val title = parts.getOrNull(2)?.let {
-            runCatching { java.net.URLDecoder.decode(it, "UTF-8") }.getOrDefault("")
-        }.orEmpty()
-        val year = parts.getOrNull(3) ?: ""
-        if (title.isNotBlank()) {
-            emitSubs(title, year, subtitleCallback)
+        // Normal path: our "lane|||url|||title|||year" data. The app
+        // may hand it back URI-encoded (v1 "unknown-lane" report), so
+        // try the raw split first, then a URL-decoded split.
+        var parts = data.split("|||")
+        if (parts.size < 2) {
+            val decoded = runCatching {
+                java.net.URLDecoder.decode(data, "UTF-8")
+            }.getOrNull()
+            if (decoded != null) parts = decoded.split("|||")
         }
-        return when (lane) {
-            "cb" -> loadLinksCineby(realUrl, subtitleCallback, callback, ::elapsed)
-            "yt" -> loadLinksYts(realUrl, title, year, subtitleCallback, callback, ::elapsed)
+        if (parts.size >= 2) {
+            val lane = parts.getOrNull(0) ?: ""
+            val realUrl = parts.getOrNull(1) ?: data
+            val title = parts.getOrNull(2)?.let {
+                runCatching { java.net.URLDecoder.decode(it, "UTF-8") }.getOrDefault("")
+            }.orEmpty()
+            val year = parts.getOrNull(3) ?: ""
+            if (title.isNotBlank()) {
+                emitSubs(title, year, subtitleCallback)
+            }
+            return when (lane) {
+                "cb" -> loadLinksCineby(realUrl, subtitleCallback, callback, ::elapsed)
+                "yt" -> loadLinksYts(realUrl, title, year, subtitleCallback, callback, ::elapsed)
+                else -> {
+                    emitDebug(listOf("Merged", "unknown-lane"), callback)
+                    true
+                }
+            }
+        }
+        // Fallback: a plain URL arrived instead of our data string.
+        // Route by URL shape so playback still works.
+        return when {
+            data.contains("cineby.ws") && data.contains("/episode/") ->
+                loadLinksCineby(data, subtitleCallback, callback, ::elapsed)
+            data.contains("yts.lu/movies/") -> {
+                val (t, y) = slugTitleYear(data)
+                if (t.isNotBlank()) emitSubs(t, y, subtitleCallback)
+                loadLinksYts(data, t, y, subtitleCallback, callback, ::elapsed)
+            }
+            data.contains("cineby.ws/tv/") -> {
+                // Series page passed: play its first episode.
+                val first = runCatching {
+                    val doc = app.get(data, headers = browserHeaders).document
+                    parseCinebyEpisodes(doc).firstOrNull()
+                }.getOrNull()
+                if (first != null) {
+                    val epUrl = data.trimEnd('/') +
+                        "/episode/${first.first}/${first.second}"
+                    loadLinksCineby(epUrl, subtitleCallback, callback, ::elapsed)
+                } else {
+                    emitDebug(listOf("Merged", "no-episodes"), callback)
+                    true
+                }
+            }
             else -> {
                 emitDebug(listOf("Merged", "unknown-lane"), callback)
                 true

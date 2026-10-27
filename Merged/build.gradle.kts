@@ -1,12 +1,12 @@
 // Merged CloudStream plugin module.
-version = 5
+version = 6
 
 android {
     namespace = "com.merged"
 }
 
 cloudstream {
-    description = "Merged (مدمج) - Movies + anime from foreign sites, apps and torrent sites, with automatic subtitles (English / Arabic / both)"
+    description = "Merged (مدمج) - Movies + anime from foreign sites, direct streams, with automatic subtitles (English / Arabic / both)"
     authors = listOf("Saher")
 
     /**

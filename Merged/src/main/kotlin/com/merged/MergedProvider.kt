@@ -207,9 +207,9 @@ class MergedProvider : MainAPI() {
         }
     }
 
-    private fun subData(lane: String, realUrl: String, title: String, year: String): String {
+    private fun subData(lane: String, realUrl: String, title: String, year: String, extra: String = ""): String {
         val enc = java.net.URLEncoder.encode(title, "UTF-8")
-        return lane + "|||" + realUrl + "|||" + enc + "|||" + year
+        return lane + "|||" + realUrl + "|||" + enc + "|||" + year + "|||" + extra
     }
 
     private fun parseYear(title: String): String {
@@ -297,6 +297,7 @@ class MergedProvider : MainAPI() {
         var plot = doc?.selectFirst("meta[property=og:description]")?.attr("content")
         if (title.isBlank()) title = slugTitle
         val year = parseYear(title).ifBlank { slugYear }
+        var tmdbId = ""
         if (poster.isNullOrBlank() || plot.isNullOrBlank() || title == slugTitle) {
             runCatching {
                 val apiBase = if (url.endsWith("/")) url else "$url/"
@@ -319,6 +320,9 @@ class MergedProvider : MainAPI() {
                         if (pick == null) pick = o
                     }
                     pick?.let { o ->
+                        o.optString("id").takeIf { it.isNotBlank() }?.let {
+                            tmdbId = it
+                        }
                         if (poster.isNullOrBlank()) {
                             o.optString("poster_path").takeIf { it.isNotBlank() }?.let {
                                 poster = "https://image.tmdb.org/t/p/w780$it"
@@ -348,7 +352,7 @@ class MergedProvider : MainAPI() {
             }
         }
         if (title.isBlank()) return null
-        return newMovieLoadResponse(title, url, TvType.Movie, subData("yt", url, title, year)) {
+        return newMovieLoadResponse(title, url, TvType.Movie, subData("yt", url, title, year, tmdbId)) {
             if (!poster.isNullOrBlank()) this.posterUrl = poster
             if (!plot.isNullOrBlank()) this.plot = plot
         }
@@ -543,12 +547,13 @@ class MergedProvider : MainAPI() {
                 runCatching { java.net.URLDecoder.decode(it, "UTF-8") }.getOrDefault("")
             }.orEmpty()
             val year = parts.getOrNull(3) ?: ""
+            val extra = parts.getOrNull(4) ?: ""
             if (title.isNotBlank()) {
                 emitSubs(title, year, subtitleCallback)
             }
             return when (lane) {
                 "cb" -> loadLinksCineby(realUrl, subtitleCallback, callback, ::elapsed)
-                "yt" -> loadLinksYts(realUrl, title, year, subtitleCallback, callback, ::elapsed)
+                "yt" -> loadLinksYts(realUrl, title, year, extra, subtitleCallback, callback, ::elapsed)
                 else -> {
                     emitDebug(listOf("Merged", "unknown-lane"), callback)
                     true
@@ -563,7 +568,7 @@ class MergedProvider : MainAPI() {
             data.contains("yts.lu/movies/") -> {
                 val (t, y) = slugTitleYear(data)
                 if (t.isNotBlank()) emitSubs(t, y, subtitleCallback)
-                loadLinksYts(data, t, y, subtitleCallback, callback, ::elapsed)
+                loadLinksYts(data, t, y, "", subtitleCallback, callback, ::elapsed)
             }
             data.contains("cineby.ws/tv/") -> {
                 // Series page passed: play its first episode.
@@ -688,10 +693,24 @@ class MergedProvider : MainAPI() {
         movieUrl: String,
         title: String,
         year: String,
+        tmdbId: String,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit,
         elapsed: () -> Long
     ): Boolean {
+        // Stream FIRST (no torrent engine needed): the YTS site's
+        // own player is vidsrc.mov/embed/movie/{tmdbId} (verified
+        // in the page JS 2026-10-27). Magnets stay below it.
+        var streamEmitted = 0
+        if (tmdbId.isNotBlank()) {
+            runCatching {
+                loadExtractor(
+                    "https://vidsrc.mov/embed/movie/$tmdbId",
+                    movieUrl,
+                    subtitleCallback
+                ) { streamEmitted++; callback(it) }
+            }
+        }
         // Torrent search needs the FULL correct title: a misspelled
         // slug title returns zero hits (verified on Baahubali).
         // Retry chain: given title -> IMDb fuzzy title -> cleaned
@@ -755,7 +774,7 @@ class MergedProvider : MainAPI() {
                 t.contains("480p") -> "480p"
                 else -> ""
             }
-            val label = listOf(qLabel, sizeGb, "$seeds seeds").filter { it.isNotBlank() }
+            val label = listOf("$seeds seeds", qLabel, sizeGb).filter { it.isNotBlank() }
                 .joinToString(" · ")
             tors += Tor(magnet, seeds, label, q)
         }

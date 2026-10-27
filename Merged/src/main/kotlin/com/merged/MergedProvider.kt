@@ -53,10 +53,17 @@ import org.jsoup.nodes.Document
  *   Any subtitle failure falls back to the available language
  *   (or nothing) — playback is never blocked.
  *
- * NOT in v1 (chains still unverified, added as they verify):
- *   9anime episode ajax, miruro player chain, OscarTV-web
- *   routes, NetMirror-web, EZTV/Lime/TPB/ext torrent lanes,
- *   dubbed-anime row, pagination (v1 rows are page 1 only).
+ * v5 adds 9anime (direct mp4 chain, verified live 2026-10-27)
+ * and EZTV (search -> episode page -> magnet), and hardens
+ * the YTS stream (all vidsrc domains + relay fallback) after
+ * the v4 on-device report (stream link never appeared —
+ * vidsrc.mov extractor coverage unverified).
+ * NOT in v5 yet: miruro player chunk (lazy-loaded, unmapped),
+ * OscarTV content API (only /reviews-api.php found),
+ * NetMirror-web (Cloudflare-walled from sandbox AND Render),
+ * Lime/TPB/ext.to (torrent lanes; playback still needs a
+ * working torrent engine on the device), dubbed-anime row,
+ * pagination (rows are page 1 only).
  */
 class MergedProvider : MainAPI() {
     override var mainUrl = "https://cineby.ws"
@@ -81,6 +88,7 @@ class MergedProvider : MainAPI() {
         "cb:https://cineby.ws/movies" to "أفلام — Cineby",
         "cb:https://cineby.ws/tv" to "مسلسلات — Cineby",
         "yt:https://www13.yts.lu/" to "أفلام — YTS",
+        "an:https://9anime.or.at/" to "أنمي — 9anime",
     )
 
     // ---------- main page ----------
@@ -97,6 +105,7 @@ class MergedProvider : MainAPI() {
             "cb" -> if (base == "https://cineby.ws/") cinebyHotCards(doc)
                 else cinebyGridCards(doc)
             "yt" -> ytsHomeCards(doc)
+            "an" -> anime9Cards(doc)
             else -> emptyList()
         }
         return newHomePageResponse(
@@ -184,6 +193,22 @@ class MergedProvider : MainAPI() {
             ).document
             out += ytsHomeCards(doc).take(12)
         }
+        runCatching {
+            val doc = app.get(
+                "https://9anime.or.at/?s=$q", headers = browserHeaders
+            ).document
+            out += anime9Cards(doc).take(12)
+        }
+        runCatching {
+            val slug = query.trim().lowercase()
+                .replace(Regex("[^a-z0-9]+"), "-").trim('-')
+            if (slug.isNotBlank()) {
+                val doc = app.get(
+                    "https://eztv1.xyz/search/$slug", headers = browserHeaders
+                ).document
+                out += eztvSearchCards(doc).take(12)
+            }
+        }
         return out
     }
 
@@ -203,6 +228,8 @@ class MergedProvider : MainAPI() {
             url.contains("cineby.ws/tv/") -> loadCinebySeries(url)
             url.contains("cineby.ws/movie/") -> loadCinebyMovie(url)
             url.contains("yts.lu/movies/") -> loadYtsMovie(url)
+            url.contains("9anime.or.at/anime/") -> loadAnime9(url)
+            url.contains("eztv1.xyz/ep/") -> loadEztvEp(url)
             else -> null
         }
     }
@@ -356,6 +383,235 @@ class MergedProvider : MainAPI() {
             if (!poster.isNullOrBlank()) this.posterUrl = poster
             if (!plot.isNullOrBlank()) this.plot = plot
         }
+    }
+
+
+    // ---------- 9anime (v5) ----------
+
+    private fun anime9Cards(doc: Document): List<SearchResponse> {
+        val out = mutableListOf<SearchResponse>()
+        val seen = HashSet<String>()
+        for (item in doc.select(".film_list-grid .flw-item")) {
+            val a = item.selectFirst(".film-name a")
+                ?: item.selectFirst("a.film-poster-ahref") ?: continue
+            val href = a.attr("href")
+            if (href.isBlank() || !seen.add(href)) continue
+            val title = item.selectFirst(".film-name")?.text()?.trim()
+                ?.ifBlank { a.attr("title").trim() }?.ifBlank { a.text().trim() }
+                ?: continue
+            if (title.isBlank()) continue
+            val img = item.selectFirst("img")
+            val poster = img?.attr("data-src")?.ifBlank { img.attr("src") }
+            val r = newTvSeriesSearchResponse(title, href, TvType.TvSeries)
+            if (!poster.isNullOrBlank()) r.posterUrl = poster
+            out += r
+        }
+        return out
+    }
+
+    private suspend fun loadAnime9(url: String): LoadResponse? {
+        // Anime page -> .block_area-episodes[data-series] sid ->
+        // GET /wp-json/9animetv/v1/episodes/{sid}?active=0 ->
+        // JSON {status, total, pages} with .ep-item links.
+        // Verified live 2026-10-27 (sid 3508 -> 4 episodes).
+        val doc = runCatching {
+            app.get(url, headers = browserHeaders).document
+        }.getOrNull() ?: return null
+        val title = doc.selectFirst("meta[property=og:title]")?.attr("content")
+            ?.trim().orEmpty().ifBlank { doc.selectFirst("h1")?.text()?.trim().orEmpty() }
+        if (title.isBlank()) return null
+        val poster = doc.selectFirst("meta[property=og:image]")?.attr("content")
+        val sid = doc.selectFirst(".block_area-episodes")?.attr("data-series")
+            ?.trim().orEmpty()
+        if (sid.isBlank()) return null
+        val json = runCatching {
+            app.get(
+                "https://9anime.or.at/wp-json/9animetv/v1/episodes/$sid?active=0",
+                headers = browserHeaders
+            ).text
+        }.getOrNull() ?: return null
+        val pages = runCatching { JSONObject(json).optString("pages") }
+            .getOrNull().orEmpty()
+        if (pages.isBlank()) return null
+        val epDoc = Jsoup.parse(pages)
+        val seen = HashSet<Int>()
+        val eps = epDoc.select("a[href*=-episode-]").mapNotNull { a ->
+            val href = a.attr("href")
+            val n = Regex("""-episode-(\d+)-""").find(href)
+                ?.groupValues?.get(1)?.toIntOrNull() ?: return@mapNotNull null
+            if (!seen.add(n)) return@mapNotNull null
+            Pair(n, href)
+        }.sortedBy { it.first }.map { (n, href) ->
+            newEpisode(subData("an", href, title, "")) {
+                this.name = "الحلقة $n"
+                this.season = 1
+                this.episode = n
+                if (!poster.isNullOrBlank()) this.posterUrl = poster
+            }
+        }
+        if (eps.isEmpty()) return null
+        return newTvSeriesLoadResponse(title, url, TvType.TvSeries, eps) {
+            if (!poster.isNullOrBlank()) {
+                this.posterUrl = poster
+                this.backgroundPosterUrl = poster
+            }
+        }
+    }
+
+    /** Pure-Kotlin base64 decode (no android/java base64 dependency,
+     * so the local stub build and the real Gradle build agree). */
+    private fun decodeBase64(input: String): String? {
+        return runCatching {
+            val table = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+            val clean = input.filter { it in table || it == '=' }
+            val out = mutableListOf<Byte>()
+            var i = 0
+            while (i + 4 <= clean.length) {
+                val c0 = table.indexOf(clean[i])
+                val c1 = table.indexOf(clean[i + 1])
+                if (c0 < 0 || c1 < 0) break
+                val c2 = if (clean[i + 2] == '=') -1 else table.indexOf(clean[i + 2])
+                val c3 = if (clean[i + 3] == '=') -1 else table.indexOf(clean[i + 3])
+                out += ((c0 shl 2) or (c1 shr 4)).toByte()
+                if (c2 >= 0) out += (((c1 and 15) shl 4) or (c2 shr 2)).toByte()
+                if (c3 >= 0) out += (((c2 and 3) shl 6) or c3).toByte()
+                i += 4
+            }
+            String(out.toByteArray(), Charsets.UTF_8)
+        }.getOrNull()
+    }
+
+    private suspend fun loadLinksAnime9(
+        epUrl: String,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit,
+        elapsed: () -> Long
+    ): Boolean {
+        // Episode page inline tsEp {episodeId} ->
+        // GET /ajax/episode/servers/?id={epId} (Referer = episode
+        // page) -> {status, html} with .server-item[data-embed]
+        // (base64 play URL) -> /play/{hash} page carries a DIRECT
+        // mp4 at /stream/{hash}. No extractor, no torrent engine.
+        // Verified live 2026-10-27 (ep 3534 -> my.1anime.site).
+        val page = runCatching {
+            app.get(epUrl, headers = browserHeaders).text
+        }.getOrNull()
+        val epId = page?.let {
+            Regex("""episodeId\s*:\s*(\d+)""").find(it)?.groupValues?.get(1)
+        }.orEmpty()
+        if (epId.isBlank()) {
+            emitDebug(listOf("Merged·An", "no-epid"), callback)
+            return true
+        }
+        val json = runCatching {
+            app.get(
+                "https://9anime.or.at/ajax/episode/servers/?id=$epId",
+                headers = browserHeaders + mapOf("Referer" to epUrl)
+            ).text
+        }.getOrNull()
+        val html = runCatching { JSONObject(json ?: "").optString("html") }
+            .getOrNull().orEmpty()
+        var srv = 0
+        var emitted = 0
+        if (html.isNotBlank()) {
+            val sDoc = Jsoup.parse(html)
+            for (item in sDoc.select(".server-item[data-embed]")) {
+                val emb64 = item.attr("data-embed")
+                if (emb64.isBlank()) continue
+                srv++
+                val play = decodeBase64(emb64) ?: continue
+                if (!play.contains("/play/")) continue
+                val stream = play.replace("/play/", "/stream/")
+                val typ = item.attr("data-type").ifBlank { "sub" }.uppercase()
+                callback(
+                    newExtractorLink("9anime", "$typ · Direct", stream, ExtractorLinkType.VIDEO) {
+                        this.referer = play
+                        this.quality = Qualities.Unknown.value
+                    }
+                )
+                emitted++
+            }
+        }
+        if (emitted == 0) {
+            emitDebug(
+                listOf("Merged·An", "srv=$srv", "t=${elapsed() / 1000}s"),
+                callback
+            )
+        }
+        return true
+    }
+
+    // ---------- EZTV (v5, search-only lane) ----------
+
+    private fun eztvSearchCards(doc: Document): List<SearchResponse> {
+        val out = mutableListOf<SearchResponse>()
+        val seen = HashSet<String>()
+        for (a in doc.select("a[href*=/ep/]")) {
+            val href = a.attr("href")
+            if (href.isBlank() || !seen.add(href)) continue
+            var title = a.text().trim()
+            if (title.isBlank()) {
+                title = href.trimEnd('/').substringAfterLast('/')
+                    .substringBefore('?').replace("-", " ")
+                    .replaceFirstChar { it.uppercase() }
+            }
+            val full = when {
+                href.startsWith("http") -> href
+                href.startsWith("/") -> "https://eztv1.xyz$href"
+                else -> "https://eztv1.xyz/$href"
+            }
+            out += newMovieSearchResponse(title, full, TvType.Movie)
+        }
+        return out
+    }
+
+    private suspend fun loadEztvEp(url: String): LoadResponse? {
+        val page = runCatching {
+            app.get(url, headers = browserHeaders).text
+        }.getOrNull() ?: return null
+        val norm = page.replace("&amp;", "&")
+        val magnet = Regex("""magnet:\?xt=urn:btih:[^\s"'<>]+""")
+            .find(norm)?.value ?: return null
+        val dn = Regex("""dn=([^&]+)""").find(magnet)?.groupValues?.get(1)
+            ?.let { runCatching { java.net.URLDecoder.decode(it, "UTF-8") }.getOrDefault("") }
+            .orEmpty()
+        val title = dn.ifBlank {
+            url.trimEnd('/').substringAfterLast('/').substringBefore('?')
+                .replace("-", " ").replaceFirstChar { it.uppercase() }
+        }
+        return newMovieLoadResponse(title, url, TvType.Movie, subData("ez", url, title, ""))
+    }
+
+    private suspend fun loadLinksEztv(
+        epUrl: String,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit,
+        elapsed: () -> Long
+    ): Boolean {
+        // Episode page (with ?d=) carries exactly one magnet.
+        // Verified live 2026-10-27 on 3 episode ids (one stale
+        // id 404s — search results can go stale on this mirror).
+        // NOTE: magnet playback still needs a working torrent
+        // engine on the device (same caveat as YTS torrents).
+        val page = runCatching {
+            app.get(epUrl, headers = browserHeaders).text
+        }.getOrNull()
+        val magnet = page?.replace("&amp;", "&")?.let {
+            Regex("""magnet:\?xt=urn:btih:[^\s"'<>]+""").find(it)?.value
+        }.orEmpty()
+        if (magnet.isBlank()) {
+            emitDebug(listOf("Merged·Ez", "no-magnet"), callback)
+            return true
+        }
+        val dn = Regex("""dn=([^&]+)""").find(magnet)?.groupValues?.get(1)
+            ?.let { runCatching { java.net.URLDecoder.decode(it, "UTF-8") }.getOrDefault("") }
+            .orEmpty()
+        callback(
+            newExtractorLink("EZTV", dn.ifBlank { "Torrent" }, magnet, ExtractorLinkType.VIDEO) {
+                this.quality = Qualities.Unknown.value
+            }
+        )
+        return true
     }
 
     // ---------- subtitles (automatic, gear-controlled) ----------
@@ -554,6 +810,8 @@ class MergedProvider : MainAPI() {
             return when (lane) {
                 "cb" -> loadLinksCineby(realUrl, subtitleCallback, callback, ::elapsed)
                 "yt" -> loadLinksYts(realUrl, title, year, extra, subtitleCallback, callback, ::elapsed)
+                "an" -> loadLinksAnime9(realUrl, subtitleCallback, callback, ::elapsed)
+                "ez" -> loadLinksEztv(realUrl, subtitleCallback, callback, ::elapsed)
                 else -> {
                     emitDebug(listOf("Merged", "unknown-lane"), callback)
                     true
@@ -570,6 +828,10 @@ class MergedProvider : MainAPI() {
                 if (t.isNotBlank()) emitSubs(t, y, subtitleCallback)
                 loadLinksYts(data, t, y, "", subtitleCallback, callback, ::elapsed)
             }
+            data.contains("9anime.or.at") && data.contains("-episode-") ->
+                loadLinksAnime9(data, subtitleCallback, callback, ::elapsed)
+            data.contains("eztv1.xyz/ep/") ->
+                loadLinksEztv(data, subtitleCallback, callback, ::elapsed)
             data.contains("cineby.ws/tv/") -> {
                 // Series page passed: play its first episode.
                 val first = runCatching {
@@ -699,16 +961,46 @@ class MergedProvider : MainAPI() {
         elapsed: () -> Long
     ): Boolean {
         // Stream FIRST (no torrent engine needed): the YTS site's
-        // own player is vidsrc.mov/embed/movie/{tmdbId} (verified
-        // in the page JS 2026-10-27). Magnets stay below it.
+        // own player is vidsrc*/embed/movie/{tmdbId} (verified
+        // in the page JS 2026-10-27). v4 used vidsrc.mov only and
+        // the stream link never appeared on-device (extractor
+        // coverage for .mov unverified) — so v5 tries every
+        // vidsrc domain the family uses, then the relay.
+        // Magnets stay below the stream.
         var streamEmitted = 0
         if (tmdbId.isNotBlank()) {
-            runCatching {
-                loadExtractor(
-                    "https://vidsrc.mov/embed/movie/$tmdbId",
-                    movieUrl,
-                    subtitleCallback
-                ) { streamEmitted++; callback(it) }
+            for (domain in listOf("vidsrc.to", "vidsrc.xyz", "vidsrc.mov")) {
+                if (streamEmitted > 0) break
+                runCatching {
+                    loadExtractor(
+                        "https://$domain/embed/movie/$tmdbId",
+                        movieUrl,
+                        subtitleCallback
+                    ) { streamEmitted++; callback(it) }
+                }
+            }
+            if (streamEmitted == 0 && elapsed() < 15000) {
+                runCatching {
+                    val r = app.get(
+                        "$relayBase/relay/resolve?url=" +
+                            java.net.URLEncoder.encode(
+                                "https://vidsrc.mov/embed/movie/$tmdbId", "UTF-8"
+                            ) +
+                            "&ref=" + java.net.URLEncoder.encode(movieUrl, "UTF-8")
+                    ).text
+                    val direct = JSONObject(r).optJSONArray("direct")
+                    if (direct != null && direct.length() > 0) {
+                        val d = direct.optString(0)
+                        if (d.isNotBlank()) {
+                            streamEmitted++
+                            callback(
+                                newExtractorLink("Merged", "Relay", d, ExtractorLinkType.VIDEO) {
+                                    this.quality = Qualities.Unknown.value
+                                }
+                            )
+                        }
+                    }
+                }
             }
         }
         // Torrent search needs the FULL correct title: a misspelled

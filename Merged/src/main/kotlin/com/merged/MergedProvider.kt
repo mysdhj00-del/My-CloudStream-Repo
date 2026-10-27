@@ -26,8 +26,8 @@ import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 
 /**
- * Merged (مدمج) — movies + anime from foreign sites, apps and
- * torrent sites, v1 lanes = the two chains verified live 2026-10-27:
+ * Merged (مدمج) v6 — DIRECT STREAMING ONLY, no torrents.
+ * Lanes (both chains verified live 2026-10-27):
  *
  * - CINEBY (cineby.ws): /tv/{slug}/episode/{s}/{e} (XHR headers)
  *   returns JSON {success, playerSources[{name, url}]} on
@@ -37,11 +37,12 @@ import org.jsoup.nodes.Document
  *   shows them per-season tabs. Movies at /movie/{slug}.
  *   Search: GET /search?q=. Lists: /movies, /tv (content-card).
  *   Home "Hot Right Now" = ranked text cards (no posters).
- * - YTS (yts.lu): homepage + /?query= are server-rendered
- *   movie cards (/movies/{slug}/). Movie page torrents API:
- *   ?api=torrents&mode=movie&name={title}&year={yr}&quality=all
- *   returns {hits[{title, seeds, peers, bytes, magnetUrl, hash}]}.
- *   Torrent servers are ranked by SEEDS (fast + live first).
+ * - 9ANIME (9anime.or.at): WordPress grid .flw-item; anime page
+ *   .block_area-episodes[data-series] -> episodes API ->
+ *   episode page tsEp {episodeId} -> servers API (Referer =
+ *   episode page) -> .server-item[data-embed] base64 play URL
+ *   -> /stream/{hash} DIRECT mp4. No extractor, no torrent
+ *   engine. SUB/DUB distinguished by data-type.
  *
  * Subtitles (settings gear, MergedSubs): automatic, fail-soft.
  *   English = IMDb suggest -> OpenSubtitles v3 -> sync-first
@@ -53,16 +54,13 @@ import org.jsoup.nodes.Document
  *   Any subtitle failure falls back to the available language
  *   (or nothing) — playback is never blocked.
  *
- * v5 adds 9anime (direct mp4 chain, verified live 2026-10-27)
- * and EZTV (search -> episode page -> magnet), and hardens
- * the YTS stream (all vidsrc domains + relay fallback) after
- * the v4 on-device report (stream link never appeared —
- * vidsrc.mov extractor coverage unverified).
- * NOT in v5 yet: miruro player chunk (lazy-loaded, unmapped),
- * OscarTV content API (only /reviews-api.php found),
- * NetMirror-web (Cloudflare-walled from sandbox AND Render),
- * Lime/TPB/ext.to (torrent lanes; playback still needs a
- * working torrent engine on the device), dubbed-anime row,
+ * v6 REMOVES the YTS + EZTV torrent lanes entirely (user order
+ * 2026-10-27: sites 1/9/10 only, direct site streams, no
+ * torrents — his phone's torrent engine does not connect).
+ * NOT in v6 yet: miruro (player = strm.cx session handshake;
+ * session stream source not found in any of 70+ site JS
+ * chunks — needs a network-level capture), OscarTV content
+ * API, NetMirror-web (Cloudflare-walled), dubbed-anime row,
  * pagination (rows are page 1 only).
  */
 class MergedProvider : MainAPI() {
@@ -87,8 +85,7 @@ class MergedProvider : MainAPI() {
         "cb:https://cineby.ws/" to "الأكثر مشاهدة — Cineby",
         "cb:https://cineby.ws/movies" to "أفلام — Cineby",
         "cb:https://cineby.ws/tv" to "مسلسلات — Cineby",
-        "yt:https://www13.yts.lu/" to "أفلام — YTS",
-        "an:https://9anime.or.at/" to "أنمي — 9anime",
+                "an:https://9anime.or.at/" to "أنمي — 9anime",
     )
 
     // ---------- main page ----------
@@ -104,8 +101,7 @@ class MergedProvider : MainAPI() {
         val cards = when (lane) {
             "cb" -> if (base == "https://cineby.ws/") cinebyHotCards(doc)
                 else cinebyGridCards(doc)
-            "yt" -> ytsHomeCards(doc)
-            "an" -> anime9Cards(doc)
+                        "an" -> anime9Cards(doc)
             else -> emptyList()
         }
         return newHomePageResponse(
@@ -151,30 +147,6 @@ class MergedProvider : MainAPI() {
         return out
     }
 
-    private fun ytsHomeCards(doc: Document): List<SearchResponse> {
-        val out = mutableListOf<SearchResponse>()
-        val seen = HashSet<String>()
-        // Title links carry the correct spelling ("Avatar: Fire and
-        // Ash"); the wrap link only has an img whose alt appends
-        // " download" (and sometimes a misspelled slug form).
-        for (a in doc.select("a[href*=/movies/]")) {
-            val href = a.attr("href")
-            if (href.isBlank() || !seen.add(href)) continue
-            val img = a.selectFirst("img")
-            var title = if (a.hasClass("browse-movie-title")) {
-                a.text().trim()
-            } else {
-                img?.attr("alt")?.trim().orEmpty()
-            }.ifBlank { a.text().trim() }
-            title = title.removeSuffix(" download").trim()
-            title = title.replace(Regex("""\s*\(\d{4}\)\s*$"""), "").trim()
-            if (title.isBlank()) continue
-            val r = newMovieSearchResponse(title, href, TvType.Movie)
-            img?.attr("src")?.let { if (it.isNotBlank()) r.posterUrl = it }
-            out += r
-        }
-        return out
-    }
 
     // ---------- search ----------
 
@@ -189,25 +161,9 @@ class MergedProvider : MainAPI() {
         }
         runCatching {
             val doc = app.get(
-                "https://www13.yts.lu/?query=$q", headers = browserHeaders
-            ).document
-            out += ytsHomeCards(doc).take(12)
-        }
-        runCatching {
-            val doc = app.get(
                 "https://9anime.or.at/?s=$q", headers = browserHeaders
             ).document
             out += anime9Cards(doc).take(12)
-        }
-        runCatching {
-            val slug = query.trim().lowercase()
-                .replace(Regex("[^a-z0-9]+"), "-").trim('-')
-            if (slug.isNotBlank()) {
-                val doc = app.get(
-                    "https://eztv1.xyz/search/$slug", headers = browserHeaders
-                ).document
-                out += eztvSearchCards(doc).take(12)
-            }
         }
         return out
     }
@@ -227,10 +183,8 @@ class MergedProvider : MainAPI() {
         return when {
             url.contains("cineby.ws/tv/") -> loadCinebySeries(url)
             url.contains("cineby.ws/movie/") -> loadCinebyMovie(url)
-            url.contains("yts.lu/movies/") -> loadYtsMovie(url)
-            url.contains("9anime.or.at/anime/") -> loadAnime9(url)
-            url.contains("eztv1.xyz/ep/") -> loadEztvEp(url)
-            else -> null
+                        url.contains("9anime.or.at/anime/") -> loadAnime9(url)
+                        else -> null
         }
     }
 
@@ -243,16 +197,6 @@ class MergedProvider : MainAPI() {
         return Regex("""(19|20)\d\d""").find(title)?.value ?: ""
     }
 
-    /** Slug "avatar-fire-and-ash-2025" -> ("Avatar Fire And Ash", "2025"). */
-    private fun slugTitleYear(url: String): Pair<String, String> {
-        val slug = url.trimEnd('/').substringAfterLast('/').substringBefore('?')
-        val year = Regex("""(19|20)\d\d$""").find(slug)?.value ?: ""
-        val words = if (year.isNotBlank()) slug.removeSuffix("-$year") else slug
-        val title = words.split("-").filter { it.isNotBlank() }.joinToString(" ") {
-            it.replaceFirstChar { c -> c.uppercase() }
-        }
-        return Pair(title, year)
-    }
 
     /** Every .episode-item carries its season + episode numbers. */
     private fun parseCinebyEpisodes(doc: Document): List<Triple<Int, Int, String?>> {
@@ -308,82 +252,6 @@ class MergedProvider : MainAPI() {
         }
     }
 
-    private suspend fun loadYtsMovie(url: String): LoadResponse? {
-        // YTS movie pages are a JS shell: NO og:title / og:image in
-        // the HTML (verified 2026-10-27) — the real data comes from
-        // the site's own ?api=search (TMDB-backed). So: slug-derived
-        // title/year always, og meta when present, TMDB poster/plot
-        // via the search API, and NEVER null when the slug parses.
-        val (slugTitle, slugYear) = slugTitleYear(url)
-        val doc = runCatching {
-            app.get(url, headers = browserHeaders).document
-        }.getOrNull()
-        var title = doc?.selectFirst("meta[property=og:title]")?.attr("content")
-            ?.trim().orEmpty()
-        var poster = doc?.selectFirst("meta[property=og:image]")?.attr("content")
-        var plot = doc?.selectFirst("meta[property=og:description]")?.attr("content")
-        if (title.isBlank()) title = slugTitle
-        val year = parseYear(title).ifBlank { slugYear }
-        var tmdbId = ""
-        if (poster.isNullOrBlank() || plot.isNullOrBlank() || title == slugTitle) {
-            runCatching {
-                val apiBase = if (url.endsWith("/")) url else "$url/"
-                val q = java.net.URLEncoder.encode(slugTitle, "UTF-8")
-                val json = app.get(
-                    apiBase + "?api=search&mode=movie&q=$q&page=1",
-                    headers = browserHeaders
-                ).text
-                val arr = JSONObject(json).optJSONArray("results")
-                if (arr != null) {
-                    var pick: JSONObject? = null
-                    for (i in 0 until arr.length()) {
-                        val o = arr.optJSONObject(i) ?: continue
-                        if (year.isNotBlank() &&
-                            o.optString("release_date").startsWith(year)
-                        ) {
-                            pick = o
-                            break
-                        }
-                        if (pick == null) pick = o
-                    }
-                    pick?.let { o ->
-                        o.optString("id").takeIf { it.isNotBlank() }?.let {
-                            tmdbId = it
-                        }
-                        if (poster.isNullOrBlank()) {
-                            o.optString("poster_path").takeIf { it.isNotBlank() }?.let {
-                                poster = "https://image.tmdb.org/t/p/w780$it"
-                            }
-                        }
-                        if (plot.isNullOrBlank()) {
-                            o.optString("overview").takeIf { it.isNotBlank() }?.let {
-                                plot = it
-                            }
-                        }
-                        if (title == slugTitle) {
-                            o.optString("title").takeIf { it.isNotBlank() }?.let {
-                                title = it
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        // TMDB search cannot fix a misspelled slug ("B Hubali");
-        // IMDb suggest is fuzzy and returns the correct spelling.
-        if (title == slugTitle) {
-            runCatching {
-                resolveImdbTitle(slugTitle, year.toIntOrNull())?.let {
-                    title = it
-                }
-            }
-        }
-        if (title.isBlank()) return null
-        return newMovieLoadResponse(title, url, TvType.Movie, subData("yt", url, title, year, tmdbId)) {
-            if (!poster.isNullOrBlank()) this.posterUrl = poster
-            if (!plot.isNullOrBlank()) this.plot = plot
-        }
-    }
 
 
     // ---------- 9anime (v5) ----------
@@ -541,79 +409,6 @@ class MergedProvider : MainAPI() {
         return true
     }
 
-    // ---------- EZTV (v5, search-only lane) ----------
-
-    private fun eztvSearchCards(doc: Document): List<SearchResponse> {
-        val out = mutableListOf<SearchResponse>()
-        val seen = HashSet<String>()
-        for (a in doc.select("a[href*=/ep/]")) {
-            val href = a.attr("href")
-            if (href.isBlank() || !seen.add(href)) continue
-            var title = a.text().trim()
-            if (title.isBlank()) {
-                title = href.trimEnd('/').substringAfterLast('/')
-                    .substringBefore('?').replace("-", " ")
-                    .replaceFirstChar { it.uppercase() }
-            }
-            val full = when {
-                href.startsWith("http") -> href
-                href.startsWith("/") -> "https://eztv1.xyz$href"
-                else -> "https://eztv1.xyz/$href"
-            }
-            out += newMovieSearchResponse(title, full, TvType.Movie)
-        }
-        return out
-    }
-
-    private suspend fun loadEztvEp(url: String): LoadResponse? {
-        val page = runCatching {
-            app.get(url, headers = browserHeaders).text
-        }.getOrNull() ?: return null
-        val norm = page.replace("&amp;", "&")
-        val magnet = Regex("""magnet:\?xt=urn:btih:[^\s"'<>]+""")
-            .find(norm)?.value ?: return null
-        val dn = Regex("""dn=([^&]+)""").find(magnet)?.groupValues?.get(1)
-            ?.let { runCatching { java.net.URLDecoder.decode(it, "UTF-8") }.getOrDefault("") }
-            .orEmpty()
-        val title = dn.ifBlank {
-            url.trimEnd('/').substringAfterLast('/').substringBefore('?')
-                .replace("-", " ").replaceFirstChar { it.uppercase() }
-        }
-        return newMovieLoadResponse(title, url, TvType.Movie, subData("ez", url, title, ""))
-    }
-
-    private suspend fun loadLinksEztv(
-        epUrl: String,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit,
-        elapsed: () -> Long
-    ): Boolean {
-        // Episode page (with ?d=) carries exactly one magnet.
-        // Verified live 2026-10-27 on 3 episode ids (one stale
-        // id 404s — search results can go stale on this mirror).
-        // NOTE: magnet playback still needs a working torrent
-        // engine on the device (same caveat as YTS torrents).
-        val page = runCatching {
-            app.get(epUrl, headers = browserHeaders).text
-        }.getOrNull()
-        val magnet = page?.replace("&amp;", "&")?.let {
-            Regex("""magnet:\?xt=urn:btih:[^\s"'<>]+""").find(it)?.value
-        }.orEmpty()
-        if (magnet.isBlank()) {
-            emitDebug(listOf("Merged·Ez", "no-magnet"), callback)
-            return true
-        }
-        val dn = Regex("""dn=([^&]+)""").find(magnet)?.groupValues?.get(1)
-            ?.let { runCatching { java.net.URLDecoder.decode(it, "UTF-8") }.getOrDefault("") }
-            .orEmpty()
-        callback(
-            newExtractorLink("EZTV", dn.ifBlank { "Torrent" }, magnet, ExtractorLinkType.VIDEO) {
-                this.quality = Qualities.Unknown.value
-            }
-        )
-        return true
-    }
-
     // ---------- subtitles (automatic, gear-controlled) ----------
 
     private fun httpGetText(url: String, timeoutMs: Int): String? {
@@ -672,33 +467,6 @@ class MergedProvider : MainAPI() {
         return fallback
     }
 
-    /** Fuzzy title resolution: IMDb suggest finds the correct
-     * spelling even when the site's own slug is misspelled
-     * (verified: "B Hubali The Epic" -> "Baahubali: The Epic"). */
-    private fun resolveImdbTitle(latinTitle: String, year: Int?): String? {
-        val bucket = latinTitle.firstOrNull()?.lowercaseChar() ?: return null
-        val q = java.net.URLEncoder.encode(latinTitle, "UTF-8")
-        val json = httpGetText(
-            "https://v2.sg.media-imdb.com/suggestion/$bucket/$q.json", 8000
-        ) ?: return null
-        val arr = runCatching {
-            JSONObject(json).optJSONArray("d")
-        }.getOrNull() ?: return null
-        var fallback: String? = null
-        for (i in 0 until arr.length()) {
-            val o = arr.optJSONObject(i) ?: continue
-            val id = o.optString("id")
-            if (!id.startsWith("tt")) continue
-            val label = o.optString("l")
-            if (label.isBlank()) continue
-            val qkind = o.optString("q")
-            val y = o.optInt("y", -1)
-            if (fallback == null) fallback = label
-            if (year != null && y != year) continue
-            if (qkind == "feature" || qkind == "TV series") return label
-        }
-        return fallback
-    }
 
     private data class SubHit(val url: String, val score: Int)
 
@@ -809,10 +577,8 @@ class MergedProvider : MainAPI() {
             }
             return when (lane) {
                 "cb" -> loadLinksCineby(realUrl, subtitleCallback, callback, ::elapsed)
-                "yt" -> loadLinksYts(realUrl, title, year, extra, subtitleCallback, callback, ::elapsed)
-                "an" -> loadLinksAnime9(realUrl, subtitleCallback, callback, ::elapsed)
-                "ez" -> loadLinksEztv(realUrl, subtitleCallback, callback, ::elapsed)
-                else -> {
+                                "an" -> loadLinksAnime9(realUrl, subtitleCallback, callback, ::elapsed)
+                                else -> {
                     emitDebug(listOf("Merged", "unknown-lane"), callback)
                     true
                 }
@@ -823,16 +589,9 @@ class MergedProvider : MainAPI() {
         return when {
             data.contains("cineby.ws") && data.contains("/episode/") ->
                 loadLinksCineby(data, subtitleCallback, callback, ::elapsed)
-            data.contains("yts.lu/movies/") -> {
-                val (t, y) = slugTitleYear(data)
-                if (t.isNotBlank()) emitSubs(t, y, subtitleCallback)
-                loadLinksYts(data, t, y, "", subtitleCallback, callback, ::elapsed)
-            }
             data.contains("9anime.or.at") && data.contains("-episode-") ->
                 loadLinksAnime9(data, subtitleCallback, callback, ::elapsed)
-            data.contains("eztv1.xyz/ep/") ->
-                loadLinksEztv(data, subtitleCallback, callback, ::elapsed)
-            data.contains("cineby.ws/tv/") -> {
+                                        data.contains("cineby.ws/tv/") -> {
                 // Series page passed: play its first episode.
                 val first = runCatching {
                     val doc = app.get(data, headers = browserHeaders).document
@@ -951,138 +710,4 @@ class MergedProvider : MainAPI() {
         return true
     }
 
-    private suspend fun loadLinksYts(
-        movieUrl: String,
-        title: String,
-        year: String,
-        tmdbId: String,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit,
-        elapsed: () -> Long
-    ): Boolean {
-        // Stream FIRST (no torrent engine needed): the YTS site's
-        // own player is vidsrc*/embed/movie/{tmdbId} (verified
-        // in the page JS 2026-10-27). v4 used vidsrc.mov only and
-        // the stream link never appeared on-device (extractor
-        // coverage for .mov unverified) — so v5 tries every
-        // vidsrc domain the family uses, then the relay.
-        // Magnets stay below the stream.
-        var streamEmitted = 0
-        if (tmdbId.isNotBlank()) {
-            for (domain in listOf("vidsrc.to", "vidsrc.xyz", "vidsrc.mov")) {
-                if (streamEmitted > 0) break
-                runCatching {
-                    loadExtractor(
-                        "https://$domain/embed/movie/$tmdbId",
-                        movieUrl,
-                        subtitleCallback
-                    ) { streamEmitted++; callback(it) }
-                }
-            }
-            if (streamEmitted == 0 && elapsed() < 15000) {
-                runCatching {
-                    val r = app.get(
-                        "$relayBase/relay/resolve?url=" +
-                            java.net.URLEncoder.encode(
-                                "https://vidsrc.mov/embed/movie/$tmdbId", "UTF-8"
-                            ) +
-                            "&ref=" + java.net.URLEncoder.encode(movieUrl, "UTF-8")
-                    ).text
-                    val direct = JSONObject(r).optJSONArray("direct")
-                    if (direct != null && direct.length() > 0) {
-                        val d = direct.optString(0)
-                        if (d.isNotBlank()) {
-                            streamEmitted++
-                            callback(
-                                newExtractorLink("Merged", "Relay", d, ExtractorLinkType.VIDEO) {
-                                    this.quality = Qualities.Unknown.value
-                                }
-                            )
-                        }
-                    }
-                }
-            }
-        }
-        // Torrent search needs the FULL correct title: a misspelled
-        // slug title returns zero hits (verified on Baahubali).
-        // Retry chain: given title -> IMDb fuzzy title -> cleaned
-        // title (punctuation stripped). First non-empty hit list wins.
-        val attempts = mutableListOf<String>()
-        if (title.isNotBlank()) attempts += title
-        if (title.isNotBlank()) {
-            runCatching {
-                resolveImdbTitle(title, year.toIntOrNull())?.let {
-                    if (!attempts.contains(it)) attempts += it
-                }
-            }
-        }
-        val cleaned = title.replace(Regex("""[^A-Za-z0-9 ]"""), " ")
-            .replace(Regex("""\s+"""), " ").trim()
-        if (cleaned.isNotBlank() && !attempts.contains(cleaned)) attempts += cleaned
-        val apiBase = if (movieUrl.endsWith("/")) movieUrl else "$movieUrl/"
-        var hits: org.json.JSONArray? = null
-        for (name in attempts) {
-            val apiUrl = apiBase + "?api=torrents&mode=movie" +
-                "&name=" + java.net.URLEncoder.encode(name, "UTF-8") +
-                "&year=" + java.net.URLEncoder.encode(year, "UTF-8") +
-                "&quality=all"
-            val json = runCatching {
-                app.get(apiUrl, headers = browserHeaders).text
-            }.getOrNull()
-            val arr = runCatching {
-                JSONObject(json ?: "").optJSONArray("hits")
-            }.getOrNull()
-            if (arr != null && arr.length() > 0) {
-                hits = arr
-                break
-            }
-        }
-        if (hits == null || hits.length() == 0) {
-            emitDebug(listOf("Merged·Yts", "no-hits"), callback)
-            return true
-        }
-        val hitsArr = hits
-        data class Tor(val magnet: String, val seeds: Int, val label: String, val q: Int)
-        val tors = mutableListOf<Tor>()
-        for (i in 0 until hitsArr.length()) {
-            val o = hitsArr.optJSONObject(i) ?: continue
-            val magnet = o.optString("magnetUrl")
-            if (!magnet.startsWith("magnet:")) continue
-            val t = o.optString("title")
-            val seeds = o.optString("seeds").toIntOrNull() ?: 0
-            val bytes = o.optString("bytes").toLongOrNull() ?: 0L
-            val sizeGb = if (bytes > 0) "%.1f GB".format(bytes / 1073741824.0) else ""
-            val q = when {
-                t.contains("2160p") -> Qualities.P2160.value
-                t.contains("1080p") -> Qualities.P1080.value
-                t.contains("720p") -> Qualities.P720.value
-                t.contains("480p") -> Qualities.P480.value
-                else -> Qualities.Unknown.value
-            }
-            val qLabel = when {
-                t.contains("2160p") -> "2160p"
-                t.contains("1080p") -> "1080p"
-                t.contains("720p") -> "720p"
-                t.contains("480p") -> "480p"
-                else -> ""
-            }
-            val label = listOf("$seeds seeds", qLabel, sizeGb).filter { it.isNotBlank() }
-                .joinToString(" · ")
-            tors += Tor(magnet, seeds, label, q)
-        }
-        // Fast + live first: seeds descending, dead (0 seeds) dropped.
-        val ranked = tors.filter { it.seeds > 0 }.sortedByDescending { it.seeds }.take(5)
-        if (ranked.isEmpty()) {
-            emitDebug(listOf("Merged·Yts", "no-live"), callback)
-            return true
-        }
-        for (tor in ranked) {
-            callback(
-                newExtractorLink("YTS", tor.label, tor.magnet, ExtractorLinkType.VIDEO) {
-                    this.quality = tor.q
-                }
-            )
-        }
-        return true
-    }
 }

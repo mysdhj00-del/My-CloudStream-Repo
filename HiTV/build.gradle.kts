@@ -1,5 +1,7 @@
 // HiTV CloudStream plugin module (Super drama world HiTV, v3.13.3 app lineage).
-version = 1
+// v2: detail URLs are absolute (CloudStream normalises a custom scheme
+// against mainUrl, which broke v1 detail pages on-device).
+version = 2
 
 android {
     namespace = "com.hitv"

@@ -304,10 +304,7 @@ class HiTVProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit,
     ): Boolean {
         val pm = Regex("""hitvPlay:(\d+):(\d+):(\d+)""").find(data)
-        if (pm == null) {
-            emitDebug(listOf("HiTV", "bad-data"), callback)
-            return true
-        }
+        if (pm == null) return false
         val cat = pm.groupValues[1]
         val id = pm.groupValues[2]
         val epId = pm.groupValues[3]
@@ -316,13 +313,9 @@ class HiTVProvider : MainAPI() {
             mapOf("category" to cat, "id" to id, "episodeId" to epId),
             "H5", "32"
         )
-        if (play == null) {
-            emitDebug(listOf("HiTV", "play:null", "cat:$cat", "id:$id", "ep:$epId"), callback)
-            return true
-        }
+        if (play == null) return false
         val mediaUrl = play.optString("mediaUrl")
-        val freeDur = if (play.isNull("freeDuration")) "null" else (play.opt("freeDuration")?.toString() ?: "?")
-        val totalDur = play.optInt("totalDuration", -1)
+        if (mediaUrl.isBlank()) return false
         val subs = play.optJSONArray("subtitlingList")
         if (subs != null) {
             for (i in 0 until subs.length()) {
@@ -333,11 +326,6 @@ class HiTVProvider : MainAPI() {
                 subtitleCallback(SubtitleFile(slab.ifBlank { "Subtitle" }, surl))
             }
         }
-        emitDebug(
-            listOf("HiTV", "play:ok", "free:$freeDur", "dur:$totalDur", "cat:$cat", "id:$id", "ep:$epId"),
-            callback
-        )
-        if (mediaUrl.isBlank()) return true
         callback(
             newExtractorLink(
                 "HiTV",
@@ -349,22 +337,5 @@ class HiTVProvider : MainAPI() {
             }
         )
         return true
-    }
-
-    private suspend fun emitDebug(diag: List<String>, callback: (ExtractorLink) -> Unit) {
-        try {
-            callback(
-                newExtractorLink(
-                    "HiTV",
-                    "DEBUG " + diag.joinToString(" | "),
-                    "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8",
-                    ExtractorLinkType.M3U8
-                ) {
-                    this.quality = Qualities.Unknown.value
-                }
-            )
-        } catch (e: Exception) {
-            // Diagnostics must never break playback.
-        }
     }
 }

@@ -20,7 +20,6 @@ import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
-import kotlinx.coroutines.delay
 import org.json.JSONObject
 import java.security.KeyFactory
 import java.security.MessageDigest
@@ -163,9 +162,9 @@ class HiTVProvider : MainAPI() {
                     }
                     // Any non-success code: retry once more after a pause,
                     // the service is flaky under bursts (A0201 especially).
-                    if (attempt < 2) delay(6000) else return null
-                } else if (attempt < 2) delay(6000)
-            } else if (attempt < 2) delay(6000)
+                    if (attempt < 2) Thread.sleep(6000) else return null
+                } else if (attempt < 2) Thread.sleep(6000)
+            } else if (attempt < 2) Thread.sleep(6000)
         }
         return null
     }

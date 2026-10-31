@@ -198,7 +198,10 @@ class HiTVProvider : MainAPI() {
                 val title = it.optString("title").ifBlank { it.optString("videoName") }
                 if (title.isBlank()) continue
                 val cat = it.optInt("category", 0)
-                val url = "hitv:$cat:$id"
+                // Absolute URL: a custom "hitv:cat:id" scheme gets
+                // normalised by CloudStream against mainUrl, which is
+                // exactly what broke v1 detail pages on-device.
+                val url = "https://hitv.local/$cat/$id"
                 val poster = it.optString("imageUrl")
                 val card = if (cat == 0) {
                     newMovieSearchResponse(title, url, TvType.Movie)
@@ -230,10 +233,15 @@ class HiTVProvider : MainAPI() {
     // ---------- detail ----------
 
     override suspend fun load(url: String): LoadResponse? {
-        val parts = url.split(":")
-        if (parts.size < 3 || parts[0] != "hitv") return null
-        val cat = parts[1].toIntOrNull() ?: return null
-        val id = parts[2].toIntOrNull() ?: return null
+        // Accept all three forms: v2 absolute "https://hitv.local/cat/id",
+        // v1 "hitv:cat:id", and v1 as CloudStream normalised it on-device
+        // ("https://h5-api.hitv.ltd/hitv:cat:id", which the old split(":")
+        // parser rejected and turned into "Error loading").
+        val m = Regex("""hitv:(\d+):(\d+)""").find(url)
+            ?: Regex("""hitv\.local/(\d+)/(\d+)""").find(url)
+            ?: return null
+        val cat = m.groupValues[1].toIntOrNull() ?: return null
+        val id = m.groupValues[2].toIntOrNull() ?: return null
         val data = apiData(
             "/cms/web/movieDrama/get",
             mapOf("category" to cat.toString(), "id" to id.toString()),
@@ -295,14 +303,14 @@ class HiTVProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit,
     ): Boolean {
-        val parts = data.split(":")
-        if (parts.size < 4 || parts[0] != "hitvPlay") {
+        val pm = Regex("""hitvPlay:(\d+):(\d+):(\d+)""").find(data)
+        if (pm == null) {
             emitDebug(listOf("HiTV", "bad-data"), callback)
             return true
         }
-        val cat = parts[1]
-        val id = parts[2]
-        val epId = parts[3]
+        val cat = pm.groupValues[1]
+        val id = pm.groupValues[2]
+        val epId = pm.groupValues[3]
         val play = apiData(
             "/cms/web/ios_h5/movieDrama/getPlayInfo",
             mapOf("category" to cat, "id" to id, "episodeId" to epId),

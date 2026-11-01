@@ -308,7 +308,22 @@ class HiTVProvider : MainAPI() {
         val cat = pm.groupValues[1]
         val id = pm.groupValues[2]
         val epId = pm.groupValues[3]
-        val play = apiData(
+        // v4: the ios_h5 endpoint defaults to GROOT_FD (~360-540p).
+        // The working parameter name is "definition" (not
+        // "definitionCode", which the server silently ignores, and not
+        // a mediaUrl suffix swap, which returns 403). Verified live
+        // 2026-11-01: definition=GROOT_HD returns a real 1080p playlist
+        // on Blue Brick Man, Lupin and Colony, with subtitles intact.
+        // Fall back to the default stream when HD is not returned.
+        val playHd = apiData(
+            "/cms/web/ios_h5/movieDrama/getPlayInfo",
+            mapOf("category" to cat, "id" to id, "episodeId" to epId, "definition" to "GROOT_HD"),
+            "H5", "32"
+        )
+        val isHd = playHd != null &&
+            playHd.optString("currentDefinition") == "GROOT_HD" &&
+            playHd.optString("mediaUrl").isNotBlank()
+        val play = if (isHd) playHd else apiData(
             "/cms/web/ios_h5/movieDrama/getPlayInfo",
             mapOf("category" to cat, "id" to id, "episodeId" to epId),
             "H5", "32"
@@ -329,11 +344,11 @@ class HiTVProvider : MainAPI() {
         callback(
             newExtractorLink(
                 "HiTV",
-                "HiTV",
+                if (isHd) "HiTV 1080p" else "HiTV",
                 mediaUrl,
                 ExtractorLinkType.M3U8
             ) {
-                this.quality = Qualities.Unknown.value
+                this.quality = if (isHd) Qualities.P1080.value else Qualities.Unknown.value
             }
         )
         return true

@@ -6,7 +6,11 @@
 // v4: request 1080p explicitly via definition=GROOT_HD on the ios_h5
 // play endpoint (verified live 2026-11-01 on 3 titles), with a fallback
 // to the default FD stream when HD is not returned.
-version = 4
+// v5: search fallback — the server search index returns empty for every
+// keyword (verified 2026-11-01), so search() scans the home sections
+// and matches title / videoName / English slug. Published after v4 to
+// avoid two competing publishes.
+version = 5
 
 android {
     namespace = "com.hitv"

@@ -10,7 +10,11 @@
 // keyword (verified 2026-11-01), so search() scans the home sections
 // and matches title / videoName / English slug. Published after v4 to
 // avoid two competing publishes.
-version = 5
+// v6: dual subtitles — when a title carries both English and Arabic
+// subtitle files, loadLinks also emits one merged "English + العربية"
+// track (English line above Arabic in the same cue) via the existing
+// relay /relay/mergesubs route (verified live 2026-11-01 on Colony).
+version = 6
 
 android {
     namespace = "com.hitv"

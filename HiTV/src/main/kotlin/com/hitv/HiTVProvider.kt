@@ -397,14 +397,46 @@ class HiTVProvider : MainAPI() {
         if (play == null) return false
         val mediaUrl = play.optString("mediaUrl")
         if (mediaUrl.isBlank()) return false
+        // v6 dual subtitles: HiTV titles that carry subtitle files
+        // usually carry both English and Arabic (e.g. Colony: en + ar
+        // among 11 languages). CloudStream shows one subtitle track at
+        // a time, so simultaneous EN+AR needs one merged cue file with
+        // the English line above the Arabic line in each cue — produced
+        // by the existing relay /relay/mergesubs route (the same route
+        // Anime9/Merged use; verified live 2026-11-01 on Colony, first
+        // cues are EN line then AR line). The merged track is emitted
+        // first, with the individual tracks still available as
+        // alternatives. If either language is missing, no merged track
+        // is emitted and the available tracks are used as-is.
         val subs = play.optJSONArray("subtitlingList")
         if (subs != null) {
+            val byAbbr = HashMap<String, String>()
+            val individual = mutableListOf<Pair<String, String>>()
             for (i in 0 until subs.length()) {
                 val s = subs.optJSONObject(i) ?: continue
                 val surl = s.optString("subtitlingUrl")
                 if (surl.isBlank()) continue
-                val slab = s.optString("language").ifBlank { s.optString("languageAbbr") }
-                subtitleCallback(SubtitleFile(slab.ifBlank { "Subtitle" }, surl))
+                val abbr = s.optString("languageAbbr")
+                if (abbr.isNotBlank()) byAbbr[abbr] = surl
+                val slab = s.optString("language").ifBlank { abbr }
+                individual += (slab.ifBlank { "Subtitle" } to surl)
+            }
+            val engUrl = byAbbr["en"]
+            val araUrl = byAbbr["ar"]
+            if (engUrl != null && araUrl != null) {
+                val merged = runCatching {
+                    val eu = java.net.URLEncoder.encode(engUrl, "UTF-8")
+                    val au = java.net.URLEncoder.encode(araUrl, "UTF-8")
+                    val mUrl = "https://egydead-stremio.onrender.com/relay/mergesubs?eng=$eu&ara=$au"
+                    val probe = probeText(mUrl, 15000)
+                    if (!probe.isNullOrBlank()) mUrl else null
+                }.getOrNull()
+                if (merged != null) {
+                    subtitleCallback(SubtitleFile("English + العربية", merged))
+                }
+            }
+            for ((label, surl) in individual) {
+                subtitleCallback(SubtitleFile(label, surl))
             }
         }
         callback(
@@ -418,5 +450,19 @@ class HiTVProvider : MainAPI() {
             }
         )
         return true
+    }
+
+    private fun probeText(url: String, timeoutMs: Int): String? {
+        return runCatching {
+            val conn = java.net.URL(url).openConnection() as java.net.HttpURLConnection
+            conn.connectTimeout = timeoutMs
+            conn.readTimeout = timeoutMs
+            conn.setRequestProperty("User-Agent", "Mozilla/5.0")
+            conn.setRequestProperty("Accept", "text/plain, */*")
+            if (conn.responseCode !in 200..299) return null
+            val stream = if (conn.contentEncoding == "gzip")
+                java.util.zip.GZIPInputStream(conn.inputStream) else conn.inputStream
+            stream.bufferedReader(Charsets.UTF_8).readText()
+        }.getOrNull()
     }
 }

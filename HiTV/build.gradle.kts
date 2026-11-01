@@ -14,7 +14,10 @@
 // subtitle files, loadLinks also emits one merged "English + العربية"
 // track (English line above Arabic in the same cue) via the existing
 // relay /relay/mergesubs route (verified live 2026-11-01 on Colony).
-version = 6
+// v7: stronger search — server attempt first, then a full home scan
+// (all navs, pages 1-3, no early exit, capped at 50) matching title,
+// videoName, English slug, plot introduction and tags.
+version = 7
 
 android {
     namespace = "com.hitv"

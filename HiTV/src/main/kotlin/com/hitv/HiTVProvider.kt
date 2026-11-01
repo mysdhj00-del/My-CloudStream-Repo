@@ -128,8 +128,8 @@ class HiTVProvider : MainAPI() {
         params: Map<String, String>,
         clientType: String,
         versionCode: String,
+        ts: Long = System.currentTimeMillis(),
     ): Map<String, String> {
-        val ts = System.currentTimeMillis()
         return mapOf(
             "currentTime" to ts.toString(),
             "sign" to sign(params, ts),
@@ -223,22 +223,29 @@ class HiTVProvider : MainAPI() {
         return newHomePageResponse(lists, false)
     }
 
-    // ---------- search: server search is dead, so scan the home catalog ----------
+    // ---------- search: stronger v7 scan (server search is dead) ----------
     //
     // Probed 2026-11-01, method corrected from the site's own JS (POST,
     // not GET — GET returns "Request method 'GET' not supported"):
     // POST /cms/v2/h5/search/searchWithKeyWord with the accepted body
     // {keyword, page, size} returns code 00000 but an EMPTY array for
-    // every keyword tried, including "a", "Colony", "Blue" and "القلعة"
-    // (titles that certainly exist in the catalog); searchLenovo also
-    // returns empty searchResults, and searchDrama is 404. An Arabic
-    // keyword even returns A0201. The server search index is empty on
-    // this service version, so no provider-side parameter fixes it.
-    // Fallback implemented instead: search() scans the home sections
-    // (all 5 navs, page 1, then page 2 only if page 1 matched nothing)
-    // and returns titles whose title, videoName or English slug contain
-    // the query. This finds popular/recommended titles (the home
-    // catalog), not the full catalog — stated plainly, not oversold.
+    // every keyword tried, including "a", "Colony", "Blue" and "القلعة";
+    // searchLenovo also returns empty, searchDrama is 404, ranking
+    // more/v3 still uncracked ("id must not be null" for every field
+    // name tried), getHomeRank returns empty, and home pagination is
+    // shallow (nav 1000004 yields only 36 unique titles across pages
+    // 1-3, then repeats/empty; nav 1000017 only 6). There is no
+    // full-catalog listing endpoint in the H5 API, so a provider-side
+    // search cannot literally cover every title in the service's
+    // database — that limit is stated plainly, not hidden.
+    // v7 therefore makes the scan as strong as the API allows:
+    // (1) try the server search first (cheap; if its index ever
+    // recovers, those results win), (2) scan ALL home pages 1-3 for
+    // ALL 5 navs (no early exit after page 1), deduplicated, capped
+    // at 50 results, and (3) match against title, videoName, the
+    // English slug in cid, the plot introduction, AND the tag list —
+    // so a query like "رعب" or "زومبي" also finds titles tagged that
+    // way even when the word is not in the title.
 
     override suspend fun search(query: String): List<SearchResponse> {
         val q = query.trim()
@@ -246,8 +253,17 @@ class HiTVProvider : MainAPI() {
         val nq = q.lowercase()
         val seen = HashSet<Int>()
         val results = mutableListOf<SearchResponse>()
+        // (1) Server search attempt — currently returns [] everywhere,
+        // but costs one call and future-proofs the provider.
+        for (it in serverSearch(q)) {
+            val id = it.optInt("id", 0)
+            if (id == 0 || !seen.add(id)) continue
+            cardForSearch(it, id)?.let { results += it }
+            if (results.size >= 50) return results
+        }
+        // (2) Full home scan, pages 1-3, all navs, no early exit.
         val navs = listOf(1000004, 1000016, 1000017, 1000018, 1000019)
-        for (page in 1..2) {
+        for (page in 1..3) {
             for (nav in navs) {
                 val data = apiData(
                     "/home/h5/getHome",
@@ -263,37 +279,100 @@ class HiTVProvider : MainAPI() {
                         val id = it.optInt("id", 0)
                         if (id == 0 || !seen.add(id)) continue
                         if (!matchesQuery(it, nq)) continue
-                        val title = it.optString("title").ifBlank { it.optString("videoName") }
-                        if (title.isBlank()) continue
-                        val cat = it.optInt("category", 0)
-                        val url = "https://hitv.local/$cat/$id"
-                        val poster = it.optString("imageUrl")
-                        val card = if (cat == 0) {
-                            newMovieSearchResponse(title, url, TvType.Movie)
-                        } else {
-                            newTvSeriesSearchResponse(title, url, TvType.TvSeries)
-                        }
-                        if (poster.isNotBlank()) card.posterUrl = poster
-                        results += card
+                        cardForSearch(it, id)?.let { results += it }
+                        if (results.size >= 50) return results
                     }
                 }
             }
-            if (results.isNotEmpty()) break
         }
         return results
     }
 
+    private fun cardForSearch(it: JSONObject, id: Int): SearchResponse? {
+        val title = it.optString("title")
+            .ifBlank { it.optString("videoName") }
+            .ifBlank { it.optString("name") }
+        if (title.isBlank()) return null
+        val cat = it.optInt("category", 0)
+        val url = "https://hitv.local/$cat/$id"
+        val poster = it.optString("imageUrl")
+            .ifBlank { it.optString("coverHorizontalUrl") }
+        val card = if (cat == 0) {
+            newMovieSearchResponse(title, url, TvType.Movie)
+        } else {
+            newTvSeriesSearchResponse(title, url, TvType.TvSeries)
+        }
+        if (poster.isNotBlank()) card.posterUrl = poster
+        return card
+    }
+
     private fun matchesQuery(item: JSONObject, nq: String): Boolean {
-        val title = item.optString("title")
-        val videoName = item.optString("videoName")
         // cid looks like "<random>-The-English-Slug": the part after the
         // first dash is the English title, so an English query can match
         // an Arabic-titled card through its slug.
         val slug = item.optString("cid").substringAfter("-", "")
             .replace("-", " ")
-        return title.lowercase().contains(nq) ||
-            videoName.lowercase().contains(nq) ||
-            slug.lowercase().contains(nq)
+        if (item.optString("title").lowercase().contains(nq)) return true
+        if (item.optString("videoName").lowercase().contains(nq)) return true
+        if (slug.lowercase().contains(nq)) return true
+        if (item.optString("introduction").lowercase().contains(nq)) return true
+        val tags = item.optJSONArray("tagList")
+        if (tags != null) {
+            for (i in 0 until tags.length()) {
+                val t = tags.optJSONObject(i)
+                if (t != null) {
+                    if (t.optString("tagName").lowercase().contains(nq)) return true
+                    if (t.optString("name").lowercase().contains(nq)) return true
+                } else if (tags.optString(i).lowercase().contains(nq)) {
+                    return true
+                }
+            }
+        }
+        return false
+    }
+
+    /** POST searchWithKeyWord via raw HttpURLConnection (sign over the
+     *  JSON body fields, exactly as the site's own JS signs POSTs).
+     *  Returns the raw result items, or empty when the endpoint gives
+     *  nothing (its current behaviour for every keyword). */
+    private fun serverSearch(query: String): List<JSONObject> {
+        return try {
+            val body = JSONObject()
+            body.put("keyword", query)
+            body.put("page", 1)
+            body.put("size", 20)
+            val params = mapOf("keyword" to query, "page" to "1", "size" to "20")
+            val ts = System.currentTimeMillis()
+            val conn = java.net.URL("$API/cms/v2/h5/search/searchWithKeyWord")
+                .openConnection() as java.net.HttpURLConnection
+            conn.requestMethod = "POST"
+            conn.doOutput = true
+            conn.connectTimeout = 15000
+            conn.readTimeout = 15000
+            conn.setRequestProperty("Content-Type", "application/json")
+            conn.setRequestProperty("Accept", "application/json")
+            for ((k, v) in signedHeaders(params, "H5", "32", ts)) {
+                conn.setRequestProperty(k, v)
+            }
+            conn.outputStream.bufferedWriter(Charsets.UTF_8).use {
+                it.write(body.toString())
+            }
+            if (conn.responseCode !in 200..299) return emptyList()
+            val text = conn.inputStream.bufferedReader(Charsets.UTF_8).readText()
+            val json = JSONObject(text)
+            if (json.optString("code") != "00000") return emptyList()
+            val data = json.opt("data") ?: return emptyList()
+            val arr = when (data) {
+                is org.json.JSONArray -> data
+                is JSONObject -> data.optJSONArray("list")
+                    ?: data.optJSONArray("searchResults")
+                    ?: return emptyList()
+                else -> return emptyList()
+            }
+            (0 until arr.length()).mapNotNull { arr.optJSONObject(it) }
+        } catch (e: Exception) {
+            emptyList()
+        }
     }
 
     // ---------- detail ----------

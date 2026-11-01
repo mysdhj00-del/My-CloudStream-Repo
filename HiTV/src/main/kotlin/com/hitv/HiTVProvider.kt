@@ -47,10 +47,12 @@ import javax.crypto.spec.SecretKeySpec
  *   (ali-cdn-preview-web, freeDuration 300, end=300) and is NOT used.
  * - Subtitles come from getPlayInfo subtitlingList (languageAbbr + URL).
  *
- * Known v1 limits, stated plainly, not hidden:
- * - Search endpoints are broken on this service version (searchDrama
- *   404, searchWithKeyWord B0001, searchLenovo zero results), so
- *   search() returns empty and browsing is home sections only.
+ * Known limits, stated plainly, not hidden:
+ * - Server search is broken on this service version (searchDrama
+ *   404, searchWithKeyWord returns an empty array for every keyword,
+ *   searchLenovo empty) — v5 search() therefore scans the home
+ *   sections instead, so it finds popular titles only, not the full
+ *   catalog.
  * - The API is burst-sensitive (A0201): calls are retried with 6s
  *   spacing, so home/detail/play can take seconds, not milliseconds.
  * - Signing (decoded from the app's own H5 JS, Nuxt 4.3.4):
@@ -221,13 +223,77 @@ class HiTVProvider : MainAPI() {
         return newHomePageResponse(lists, false)
     }
 
-    // ---------- search: broken on the service version, honestly empty ----------
+    // ---------- search: server search is dead, so scan the home catalog ----------
+    //
+    // Probed 2026-11-01, method corrected from the site's own JS (POST,
+    // not GET — GET returns "Request method 'GET' not supported"):
+    // POST /cms/v2/h5/search/searchWithKeyWord with the accepted body
+    // {keyword, page, size} returns code 00000 but an EMPTY array for
+    // every keyword tried, including "a", "Colony", "Blue" and "القلعة"
+    // (titles that certainly exist in the catalog); searchLenovo also
+    // returns empty searchResults, and searchDrama is 404. An Arabic
+    // keyword even returns A0201. The server search index is empty on
+    // this service version, so no provider-side parameter fixes it.
+    // Fallback implemented instead: search() scans the home sections
+    // (all 5 navs, page 1, then page 2 only if page 1 matched nothing)
+    // and returns titles whose title, videoName or English slug contain
+    // the query. This finds popular/recommended titles (the home
+    // catalog), not the full catalog — stated plainly, not oversold.
 
     override suspend fun search(query: String): List<SearchResponse> {
-        // Endpoints tried 2026-10-31: searchDrama -> 404, searchWithKeyWord
-        // -> B0001, searchLenovo -> success with zero results. Browse the
-        // home sections instead; do not fake results.
-        return emptyList()
+        val q = query.trim()
+        if (q.isBlank()) return emptyList()
+        val nq = q.lowercase()
+        val seen = HashSet<Int>()
+        val results = mutableListOf<SearchResponse>()
+        val navs = listOf(1000004, 1000016, 1000017, 1000018, 1000019)
+        for (page in 1..2) {
+            for (nav in navs) {
+                val data = apiData(
+                    "/home/h5/getHome",
+                    mapOf("page" to page.toString(), "navigationId" to nav.toString()),
+                    "android_hitv1128", "216"
+                ) ?: continue
+                val sections = data.optJSONArray("recommendItems") ?: continue
+                for (i in 0 until sections.length()) {
+                    val sec = sections.optJSONObject(i) ?: continue
+                    val items = sec.optJSONArray("recommendContentVOList") ?: continue
+                    for (j in 0 until items.length()) {
+                        val it = items.optJSONObject(j) ?: continue
+                        val id = it.optInt("id", 0)
+                        if (id == 0 || !seen.add(id)) continue
+                        if (!matchesQuery(it, nq)) continue
+                        val title = it.optString("title").ifBlank { it.optString("videoName") }
+                        if (title.isBlank()) continue
+                        val cat = it.optInt("category", 0)
+                        val url = "https://hitv.local/$cat/$id"
+                        val poster = it.optString("imageUrl")
+                        val card = if (cat == 0) {
+                            newMovieSearchResponse(title, url, TvType.Movie)
+                        } else {
+                            newTvSeriesSearchResponse(title, url, TvType.TvSeries)
+                        }
+                        if (poster.isNotBlank()) card.posterUrl = poster
+                        results += card
+                    }
+                }
+            }
+            if (results.isNotEmpty()) break
+        }
+        return results
+    }
+
+    private fun matchesQuery(item: JSONObject, nq: String): Boolean {
+        val title = item.optString("title")
+        val videoName = item.optString("videoName")
+        // cid looks like "<random>-The-English-Slug": the part after the
+        // first dash is the English title, so an English query can match
+        // an Arabic-titled card through its slug.
+        val slug = item.optString("cid").substringAfter("-", "")
+            .replace("-", " ")
+        return title.lowercase().contains(nq) ||
+            videoName.lowercase().contains(nq) ||
+            slug.lowercase().contains(nq)
     }
 
     // ---------- detail ----------

@@ -3,7 +3,10 @@
 // against mainUrl, which broke v1 detail pages on-device).
 // v3: DEBUG test source removed at the user's order (2026-10-31 21:13
 // EET) — loadLinks now emits only the real HiTV link.
-version = 3
+// v4: request 1080p explicitly via definition=GROOT_HD on the ios_h5
+// play endpoint (verified live 2026-11-01 on 3 titles), with a fallback
+// to the default FD stream when HD is not returned.
+version = 4
 
 android {
     namespace = "com.hitv"

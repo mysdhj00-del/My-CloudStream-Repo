@@ -286,8 +286,13 @@ class TurkMoodProvider : MainAPI() {
         // v3: record the exact data loadLinks received, so the next
         // on-device DEBUG line shows the requested path, not just host.
         diag += "data=$data"
-        val isEpisode = data.startsWith("episode:")
-        val primaryUrl = if (isEpisode) "$api/episodes/${data.removePrefix("episode:")}" else data
+        // v4: CloudStream resolves relative episode data against mainUrl, so
+        // the phone passes "https://turkmoodapi.xyz/episode:<id>", not
+        // "episode:<id>". Extract the digits after "episode:" wherever they
+        // appear; anything else is used as-is (movie API URLs).
+        val epId = data.substringAfter("episode:", "").trim().takeWhile { it.isDigit() }
+        val isEpisode = epId.isNotEmpty()
+        val primaryUrl = if (isEpisode) "$api/episodes/$epId" else data
         var detailUrl = primaryUrl
         var bodyText: String? = null
         for (u in listOf(primaryUrl, altHost(primaryUrl)).distinct()) {

@@ -283,6 +283,9 @@ class TurkMoodProvider : MainAPI() {
         // v2: dual-host API fallback + ranked server resolution +
         // structured diagnostics (API vs extractor vs Cloudflare block).
         val diag = mutableListOf<String>()
+        // v3: record the exact data loadLinks received, so the next
+        // on-device DEBUG line shows the requested path, not just host.
+        diag += "data=$data"
         val isEpisode = data.startsWith("episode:")
         val primaryUrl = if (isEpisode) "$api/episodes/${data.removePrefix("episode:")}" else data
         var detailUrl = primaryUrl

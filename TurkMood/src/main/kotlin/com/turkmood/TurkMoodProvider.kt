@@ -86,6 +86,8 @@ import java.util.concurrent.atomic.AtomicBoolean
  * DEBUG source at all — meaning loadLinks died silently before the
  * diagnostic could emit. Wrapper: any throwable becomes a visible
  * LOADLINKS_CRASH DEBUG source. Dig budget tightened to 12s / max 4.
+ * v8: MiraVD/Mwdy skip the dig and go straight to WebView sniff;
+ * DEBUG lines now carry a v8 marker so the phone proves which code ran.
  *
  * v7 (Faselhd WebView sniff, user-approved 2026-11-02): last resort
  * for MiraVD/Mwdy only — invisible 1x1 WebView on the UI thread
@@ -737,10 +739,43 @@ class TurkMoodProvider(private val appContext: Context? = null) : MainAPI() {
                 found = true
                 continue
             }
-            // v5: loadExtractor has no MiraVD/Mwdy extractor — dig the
-            // embed the 3isk way (referer chain + packer unpack). Bounded:
-            // v6: 12s total, max 4 dug servers, so working titles never slow down.
-            if (dug < 4 && System.currentTimeMillis() - startedAt < 12000) {
+            // v8: MiraVD/Mwdy go STRAIGHT to WebView sniff — the plain
+            // dig cannot open them (CF 403 / disabled embeds) and only
+            // burns seconds before the sniff. Other hosts keep the dig.
+            val host = hostOf(link)
+            if ((host.contains("miravd") || host.contains("mwdy")) && webviewAttempts < 2) {
+                webviewAttempts++
+                val (wlinks, wcode) = runCatching { sniffWithWebView(link, detailUrl) }.getOrDefault(emptySet<String>() to "err")
+                if (wlinks.isNotEmpty()) {
+                    for (media in wlinks) {
+                        val isHls = media.contains(".m3u8")
+                        val cookies = runCatching { CookieManager.getInstance().getCookie(media) ?: CookieManager.getInstance().getCookie(link) ?: "" }.getOrDefault("")
+                        runCatching {
+                            callback(
+                                newExtractorLink(
+                                    name,
+                                    nm,
+                                    media,
+                                    if (isHls) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                                ) {
+                                    this.referer = link
+                                    this.quality = Qualities.Unknown.value
+                                    val hdrs = mutableMapOf(
+                                        "User-Agent" to "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36",
+                                        "Referer" to link
+                                    )
+                                    if (cookies.isNotBlank()) hdrs["Cookie"] = cookies
+                                    this.headers = hdrs
+                                }
+                            )
+                        }
+                    }
+                    outcomes += "$nm:WEBVIEW(${wlinks.size})"
+                    found = true
+                } else {
+                    outcomes += "$nm:FAIL+webview-$wcode"
+                }
+            } else if (dug < 4 && System.currentTimeMillis() - startedAt < 12000) {
                 dug++
                 val (links, code) = runCatching { digEmbed(link, detailUrl) }.getOrDefault(emptySet<String>() to "err")
                 if (links.isNotEmpty()) {
@@ -767,44 +802,7 @@ class TurkMoodProvider(private val appContext: Context? = null) : MainAPI() {
                     outcomes += "$nm:DIG(${links.size})"
                     found = true
                 } else {
-                    // v7: last resort for MiraVD/Mwdy only — WebView sniff
-                    // (Faselhd pattern, coroutine-free). Max 2 attempts.
-                    val host = hostOf(link)
-                    if ((host.contains("miravd") || host.contains("mwdy")) && webviewAttempts < 2) {
-                        webviewAttempts++
-                        val (wlinks, wcode) = runCatching { sniffWithWebView(link, detailUrl) }.getOrDefault(emptySet<String>() to "err")
-                        if (wlinks.isNotEmpty()) {
-                            for (media in wlinks) {
-                                val isHls = media.contains(".m3u8")
-                                val cookies = runCatching { CookieManager.getInstance().getCookie(media) ?: CookieManager.getInstance().getCookie(link) ?: "" }.getOrDefault("")
-                                runCatching {
-                                    callback(
-                                        newExtractorLink(
-                                            name,
-                                            nm,
-                                            media,
-                                            if (isHls) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
-                                        ) {
-                                            this.referer = link
-                                            this.quality = Qualities.Unknown.value
-                                            val hdrs = mutableMapOf(
-                                                "User-Agent" to "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36",
-                                                "Referer" to link
-                                            )
-                                            if (cookies.isNotBlank()) hdrs["Cookie"] = cookies
-                                            this.headers = hdrs
-                                        }
-                                    )
-                                }
-                            }
-                            outcomes += "$nm:WEBVIEW(${wlinks.size})"
-                            found = true
-                        } else {
-                            outcomes += "$nm:FAIL+$code+$wcode"
-                        }
-                    } else {
-                        outcomes += "$nm:FAIL+$code"
-                    }
+                    outcomes += "$nm:FAIL+$code"
                 }
             } else {
                 outcomes += "$nm:FAIL"
@@ -823,7 +821,7 @@ class TurkMoodProvider(private val appContext: Context? = null) : MainAPI() {
             callback(
                 newExtractorLink(
                     name,
-                    "DEBUG " + diag.joinToString(" | "),
+                    "DEBUG v8 | " + diag.joinToString(" | "),
                     "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8",
                     ExtractorLinkType.M3U8
                 ) {

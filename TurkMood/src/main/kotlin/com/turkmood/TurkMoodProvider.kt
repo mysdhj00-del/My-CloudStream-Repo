@@ -43,6 +43,18 @@ import org.json.JSONObject
  * - Playback servers are extractor-known hosts (StreamWish, Uqload,
  *   VidHide/EarnVids, MiraVD, Mwdy, StreamRuby, ...), resolved with
  *   loadExtractor. No login, no tokens, no session on any call.
+ *
+ * v2 (panel consensus, 2026-11-02): ranked server resolution (reachable
+ * hosts first, Cloudflare-walled MiraVD/Mwdy last), every server attempted
+ * with a per-server outcome, structured DEBUG diagnostics that distinguish
+ * API failure vs extractor failure vs Cloudflare block, dual-host API
+ * fallback (turkmoodapi.xyz -> moodkapi.xyz), and a browser-like UA on
+ * API calls. The DEBUG source is diagnostic only: its name starts with
+ * the failure class (API_FAILURE / NO_PLAYABLE_SOURCE), never a success.
+ * The FaselHD player_token chain (iframe -> video_player?player_token=
+ * -> scdns.io m3u8, WebView-based in the native app) is NOT in v2: the
+ * API exposes no FaselHD page URL per title, so that chain is still
+ * research, not a shippable plain-HTTP path.
  */
 class TurkMoodProvider : MainAPI() {
     override var mainUrl = "https://turkmoodapi.xyz"
@@ -53,6 +65,41 @@ class TurkMoodProvider : MainAPI() {
     override val hasQuickSearch = false
 
     private val api = "$mainUrl/wp-json/faselhd/v1"
+
+    // v2: browser-like headers on API calls (the API host is Cloudflare-
+    // fronted and filters some clients); harmless for the calls that
+    // already work, and one candidate explanation for phone-side WAF
+    // differences on the episode route.
+    private val apiHeaders = mapOf(
+        "User-Agent" to "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36",
+        "Accept" to "application/json"
+    )
+
+    private fun hostOf(url: String): String = url.substringAfter("://").substringBefore("/")
+
+    private fun altHost(url: String): String =
+        url.replace("https://turkmoodapi.xyz", "https://moodkapi.xyz")
+
+    // v2 server ranking: reachable hosts first, Cloudflare-walled
+    // MiraVD/Mwdy last (both return 403 "Just a moment..." to plain HTTP).
+    private fun serverRank(url: String): Int {
+        val h = url.lowercase()
+        return when {
+            "streamwish.to" in h || "streamhg" in h -> 0
+            "uqload" in h -> 1
+            "vidhide" in h || "earnvids" in h -> 2
+            "stmruby" in h || "streamruby" in h -> 3
+            "miravd" in h || "mwdy" in h -> 5
+            else -> 4
+        }
+    }
+
+    private fun bodyClass(text: String): String = when {
+        text.contains("Just a moment") || text.contains("cf-challenge") || text.contains("challenges.cloudflare.com") -> "CF_CHALLENGE"
+        text.trimStart().startsWith("<") -> "HTML"
+        text.trimStart().startsWith("{") || text.trimStart().startsWith("[") -> "JSON"
+        else -> "OTHER"
+    }
 
     override val mainPage = mainPageOf(
         "$api/episodes/latest" to "أحدث الحلقات",
@@ -141,14 +188,14 @@ class TurkMoodProvider : MainAPI() {
         val base = request.data.trimEnd('/')
         val sep = if (base.contains("?")) "&" else "?"
         val url = "$base${sep}page=$page"
-        val text = app.get(url).text
+        val text = app.get(url, headers = apiHeaders).text
         val (items, hasNext) = parseList(text, request.data)
         return newHomePageResponse(request.name, items, hasNext = hasNext)
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
         val url = "$api/search?q=" + java.net.URLEncoder.encode(query, "UTF-8")
-        val json = runCatching { JSONObject(app.get(url).text) }.getOrNull()
+        val json = runCatching { JSONObject(app.get(url, headers = apiHeaders).text) }.getOrNull()
             ?: return emptyList()
         val items = json.optJSONArray("items") ?: return emptyList()
         val out = ArrayList<SearchResponse>()
@@ -182,7 +229,7 @@ class TurkMoodProvider : MainAPI() {
     }
 
     override suspend fun load(url: String): LoadResponse {
-        val json = runCatching { JSONObject(app.get(url).text) }.getOrNull()
+        val json = runCatching { JSONObject(app.get(url, headers = apiHeaders).text) }.getOrNull()
             ?: throw ErrorLoadingException("No response")
         val item = json.optJSONObject("item") ?: throw ErrorLoadingException("No item")
         val title = item.optStr("title") ?: throw ErrorLoadingException("No title")
@@ -233,25 +280,36 @@ class TurkMoodProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
+        // v2: dual-host API fallback + ranked server resolution +
+        // structured diagnostics (API vs extractor vs Cloudflare block).
         val diag = mutableListOf<String>()
-        val detailUrl: String
         val isEpisode = data.startsWith("episode:")
-        if (isEpisode) {
-            val epId = data.removePrefix("episode:")
-            detailUrl = "$api/episodes/$epId"
-        } else {
-            detailUrl = data
+        val primaryUrl = if (isEpisode) "$api/episodes/${data.removePrefix("episode:")}" else data
+        var detailUrl = primaryUrl
+        var bodyText: String? = null
+        for (u in listOf(primaryUrl, altHost(primaryUrl)).distinct()) {
+            val r = runCatching { app.get(u, headers = apiHeaders) }.getOrNull()
+            if (r == null) {
+                diag += "api=${hostOf(u)}:ERR"
+                continue
+            }
+            val t = runCatching { r.text }.getOrNull() ?: ""
+            val cls = bodyClass(t)
+            if (r.code == 200 && cls == "JSON") {
+                bodyText = t
+                detailUrl = u
+                diag += "api=${hostOf(u)}:200/json-ok"
+                break
+            }
+            diag += "api=${hostOf(u)}:${r.code}/$cls"
         }
-        val res = runCatching { app.get(detailUrl) }.getOrNull()
-        diag += "page=${res?.code ?: "err"}"
-        if (res == null) {
-            emitDebug(diag, callback)
+        if (bodyText == null) {
+            emitDebug(listOf("API_FAILURE") + diag, callback)
             return true
         }
-        val json = runCatching { JSONObject(res.text) }.getOrNull()
+        val json = runCatching { JSONObject(bodyText) }.getOrNull()
         if (json == null) {
-            diag += "json=err"
-            emitDebug(diag, callback)
+            emitDebug(listOf("API_FAILURE", "json=err") + diag, callback)
             return true
         }
         // Movies: servers live under item.servers; episodes: under episode.servers.
@@ -260,13 +318,9 @@ class TurkMoodProvider : MainAPI() {
             else -> json.optJSONObject("item")
         }
         if (holder == null) {
-            diag += "holder=none"
-            emitDebug(diag, callback)
+            emitDebug(listOf("API_FAILURE", "holder=none") + diag, callback)
             return true
         }
-        val servers = holder.optJSONArray("servers")
-        val downloads = holder.optJSONArray("download_links")
-        diag += "servers=${servers?.length() ?: 0}"
         // Subtitles when the API provides them (shape: [{url, language}]).
         val subs = holder.optJSONArray("subtitles")
         if (subs != null) {
@@ -280,31 +334,44 @@ class TurkMoodProvider : MainAPI() {
                 subtitleCallback.invoke(SubtitleFile(slang, surl))
             }
         }
-        val seen = HashSet<String>()
-        var found = false
-        suspend fun resolve(arr: JSONArray?) {
+        // Merge servers + download links, ranked: reachable hosts first,
+        // download links next, MiraVD/Mwdy last (Cloudflare-walled).
+        val ranked = ArrayList<Triple<Int, Int, Pair<String, String>>>()
+        var order = 0
+        fun collect(arr: JSONArray?, isDownload: Boolean) {
             if (arr == null) return
             for (i in 0 until arr.length()) {
                 val o = arr.optJSONObject(i) ?: continue
                 val link = o.optString("url", "").trim()
                 if (link.isBlank() || !link.startsWith("http")) continue
-                if (!seen.add(link)) continue
-                if (loadExtractor(link, detailUrl, subtitleCallback, callback)) {
-                    found = true
+                val nm = o.optString("name", "").ifBlank {
+                    o.optString("quality", "").ifBlank { if (isDownload) "dl" else "srv" }
                 }
+                val rank = if (isDownload && serverRank(link) < 5) 4 else serverRank(link)
+                ranked += Triple(rank, order++, nm to link)
             }
         }
-        resolve(servers)
-        resolve(downloads)
+        collect(holder.optJSONArray("servers"), false)
+        collect(holder.optJSONArray("download_links"), true)
+        ranked.sortWith(compareBy({ it.first }, { it.second }))
+        val seen = HashSet<String>()
+        val outcomes = ArrayList<String>()
+        var found = false
+        for ((_, _, entry) in ranked) {
+            val (nm, link) = entry
+            if (!seen.add(link)) continue
+            val ok = runCatching { loadExtractor(link, detailUrl, subtitleCallback, callback) }.getOrNull() ?: false
+            outcomes += "$nm:${if (ok) "OK" else "FAIL"}"
+            if (ok) found = true
+        }
         if (!found) {
-            diag += "resolved=0"
-            emitDebug(diag, callback)
+            emitDebug(listOf("NO_PLAYABLE_SOURCE") + diag + listOf("tried=${outcomes.size}") + outcomes, callback)
             return true
         }
         return true
     }
 
-    /** Emits the collected stage markers as one playable debug source. */
+    /** Emits the collected stage markers as one diagnostic-only source. */
     private suspend fun emitDebug(diag: List<String>, callback: (ExtractorLink) -> Unit) {
         runCatching {
             callback(

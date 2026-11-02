@@ -13,7 +13,7 @@
 // If an episode/movie yields no servers, loadLinks emits one DEBUG
 // diagnostic source (Mux test stream) carrying stage markers, the same
 // diagnostic pattern used by the repo's EgyBest v1 provider.
-version = 7
+version = 8
 
 android {
     namespace = "com.turkmood"

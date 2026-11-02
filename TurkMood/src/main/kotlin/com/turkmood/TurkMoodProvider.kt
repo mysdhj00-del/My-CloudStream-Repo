@@ -37,6 +37,8 @@ import android.webkit.WebResourceRequest
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.webkit.WebChromeClient
+import android.webkit.ConsoleMessage
 import java.util.Collections
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
@@ -90,6 +92,10 @@ import java.util.concurrent.atomic.AtomicBoolean
  * v9: loadLinks wrapper catches Throwable (not just Exception);
  * WebView budget tightened (8s timeout / 10s latch); NO_PLAYABLE_SOURCE
  * now reports elapsed ms, so a too-slow loadLinks is visible.
+ * v10: time-boxed sniff (2nd attempt only if 1st failed fast) + broader
+ * media capture (mpd/mp4/webm/mov) + console-message sniffing; the
+ * leading theory for the empty list on v9 is now a player-side
+ * timeout/discard of the ~20s call, so v10 must complete fast.
  * DEBUG lines now carry a v8 marker so the phone proves which code ran.
  *
  * v7 (Faselhd WebView sniff, user-approved 2026-11-02): last resort
@@ -568,7 +574,7 @@ class TurkMoodProvider(private val appContext: Context? = null) : MainAPI() {
                         override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): android.webkit.WebResourceResponse? {
                             try {
                                 val u = request?.url?.toString() ?: ""
-                                if (u.contains(".m3u8")) found.add(u)
+                                if (u.contains(".m3u8") || u.contains(".mpd") || u.contains(".mp4") || u.contains(".webm") || u.contains(".mov")) found.add(u)
                             } catch (_: Exception) { }
                             return super.shouldInterceptRequest(view, request)
                         }
@@ -579,6 +585,16 @@ class TurkMoodProvider(private val appContext: Context? = null) : MainAPI() {
                                 graceRunnable = Runnable { finish() }
                                 mainHandler.postDelayed(graceRunnable!!, 3000L)
                             } catch (_: Exception) { }
+                        }
+                    }
+                    webView.webChromeClient = object : WebChromeClient() {
+                        override fun onConsoleMessage(msg: ConsoleMessage?): Boolean {
+                            try {
+                                val t = msg?.message() ?: ""
+                                val m = Regex("https?://[^\\s\"'<>]+?\\.(m3u8|mpd|mp4|webm|mov)([?#][^\\s\"'<>]*)?").findAll(t)
+                                for (hit in m) found.add(hit.value)
+                            } catch (_: Exception) { }
+                            return super.onConsoleMessage(msg)
                         }
                     }
                     // Invisible host: 1x1 off-screen dialog, decor fallback.
@@ -746,7 +762,7 @@ class TurkMoodProvider(private val appContext: Context? = null) : MainAPI() {
             // dig cannot open them (CF 403 / disabled embeds) and only
             // burns seconds before the sniff. Other hosts keep the dig.
             val host = hostOf(link)
-            if ((host.contains("miravd") || host.contains("mwdy")) && webviewAttempts < 2) {
+            if ((host.contains("miravd") || host.contains("mwdy")) && webviewAttempts < 2 && (webviewAttempts == 0 || System.currentTimeMillis() - startedAt < 8000)) {
                 webviewAttempts++
                 val (wlinks, wcode) = runCatching { sniffWithWebView(link, detailUrl) }.getOrDefault(emptySet<String>() to "err")
                 if (wlinks.isNotEmpty()) {
@@ -824,7 +840,7 @@ class TurkMoodProvider(private val appContext: Context? = null) : MainAPI() {
             callback(
                 newExtractorLink(
                     name,
-                    "DEBUG v9 | " + diag.joinToString(" | "),
+                    "DEBUG v10 | " + diag.joinToString(" | "),
                     "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8",
                     ExtractorLinkType.M3U8
                 ) {

@@ -7,6 +7,6 @@ import com.lagradost.cloudstream3.plugins.Plugin
 @CloudstreamPlugin
 class TurkMoodPlugin : Plugin() {
     override fun load(context: Context) {
-        registerMainAPI(TurkMoodProvider())
+        registerMainAPI(TurkMoodProvider(context))
     }
 }

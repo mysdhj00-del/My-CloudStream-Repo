@@ -87,6 +87,9 @@ import java.util.concurrent.atomic.AtomicBoolean
  * diagnostic could emit. Wrapper: any throwable becomes a visible
  * LOADLINKS_CRASH DEBUG source. Dig budget tightened to 12s / max 4.
  * v8: MiraVD/Mwdy skip the dig and go straight to WebView sniff;
+ * v9: loadLinks wrapper catches Throwable (not just Exception);
+ * WebView budget tightened (8s timeout / 10s latch); NO_PLAYABLE_SOURCE
+ * now reports elapsed ms, so a too-slow loadLinks is visible.
  * DEBUG lines now carry a v8 marker so the phone proves which code ran.
  *
  * v7 (Faselhd WebView sniff, user-approved 2026-11-02): last resort
@@ -605,7 +608,7 @@ class TurkMoodProvider(private val appContext: Context? = null) : MainAPI() {
                         } catch (_: Exception) { }
                     }
                     timeoutRunnable = Runnable { finish() }
-                    mainHandler.postDelayed(timeoutRunnable!!, 10000L)
+                    mainHandler.postDelayed(timeoutRunnable!!, 8000L)
                     webView.loadUrl(embedUrl, mapOf("Referer" to referer))
                 } catch (_: Exception) {
                     finish()
@@ -614,7 +617,7 @@ class TurkMoodProvider(private val appContext: Context? = null) : MainAPI() {
         } catch (_: Exception) {
             finish()
         }
-        latch.await(12, TimeUnit.SECONDS)
+        latch.await(10, TimeUnit.SECONDS)
         // Ensure cleanup even if the latch timed out without a finish.
         try { activity.runOnUiThread { cleanupOnUi() } } catch (_: Exception) { }
         return found to if (found.isNotEmpty()) "webview=${found.size}" else "webview-none"
@@ -630,7 +633,7 @@ class TurkMoodProvider(private val appContext: Context? = null) : MainAPI() {
         // failure becomes a visible DEBUG source instead of "no links".
         return try {
             loadLinksInner(data, isCasting, subtitleCallback, callback)
-        } catch (e: Exception) {
+        } catch (e: Throwable) {
             emitDebug(listOf("LOADLINKS_CRASH", e.javaClass.simpleName, (e.message ?: "nomsg").take(120)), callback)
             true
         }
@@ -809,7 +812,7 @@ class TurkMoodProvider(private val appContext: Context? = null) : MainAPI() {
             }
         }
         if (!found) {
-            emitDebug(listOf("NO_PLAYABLE_SOURCE") + diag + listOf("tried=${outcomes.size}") + outcomes, callback)
+            emitDebug(listOf("NO_PLAYABLE_SOURCE") + diag + listOf("tried=${outcomes.size}", "ms=${System.currentTimeMillis() - startedAt}") + outcomes, callback)
             return true
         }
         return true
@@ -821,7 +824,7 @@ class TurkMoodProvider(private val appContext: Context? = null) : MainAPI() {
             callback(
                 newExtractorLink(
                     name,
-                    "DEBUG v8 | " + diag.joinToString(" | "),
+                    "DEBUG v9 | " + diag.joinToString(" | "),
                     "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8",
                     ExtractorLinkType.M3U8
                 ) {

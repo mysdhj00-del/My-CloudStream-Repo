@@ -63,6 +63,11 @@ import org.json.JSONObject
  * P.A.C.K.E.R. eval scripts, extract direct media, follow one nested
  * iframe (bounded: 20s, max 8 dug servers). The 3isk watch-form POST
  * dance has no equivalent on this API and is NOT ported.
+ *
+ * v6 (2026-11-02): v5 reported on-device as 'no links found' with NO
+ * DEBUG source at all — meaning loadLinks died silently before the
+ * diagnostic could emit. Wrapper: any throwable becomes a visible
+ * LOADLINKS_CRASH DEBUG source. Dig budget tightened to 12s / max 4.
  */
 class TurkMoodProvider : MainAPI() {
     override var mainUrl = "https://turkmoodapi.xyz"
@@ -474,6 +479,22 @@ class TurkMoodProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
+        // v6: never die silently — if anything in the chain throws, the
+        // failure becomes a visible DEBUG source instead of "no links".
+        return try {
+            loadLinksInner(data, isCasting, subtitleCallback, callback)
+        } catch (e: Exception) {
+            emitDebug(listOf("LOADLINKS_CRASH", e.javaClass.simpleName, (e.message ?: "nomsg").take(120)), callback)
+            true
+        }
+    }
+
+    private suspend fun loadLinksInner(
+        data: String,
+        isCasting: Boolean,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
         // v2: dual-host API fallback + ranked server resolution +
         // structured diagnostics (API vs extractor vs Cloudflare block).
         val diag = mutableListOf<String>()
@@ -572,8 +593,8 @@ class TurkMoodProvider : MainAPI() {
             }
             // v5: loadExtractor has no MiraVD/Mwdy extractor — dig the
             // embed the 3isk way (referer chain + packer unpack). Bounded:
-            // 20s total, max 8 dug servers, so working titles never slow down.
-            if (dug < 8 && System.currentTimeMillis() - startedAt < 20000) {
+            // v6: 12s total, max 4 dug servers, so working titles never slow down.
+            if (dug < 4 && System.currentTimeMillis() - startedAt < 12000) {
                 dug++
                 val (links, code) = runCatching { digEmbed(link, detailUrl) }.getOrDefault(emptySet<String>() to "err")
                 if (links.isNotEmpty()) {

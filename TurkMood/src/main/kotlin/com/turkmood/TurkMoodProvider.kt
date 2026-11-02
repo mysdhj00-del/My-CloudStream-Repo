@@ -37,6 +37,7 @@ import android.webkit.WebResourceRequest
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.webkit.JavascriptInterface
 import android.webkit.WebChromeClient
 import android.webkit.ConsoleMessage
 import java.util.Collections
@@ -96,6 +97,11 @@ import java.util.concurrent.atomic.AtomicBoolean
  * media capture (mpd/mp4/webm/mov) + console-message sniffing; the
  * leading theory for the empty list on v9 is now a player-side
  * timeout/discard of the ~20s call, so v10 must complete fast.
+ * v11: panel-consensus warm-up sniff (host root -> same-WebView embed)
+ * + JS bridge (eval/html, double unpack) + disabled innerText check
+ * + app-context WebView fallback (never noactivity) + single-
+ * countdown latch; site-walk fallback deferred until warm-up
+ * reports cf1-disabled (panel priority: test warm-up first).
  * DEBUG lines now carry a v8 marker so the phone proves which code ran.
  *
  * v7 (Faselhd WebView sniff, user-approved 2026-11-02): last resort
@@ -511,56 +517,94 @@ class TurkMoodProvider(private val appContext: Context? = null) : MainAPI() {
     }
 
     /**
-     * v7: Faselhd-style WebView sniff, COROUTINE-FREE (our repo's CI
-     * rejects the coroutines library). Runs the embed in an invisible 1x1
-     * WebView on the UI thread and captures .m3u8 requests from the
-     * network layer, with the WebView's cookies. Only for MiraVD/Mwdy
-     * (the hosts plain HTTP cannot open). Bounded: 10s hard timeout,
-     * 3s grace after page finished, always destroyed. The loadLinks
-     * worker thread blocks on a latch (no coroutines). Returns
-     * (links, code) where code is webview=N, webview-none, noactivity
-     * or err.
+     * v11: panel-consensus warm-up sniff (7 of 8 panel voices; GPT-6 Luna
+     * dissented on bypass grounds and is reported as such). The v7-v10
+     * sniff loaded the embed as the FIRST navigation (empty
+     * document.referrer -> "disabled" stub) and died in 8-10s, before
+     * the Cloudflare challenge settles. v11 instead, in ONE WebView:
+     *   phase 1: load https://<host>/, wait onPageFinished or a 6s cap,
+     *     +2s grace, record cf_clearance presence (length only, never
+     *     the value) -> cf=yes/no;
+     *   phase 2: load the embed in the SAME WebView (document.referrer
+     *     = host root, cookies populated), sniff network (.m3u8/.mpd/
+     *     .mp4/.webm/.mov/.m4s) + console messages + JS bridge
+     *     (video.src, script .m3u8 regex, double packer unpack, and a
+     *     "disabled" innerText check), 15s hard timeout.
+     * Activity dialog WebView when an Activity is available, else a
+     * bare application-context WebView (never the v7-v10 "noactivity"
+     * exit - Gemini/Claude both build WebViews on app context).
+     * Single latch + AtomicBoolean single-countdown (gpt-oss fix).
+     * Returns (links, code): "warm" on success; on failure
+     * "warm-cf0/1-<disabled|err|timeout|none>".
      */
-    private fun sniffWithWebView(embedUrl: String, referer: String): Pair<Set<String>, String> {
-        val activity = appContext as? Activity ?: return emptySet<String>() to "noactivity"
-        if (activity.isFinishing) return emptySet<String>() to "noactivity"
+    private fun sniffWithWarmup(embedUrl: String, referer: String): Pair<Set<String>, String> {
+        val host = hostOf(embedUrl)
         val found = Collections.synchronizedSet(LinkedHashSet<String>())
         val latch = CountDownLatch(1)
-        val cleaned = AtomicBoolean(false)
+        val done = AtomicBoolean(false)
+        fun finish() {
+            if (done.compareAndSet(false, true)) latch.countDown()
+        }
+        val appCtx = appContext
+        val act = appCtx as? Activity
+        val dialogAct: Activity? = if (act != null && !act.isFinishing) act else null
+        val ctx: Context = when {
+            dialogAct != null -> dialogAct
+            appCtx != null && appCtx !is Activity -> appCtx
+            else -> return emptySet<String>() to "warm-noctx"
+        }
         var webViewRef: WebView? = null
         var dialogRef: Dialog? = null
         var decorRef: ViewGroup? = null
         var timeoutRunnable: Runnable? = null
         var graceRunnable: Runnable? = null
+        var capRunnable: Runnable? = null
         val mainHandler = Handler(Looper.getMainLooper())
-        // UI-thread only: remove callbacks, stop + destroy the WebView,
-        // dismiss the dialog, detach from decor. Idempotent.
+        val cleaned = AtomicBoolean(false)
         fun cleanupOnUi() {
             if (!cleaned.compareAndSet(false, true)) return
             try { timeoutRunnable?.let { mainHandler.removeCallbacks(it) } } catch (_: Exception) { }
             try { graceRunnable?.let { mainHandler.removeCallbacks(it) } } catch (_: Exception) { }
+            try { capRunnable?.let { mainHandler.removeCallbacks(it) } } catch (_: Exception) { }
             try { webViewRef?.stopLoading() } catch (_: Exception) { }
             try { webViewRef?.destroy() } catch (_: Exception) { }
             try { if (dialogRef?.isShowing == true) dialogRef?.dismiss() } catch (_: Exception) { }
             try { decorRef?.removeView(webViewRef) } catch (_: Exception) { }
         }
-        // Safe from any thread: cleanup on UI thread, then release latch.
-        fun finish() {
-            try {
-                if (Looper.myLooper() == Looper.getMainLooper()) {
-                    cleanupOnUi()
-                    latch.countDown()
-                } else {
-                    activity.runOnUiThread { cleanupOnUi(); latch.countDown() }
-                }
-            } catch (_: Exception) {
-                latch.countDown()
+        var phase = 1
+        var cfYes = false
+        var pageResult = "none"
+        var bridgeDone = false
+        fun mediaFromJsText(t: String): Set<String> {
+            val out = LinkedHashSet<String>()
+            out += extractMediaLinks(t)
+            var cur: String? = t
+            repeat(2) {
+                val u = cur?.let { unpackPacker(it) }
+                if (u == null) return@repeat
+                cur = u
+                out += extractMediaLinks(u)
             }
+            return out
         }
+        val bridgeJs = """
+            (function() {
+              try {
+                var _eval = window.eval;
+                window.eval = function(x) {
+                  try { Android.onEval(x); } catch(e) {}
+                  return _eval(x);
+                };
+              } catch(e) {}
+              setTimeout(function() {
+                try { Android.onHtml(document.documentElement.outerHTML.slice(0, 200000)); } catch(e) {}
+              }, 4000);
+            })();
+        """.trimIndent()
         try {
-            activity.runOnUiThread {
+            mainHandler.post {
                 try {
-                    val webView = WebView(activity)
+                    val webView = WebView(ctx)
                     webViewRef = webView
                     webView.settings.apply {
                         javaScriptEnabled = true
@@ -569,63 +613,124 @@ class TurkMoodProvider(private val appContext: Context? = null) : MainAPI() {
                         mediaPlaybackRequiresUserGesture = false
                         mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
                         blockNetworkImage = true
+                        userAgentString = "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36"
+                    }
+                    webView.addJavascriptInterface(object {
+                        @JavascriptInterface fun onEval(s: String) {
+                            try {
+                                val m = mediaFromJsText(s)
+                                if (m.isNotEmpty()) { found += m; finish() }
+                            } catch (_: Exception) { }
+                        }
+                        @JavascriptInterface fun onHtml(s: String) {
+                            try {
+                                val m = mediaFromJsText(s)
+                                if (m.isNotEmpty()) { found += m; finish() }
+                            } catch (_: Exception) { }
+                        }
+                    }, "Android")
+                    webView.webChromeClient = object : WebChromeClient() {
+                        override fun onConsoleMessage(msg: ConsoleMessage?): Boolean {
+                            try {
+                                val m = extractMediaLinks(msg?.message() ?: "")
+                                if (m.isNotEmpty()) { found += m; finish() }
+                            } catch (_: Exception) { }
+                            return super.onConsoleMessage(msg)
+                        }
+                    }
+                    fun goEmbed() {
+                        if (phase != 1 && phase != 2) return
+                        phase = 3
+                        try {
+                            cfYes = (CookieManager.getInstance().getCookie("https://$host/") ?: "").contains("cf_clearance")
+                        } catch (_: Exception) { }
+                        timeoutRunnable = Runnable {
+                            if (pageResult == "none") pageResult = "timeout"
+                            finish()
+                        }
+                        mainHandler.postDelayed(timeoutRunnable!!, 15000L)
+                        webView.loadUrl(embedUrl)
                     }
                     webView.webViewClient = object : WebViewClient() {
                         override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): android.webkit.WebResourceResponse? {
                             try {
                                 val u = request?.url?.toString() ?: ""
-                                if (u.contains(".m3u8") || u.contains(".mpd") || u.contains(".mp4") || u.contains(".webm") || u.contains(".mov")) found.add(u)
+                                if (u.contains(".m3u8") || u.contains(".mpd") || u.contains(".mp4") || u.contains(".webm") || u.contains(".mov") || u.contains(".m4s")) {
+                                    found.add(u)
+                                    finish()
+                                }
                             } catch (_: Exception) { }
                             return super.shouldInterceptRequest(view, request)
                         }
                         override fun onPageFinished(view: WebView?, url: String?) {
                             super.onPageFinished(view, url)
                             try {
-                                graceRunnable?.let { mainHandler.removeCallbacks(it) }
-                                graceRunnable = Runnable { finish() }
-                                mainHandler.postDelayed(graceRunnable!!, 3000L)
+                                val u = url ?: ""
+                                if (hostOf(u) != host) return
+                                if (phase == 1) {
+                                    phase = 2
+                                    graceRunnable = Runnable { goEmbed() }
+                                    mainHandler.postDelayed(graceRunnable!!, 2000L)
+                                } else if (phase == 3 && !bridgeDone) {
+                                    bridgeDone = true
+                                    try { view?.evaluateJavascript(bridgeJs, null) } catch (_: Exception) { }
+                                    try {
+                                        view?.evaluateJavascript("(function(){return document.body.innerText.substring(0,500)})()") { result ->
+                                            try {
+                                                if (result != null && result.contains("disabled", ignoreCase = true)) {
+                                                    pageResult = "disabled"
+                                                    finish()
+                                                }
+                                            } catch (_: Exception) { }
+                                        }
+                                    } catch (_: Exception) { }
+                                }
                             } catch (_: Exception) { }
                         }
-                    }
-                    webView.webChromeClient = object : WebChromeClient() {
-                        override fun onConsoleMessage(msg: ConsoleMessage?): Boolean {
+                        override fun onReceivedError(view: WebView?, request: WebResourceRequest?, error: android.webkit.WebResourceError?) {
+                            super.onReceivedError(view, request, error)
                             try {
-                                val t = msg?.message() ?: ""
-                                val m = Regex("https?://[^\\s\"'<>]+?\\.(m3u8|mpd|mp4|webm|mov)([?#][^\\s\"'<>]*)?").findAll(t)
-                                for (hit in m) found.add(hit.value)
+                                if (request?.isForMainFrame == true) {
+                                    if (phase == 3) {
+                                        pageResult = "err"
+                                        finish()
+                                    } else if (phase == 1) {
+                                        goEmbed()
+                                    }
+                                }
                             } catch (_: Exception) { }
-                            return super.onConsoleMessage(msg)
                         }
                     }
-                    // Invisible host: 1x1 off-screen dialog, decor fallback.
-                    try {
-                        val dialog = Dialog(activity)
-                        dialogRef = dialog
-                        dialog.setCancelable(false)
-                        dialog.setCanceledOnTouchOutside(false)
-                        dialog.requestWindowFeature(Window.FEATURE_NO_TITLE)
-                        dialog.window?.apply {
-                            setBackgroundDrawableResource(android.R.color.transparent)
-                            setDimAmount(0f)
-                            clearFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND)
-                            addFlags(WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE)
-                            attributes = attributes?.apply {
-                                width = 1; height = 1; x = -10000; y = -10000
-                                gravity = Gravity.START or Gravity.TOP
-                            }
-                        }
-                        dialog.setContentView(webView, ViewGroup.LayoutParams(1, 1))
-                        dialog.show()
-                    } catch (_: Exception) {
+                    if (dialogAct != null) {
                         try {
-                            val decor = activity.window?.decorView as? ViewGroup
-                            decorRef = decor
-                            decor?.addView(webView, ViewGroup.LayoutParams(1, 1))
-                        } catch (_: Exception) { }
+                            val dialog = Dialog(dialogAct)
+                            dialogRef = dialog
+                            dialog.setCancelable(false)
+                            dialog.setCanceledOnTouchOutside(false)
+                            dialog.requestWindowFeature(Window.FEATURE_NO_TITLE)
+                            dialog.window?.apply {
+                                setBackgroundDrawableResource(android.R.color.transparent)
+                                setDimAmount(0f)
+                                clearFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND)
+                                addFlags(WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE)
+                                attributes = attributes?.apply {
+                                    width = 1; height = 1; x = -10000; y = -10000
+                                    gravity = Gravity.START or Gravity.TOP
+                                }
+                            }
+                            dialog.setContentView(webView, ViewGroup.LayoutParams(1, 1))
+                            dialog.show()
+                        } catch (_: Exception) {
+                            try {
+                                val decor = dialogAct.window?.decorView as? ViewGroup
+                                decorRef = decor
+                                decor?.addView(webView, ViewGroup.LayoutParams(1, 1))
+                            } catch (_: Exception) { }
+                        }
                     }
-                    timeoutRunnable = Runnable { finish() }
-                    mainHandler.postDelayed(timeoutRunnable!!, 8000L)
-                    webView.loadUrl(embedUrl, mapOf("Referer" to referer))
+                    capRunnable = Runnable { if (phase == 1) goEmbed() }
+                    mainHandler.postDelayed(capRunnable!!, 6000L)
+                    webView.loadUrl("https://$host/")
                 } catch (_: Exception) {
                     finish()
                 }
@@ -633,10 +738,10 @@ class TurkMoodProvider(private val appContext: Context? = null) : MainAPI() {
         } catch (_: Exception) {
             finish()
         }
-        latch.await(10, TimeUnit.SECONDS)
-        // Ensure cleanup even if the latch timed out without a finish.
-        try { activity.runOnUiThread { cleanupOnUi() } } catch (_: Exception) { }
-        return found to if (found.isNotEmpty()) "webview=${found.size}" else "webview-none"
+        latch.await(28, TimeUnit.SECONDS)
+        try { mainHandler.post { cleanupOnUi() } } catch (_: Exception) { }
+        val code = if (found.isNotEmpty()) "warm" else "warm-cf${if (cfYes) 1 else 0}-$pageResult"
+        return found to code
     }
 
     override suspend fun loadLinks(
@@ -758,13 +863,14 @@ class TurkMoodProvider(private val appContext: Context? = null) : MainAPI() {
                 found = true
                 continue
             }
-            // v8: MiraVD/Mwdy go STRAIGHT to WebView sniff — the plain
-            // dig cannot open them (CF 403 / disabled embeds) and only
-            // burns seconds before the sniff. Other hosts keep the dig.
+            // v11 (panel consensus, 7/8 voices): MiraVD/Mwdy go to the
+            // warm-up sniff — host root first (CF settle + referrer),
+            // then the embed in the SAME WebView. The plain dig cannot
+            // open them and only burns seconds. Other hosts keep dig.
             val host = hostOf(link)
             if ((host.contains("miravd") || host.contains("mwdy")) && webviewAttempts < 2 && (webviewAttempts == 0 || System.currentTimeMillis() - startedAt < 8000)) {
                 webviewAttempts++
-                val (wlinks, wcode) = runCatching { sniffWithWebView(link, detailUrl) }.getOrDefault(emptySet<String>() to "err")
+                val (wlinks, wcode) = runCatching { sniffWithWarmup(link, detailUrl) }.getOrDefault(emptySet<String>() to "err")
                 if (wlinks.isNotEmpty()) {
                     for (media in wlinks) {
                         val isHls = media.contains(".m3u8")
@@ -789,10 +895,10 @@ class TurkMoodProvider(private val appContext: Context? = null) : MainAPI() {
                             )
                         }
                     }
-                    outcomes += "$nm:WEBVIEW(${wlinks.size})"
+                    outcomes += "$nm:WARMUP(${wlinks.size})"
                     found = true
                 } else {
-                    outcomes += "$nm:FAIL+webview-$wcode"
+                    outcomes += "$nm:FAIL+$wcode"
                 }
             } else if (dug < 4 && System.currentTimeMillis() - startedAt < 12000) {
                 dug++
@@ -840,7 +946,7 @@ class TurkMoodProvider(private val appContext: Context? = null) : MainAPI() {
             callback(
                 newExtractorLink(
                     name,
-                    "DEBUG v10 | " + diag.joinToString(" | "),
+                    "DEBUG v11 | " + diag.joinToString(" | "),
                     "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8",
                     ExtractorLinkType.M3U8
                 ) {

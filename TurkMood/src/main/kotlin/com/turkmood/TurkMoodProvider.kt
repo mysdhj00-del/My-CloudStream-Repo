@@ -55,6 +55,14 @@ import org.json.JSONObject
  * -> scdns.io m3u8, WebView-based in the native app) is NOT in v2: the
  * API exposes no FaselHD page URL per title, so that chain is still
  * research, not a shippable plain-HTTP path.
+ *
+ * v5 (3isk transfer, 2026-11-02): the Arabic repo's 3isk provider
+ * (Abodabodd/re-3arabi) plays these same MiraVD/Mwdy files on the
+ * phone, so its embed dig is ported here: for every server
+ * loadExtractor fails on, fetch the embed with a referer, unpack
+ * P.A.C.K.E.R. eval scripts, extract direct media, follow one nested
+ * iframe (bounded: 20s, max 8 dug servers). The 3isk watch-form POST
+ * dance has no equivalent on this API and is NOT ported.
  */
 class TurkMoodProvider : MainAPI() {
     override var mainUrl = "https://turkmoodapi.xyz"
@@ -274,6 +282,192 @@ class TurkMoodProvider : MainAPI() {
 
     // ---------- links ----------
 
+    // ---------- v5: 3isk-style embed dig (ported from the Arabic repo's
+    // 3isk provider, Abodabodd/re-3arabi, which plays these same
+    // MiraVD/Mwdy files on the phone) ----------
+    // The site's own watch chain reaches host embeds through a POST dance
+    // and then digs them: fetch with a referer chain, unpack P.A.C.K.E.R.
+    // eval scripts, extract direct media, follow one nested iframe. The
+    // POST dance itself has no equivalent on TurkMood's API (no watch
+    // forms), so v5 ports the DIG half: referer-chained fetch + packer
+    // unpack + media regex + nested iframe, applied to every server
+    // loadExtractor fails on (MiraVD/Mwdy first among them).
+
+    private fun jsStringUnescape(s: String): String {
+        val regex = Regex("""\\u[0-9a-fA-F]{4}|\\x[0-9a-fA-F]{2}|\\.|\\n|\\r|\\t""")
+        return regex.replace(s) { m ->
+            val esc = m.value
+            try {
+                when {
+                    esc.startsWith("\\x") -> esc.substring(2).toInt(16).toChar().toString()
+                    esc.startsWith("\\u") -> esc.substring(2).toInt(16).toChar().toString()
+                    esc == "\\n" -> "\n"
+                    esc == "\\r" -> "\r"
+                    esc == "\\t" -> "\t"
+                    esc == "\\'" -> "'"
+                    esc == "\\\"" -> "\""
+                    esc == "\\\\" -> "\\"
+                    else -> if (esc.length >= 2 && esc[0] == '\\') esc.substring(1) else esc
+                }
+            } catch (_: Exception) {
+                esc
+            }
+        }
+    }
+
+    private fun intToBase36(n0: Int): String {
+        if (n0 == 0) return "0"
+        var n = n0
+        val chars = "0123456789abcdefghijklmnopqrstuvwxyz"
+        val sb = StringBuilder()
+        while (n > 0) {
+            sb.append(chars[n % 36])
+            n /= 36
+        }
+        return sb.reverse().toString()
+    }
+
+    private fun parseJsStringAt(text: String, idxInit: Int): Pair<String?, Int> {
+        var idx = idxInit
+        if (idx >= text.length) return Pair(null, idx)
+        val quote = text[idx]
+        if (quote != '"' && quote != '\'') return Pair(null, idx)
+        idx += 1
+        val out = StringBuilder()
+        while (idx < text.length) {
+            val ch = text[idx]
+            if (ch == '\\') {
+                if (idx + 1 < text.length) {
+                    out.append(text.substring(idx, idx + 2))
+                    idx += 2
+                } else {
+                    idx++
+                }
+            } else if (ch == quote) {
+                return Pair(jsStringUnescape(out.toString()), idx + 1)
+            } else {
+                out.append(ch)
+                idx++
+            }
+        }
+        return Pair(null, idx)
+    }
+
+    private fun findMatchingBrace(text: String, startIdx: Int): Int {
+        if (startIdx < 0 || startIdx >= text.length || text[startIdx] != '{') return -1
+        var depth = 0
+        var i = startIdx
+        while (i < text.length) {
+            val ch = text[i]
+            if (ch == '{') depth++
+            else if (ch == '}') {
+                depth--
+                if (depth == 0) return i
+            }
+            i++
+        }
+        return -1
+    }
+
+    /** Unpacks one Dean Edwards P.A.C.K.E.R. eval block; null if not packed. */
+    private fun unpackPacker(evalText: String): String? {
+        try {
+            val startFn = evalText.indexOf("function(p,a,c,k,e,d)")
+            if (startFn == -1) return null
+            val braceOpen = evalText.indexOf('{', startFn)
+            if (braceOpen == -1) return null
+            val braceClose = findMatchingBrace(evalText, braceOpen)
+            if (braceClose == -1) return null
+            val argsStart = evalText.indexOf('(', braceClose)
+            if (argsStart == -1) return null
+            var i = argsStart + 1
+            while (i < evalText.length && evalText[i].isWhitespace()) i++
+            val (pVal, newI) = parseJsStringAt(evalText, i); i = newI
+            if (pVal == null) return null
+            while (i < evalText.length && (evalText[i].isWhitespace() || evalText[i] == ',')) i++
+            val aMatch = Regex("""\d+""").find(evalText.substring(i)) ?: return null
+            i += aMatch.range.last + 1
+            while (i < evalText.length && (evalText[i].isWhitespace() || evalText[i] == ',')) i++
+            val cMatch = Regex("""\d+""").find(evalText.substring(i)) ?: return null
+            val cVal = cMatch.value.toInt()
+            i += cMatch.range.last + 1
+            while (i < evalText.length && (evalText[i].isWhitespace() || evalText[i] == ',')) i++
+            val kList = mutableListOf<String>()
+            if (i < evalText.length && (evalText[i] == '"' || evalText[i] == '\'')) {
+                val (kStr, _) = parseJsStringAt(evalText, i)
+                if (kStr != null) kList.addAll(kStr.split("|"))
+            } else {
+                val m2 = Regex("""(['"])(.*?)\1\s*\.split\s*\(\s*['"]\|['"]\s*\)""", RegexOption.DOT_MATCHES_ALL).find(evalText)
+                if (m2 != null) kList.addAll(m2.groupValues[2].split("|"))
+            }
+            var p = pVal
+            for (idx in cVal - 1 downTo 0) {
+                val key = intToBase36(idx)
+                if (idx < kList.size && kList[idx].isNotEmpty()) {
+                    p = Regex("\\b" + Regex.escape(key) + "\\b").replace(p ?: "") { kList[idx] }
+                }
+            }
+            return p
+        } catch (_: Exception) {
+            return null
+        }
+    }
+
+    private val mediaRegex =
+        Regex("""(https?://[^\s"']+\.(?:m3u8|mp4|webm|mov)[^\s"']*)""", RegexOption.IGNORE_CASE)
+
+    /** Direct media links in a page body, including P.A.C.K.E.R.-packed evals. */
+    private fun extractMediaLinks(text: String): Set<String> {
+        val out = LinkedHashSet<String>()
+        mediaRegex.findAll(text).forEach { out.add(it.groupValues[1]) }
+        try {
+            val doc = org.jsoup.Jsoup.parse(text)
+            for (s in doc.select("script")) {
+                val content = s.data().ifBlank { s.html() }
+                if (!content.contains("eval(")) continue
+                val m = Regex("""eval\s*\(\s*function\s*\(\s*p\s*,\s*a\s*,\s*c\s*,\s*k\s*,\s*e\s*,\s*d\s*\)\s*\{""").find(content) ?: continue
+                val start = m.range.first
+                val sample = if (content.length > start + 10000) content.substring(start, start + 10000) else content.substring(start)
+                val unpacked = unpackPacker(sample) ?: continue
+                mediaRegex.findAll(unpacked).forEach { out.add(it.groupValues[1]) }
+            }
+        } catch (_: Exception) {
+        }
+        return out
+    }
+
+    /**
+     * 3isk-style dig of one host embed page: fetch with a referer, extract
+     * direct media (incl. packed evals), follow one nested iframe with the
+     * embed as referer. Returns (links, code) where code is dig=N, cf,
+     * disabled, nodirect or err.
+     */
+    private suspend fun digEmbed(embedUrl: String, referer: String): Pair<Set<String>, String> {
+        val out = LinkedHashSet<String>()
+        val pageHeaders = mapOf(
+            "User-Agent" to "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36",
+            "Accept" to "text/html,application/xhtml+xml"
+        )
+        val r1 = runCatching { app.get(embedUrl, headers = pageHeaders, referer = referer) }.getOrNull() ?: return emptySet<String>() to "err"
+        val t1 = runCatching { r1.text }.getOrNull() ?: return emptySet<String>() to "err"
+        if (t1.contains("Just a moment", ignoreCase = true) || t1.contains("challenges.cloudflare.com")) return emptySet<String>() to "cf"
+        if (t1.contains("Embeds disabled", ignoreCase = true)) return emptySet<String>() to "disabled"
+        out += extractMediaLinks(t1)
+        try {
+            val doc = org.jsoup.Jsoup.parse(t1)
+            val nested = doc.select("iframe").mapNotNull { it.attr("src").ifBlank { null } }.firstOrNull { it.startsWith("http") }
+            if (nested != null) {
+                val r2 = runCatching { app.get(nested, headers = pageHeaders, referer = embedUrl) }.getOrNull()
+                val t2 = r2?.let { runCatching { it.text }.getOrNull() }
+                if (t2 != null && !t2.contains("Just a moment", ignoreCase = true) && !t2.contains("challenges.cloudflare.com") && !t2.contains("Embeds disabled", ignoreCase = true)) {
+                    out += extractMediaLinks(t2)
+                }
+            }
+        } catch (_: Exception) {
+        }
+        return out to if (out.isNotEmpty()) "dig=${out.size}" else "nodirect"
+    }
+
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -365,12 +559,52 @@ class TurkMoodProvider : MainAPI() {
         val seen = HashSet<String>()
         val outcomes = ArrayList<String>()
         var found = false
+        val startedAt = System.currentTimeMillis()
+        var dug = 0
         for ((_, _, entry) in ranked) {
             val (nm, link) = entry
             if (!seen.add(link)) continue
             val ok = runCatching { loadExtractor(link, detailUrl, subtitleCallback, callback) }.getOrNull() ?: false
-            outcomes += "$nm:${if (ok) "OK" else "FAIL"}"
-            if (ok) found = true
+            if (ok) {
+                outcomes += "$nm:OK"
+                found = true
+                continue
+            }
+            // v5: loadExtractor has no MiraVD/Mwdy extractor — dig the
+            // embed the 3isk way (referer chain + packer unpack). Bounded:
+            // 20s total, max 8 dug servers, so working titles never slow down.
+            if (dug < 8 && System.currentTimeMillis() - startedAt < 20000) {
+                dug++
+                val (links, code) = runCatching { digEmbed(link, detailUrl) }.getOrDefault(emptySet<String>() to "err")
+                if (links.isNotEmpty()) {
+                    for (media in links) {
+                        val isHls = media.contains(".m3u8")
+                        runCatching {
+                            callback(
+                                newExtractorLink(
+                                    name,
+                                    nm,
+                                    media,
+                                    if (isHls) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                                ) {
+                                    this.referer = link
+                                    this.quality = Qualities.Unknown.value
+                                    this.headers = mapOf(
+                                        "User-Agent" to "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36",
+                                        "Referer" to link
+                                    )
+                                }
+                            )
+                        }
+                    }
+                    outcomes += "$nm:DIG(${links.size})"
+                    found = true
+                } else {
+                    outcomes += "$nm:FAIL+$code"
+                }
+            } else {
+                outcomes += "$nm:FAIL"
+            }
         }
         if (!found) {
             emitDebug(listOf("NO_PLAYABLE_SOURCE") + diag + listOf("tried=${outcomes.size}") + outcomes, callback)

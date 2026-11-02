@@ -23,6 +23,24 @@ import com.lagradost.cloudstream3.utils.loadExtractor
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import org.json.JSONArray
 import org.json.JSONObject
+import android.app.Activity
+import android.app.Dialog
+import android.content.Context
+import android.os.Handler
+import android.os.Looper
+import android.view.Gravity
+import android.view.ViewGroup
+import android.view.Window
+import android.view.WindowManager
+import android.webkit.CookieManager
+import android.webkit.WebResourceRequest
+import android.webkit.WebSettings
+import android.webkit.WebView
+import android.webkit.WebViewClient
+import java.util.Collections
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * TurkMood provider for CloudStream 3.
@@ -68,8 +86,16 @@ import org.json.JSONObject
  * DEBUG source at all — meaning loadLinks died silently before the
  * diagnostic could emit. Wrapper: any throwable becomes a visible
  * LOADLINKS_CRASH DEBUG source. Dig budget tightened to 12s / max 4.
+ *
+ * v7 (Faselhd WebView sniff, user-approved 2026-11-02): last resort
+ * for MiraVD/Mwdy only — invisible 1x1 WebView on the UI thread
+ * captures .m3u8 from the network layer, emitted with WebView
+ * cookies + embed referer. COROUTINE-FREE (our CI rejects the coroutines library):
+ * Handler + CountDownLatch, 10s timeout + 3s post-load grace,
+ * always destroyed. Plugin passes its Context to the provider so
+ * the WebView has an Activity. All other hosts unchanged.
  */
-class TurkMoodProvider : MainAPI() {
+class TurkMoodProvider(private val appContext: Context? = null) : MainAPI() {
     override var mainUrl = "https://turkmoodapi.xyz"
     override var name = "TurkMood"
     override var lang = "ar"
@@ -473,6 +499,125 @@ class TurkMoodProvider : MainAPI() {
         return out to if (out.isNotEmpty()) "dig=${out.size}" else "nodirect"
     }
 
+    /**
+     * v7: Faselhd-style WebView sniff, COROUTINE-FREE (our repo's CI
+     * rejects the coroutines library). Runs the embed in an invisible 1x1
+     * WebView on the UI thread and captures .m3u8 requests from the
+     * network layer, with the WebView's cookies. Only for MiraVD/Mwdy
+     * (the hosts plain HTTP cannot open). Bounded: 10s hard timeout,
+     * 3s grace after page finished, always destroyed. The loadLinks
+     * worker thread blocks on a latch (no coroutines). Returns
+     * (links, code) where code is webview=N, webview-none, noactivity
+     * or err.
+     */
+    private fun sniffWithWebView(embedUrl: String, referer: String): Pair<Set<String>, String> {
+        val activity = appContext as? Activity ?: return emptySet<String>() to "noactivity"
+        if (activity.isFinishing) return emptySet<String>() to "noactivity"
+        val found = Collections.synchronizedSet(LinkedHashSet<String>())
+        val latch = CountDownLatch(1)
+        val cleaned = AtomicBoolean(false)
+        var webViewRef: WebView? = null
+        var dialogRef: Dialog? = null
+        var decorRef: ViewGroup? = null
+        var timeoutRunnable: Runnable? = null
+        var graceRunnable: Runnable? = null
+        val mainHandler = Handler(Looper.getMainLooper())
+        // UI-thread only: remove callbacks, stop + destroy the WebView,
+        // dismiss the dialog, detach from decor. Idempotent.
+        fun cleanupOnUi() {
+            if (!cleaned.compareAndSet(false, true)) return
+            try { timeoutRunnable?.let { mainHandler.removeCallbacks(it) } } catch (_: Exception) { }
+            try { graceRunnable?.let { mainHandler.removeCallbacks(it) } } catch (_: Exception) { }
+            try { webViewRef?.stopLoading() } catch (_: Exception) { }
+            try { webViewRef?.destroy() } catch (_: Exception) { }
+            try { if (dialogRef?.isShowing == true) dialogRef?.dismiss() } catch (_: Exception) { }
+            try { decorRef?.removeView(webViewRef) } catch (_: Exception) { }
+        }
+        // Safe from any thread: cleanup on UI thread, then release latch.
+        fun finish() {
+            try {
+                if (Looper.myLooper() == Looper.getMainLooper()) {
+                    cleanupOnUi()
+                    latch.countDown()
+                } else {
+                    activity.runOnUiThread { cleanupOnUi(); latch.countDown() }
+                }
+            } catch (_: Exception) {
+                latch.countDown()
+            }
+        }
+        try {
+            activity.runOnUiThread {
+                try {
+                    val webView = WebView(activity)
+                    webViewRef = webView
+                    webView.settings.apply {
+                        javaScriptEnabled = true
+                        domStorageEnabled = true
+                        databaseEnabled = true
+                        mediaPlaybackRequiresUserGesture = false
+                        mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+                        blockNetworkImage = true
+                    }
+                    webView.webViewClient = object : WebViewClient() {
+                        override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): android.webkit.WebResourceResponse? {
+                            try {
+                                val u = request?.url?.toString() ?: ""
+                                if (u.contains(".m3u8")) found.add(u)
+                            } catch (_: Exception) { }
+                            return super.shouldInterceptRequest(view, request)
+                        }
+                        override fun onPageFinished(view: WebView?, url: String?) {
+                            super.onPageFinished(view, url)
+                            try {
+                                graceRunnable?.let { mainHandler.removeCallbacks(it) }
+                                graceRunnable = Runnable { finish() }
+                                mainHandler.postDelayed(graceRunnable!!, 3000L)
+                            } catch (_: Exception) { }
+                        }
+                    }
+                    // Invisible host: 1x1 off-screen dialog, decor fallback.
+                    try {
+                        val dialog = Dialog(activity)
+                        dialogRef = dialog
+                        dialog.setCancelable(false)
+                        dialog.setCanceledOnTouchOutside(false)
+                        dialog.requestWindowFeature(Window.FEATURE_NO_TITLE)
+                        dialog.window?.apply {
+                            setBackgroundDrawableResource(android.R.color.transparent)
+                            setDimAmount(0f)
+                            clearFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND)
+                            addFlags(WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE)
+                            attributes = attributes?.apply {
+                                width = 1; height = 1; x = -10000; y = -10000
+                                gravity = Gravity.START or Gravity.TOP
+                            }
+                        }
+                        dialog.setContentView(webView, ViewGroup.LayoutParams(1, 1))
+                        dialog.show()
+                    } catch (_: Exception) {
+                        try {
+                            val decor = activity.window?.decorView as? ViewGroup
+                            decorRef = decor
+                            decor?.addView(webView, ViewGroup.LayoutParams(1, 1))
+                        } catch (_: Exception) { }
+                    }
+                    timeoutRunnable = Runnable { finish() }
+                    mainHandler.postDelayed(timeoutRunnable!!, 10000L)
+                    webView.loadUrl(embedUrl, mapOf("Referer" to referer))
+                } catch (_: Exception) {
+                    finish()
+                }
+            }
+        } catch (_: Exception) {
+            finish()
+        }
+        latch.await(12, TimeUnit.SECONDS)
+        // Ensure cleanup even if the latch timed out without a finish.
+        try { activity.runOnUiThread { cleanupOnUi() } } catch (_: Exception) { }
+        return found to if (found.isNotEmpty()) "webview=${found.size}" else "webview-none"
+    }
+
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -582,6 +727,7 @@ class TurkMoodProvider : MainAPI() {
         var found = false
         val startedAt = System.currentTimeMillis()
         var dug = 0
+        var webviewAttempts = 0
         for ((_, _, entry) in ranked) {
             val (nm, link) = entry
             if (!seen.add(link)) continue
@@ -621,7 +767,44 @@ class TurkMoodProvider : MainAPI() {
                     outcomes += "$nm:DIG(${links.size})"
                     found = true
                 } else {
-                    outcomes += "$nm:FAIL+$code"
+                    // v7: last resort for MiraVD/Mwdy only — WebView sniff
+                    // (Faselhd pattern, coroutine-free). Max 2 attempts.
+                    val host = hostOf(link)
+                    if ((host.contains("miravd") || host.contains("mwdy")) && webviewAttempts < 2) {
+                        webviewAttempts++
+                        val (wlinks, wcode) = runCatching { sniffWithWebView(link, detailUrl) }.getOrDefault(emptySet<String>() to "err")
+                        if (wlinks.isNotEmpty()) {
+                            for (media in wlinks) {
+                                val isHls = media.contains(".m3u8")
+                                val cookies = runCatching { CookieManager.getInstance().getCookie(media) ?: CookieManager.getInstance().getCookie(link) ?: "" }.getOrDefault("")
+                                runCatching {
+                                    callback(
+                                        newExtractorLink(
+                                            name,
+                                            nm,
+                                            media,
+                                            if (isHls) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                                        ) {
+                                            this.referer = link
+                                            this.quality = Qualities.Unknown.value
+                                            val hdrs = mutableMapOf(
+                                                "User-Agent" to "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36",
+                                                "Referer" to link
+                                            )
+                                            if (cookies.isNotBlank()) hdrs["Cookie"] = cookies
+                                            this.headers = hdrs
+                                        }
+                                    )
+                                }
+                            }
+                            outcomes += "$nm:WEBVIEW(${wlinks.size})"
+                            found = true
+                        } else {
+                            outcomes += "$nm:FAIL+$code+$wcode"
+                        }
+                    } else {
+                        outcomes += "$nm:FAIL+$code"
+                    }
                 }
             } else {
                 outcomes += "$nm:FAIL"

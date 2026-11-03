@@ -862,12 +862,21 @@ class WeCimaMobileProvider : MainAPI() {
         return null
     }
 
+    /** HLS playlists on these hosts hide behind .txt names and /hls*
+     * path segments (verified live: .../hls3/.../master.txt serves
+     * application/vnd.apple.mpegurl, referer-gated, no cookies
+     * needed). Emitting one as VIDEO makes the player fail with
+     * ERROR_CODE_PARSING_CONTAINER_UNSUPPORTED (3003) — the type,
+     * not the URL, is the bug. */
+    private fun isHlsUrl(url: String): Boolean =
+        url.contains(".m3u8") || url.contains("/hls") || url.contains("master.txt")
+
     /** Emits one direct media URL found inside an embed page. */
     private suspend fun emitDirect(url: String, referer: String, callback: (ExtractorLink) -> Unit) {
         callback(
             newExtractorLink(
                 name, name, url,
-                if (url.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                if (isHlsUrl(url)) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
             ) {
                 this.referer = referer
                 this.quality = Qualities.Unknown.value

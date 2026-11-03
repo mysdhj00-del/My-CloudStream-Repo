@@ -377,9 +377,10 @@ class WeCimaMobileProvider : MainAPI() {
         // episode list. Falls through to the film response when the
         // set has < 2 episodes.
         if ((url.startsWith(wpUrl) || url.startsWith(wpAltUrl)) &&
-            Regex("""حلقة\s*-?\s*\d{1,4}""").containsMatchIn(decode(url))
+            (Regex("""حلقة\s*-?\s*\d{1,4}""").containsMatchIn(decode(url)) ||
+                Regex("""حلقة\s*-?\s*\d{1,4}""").containsMatchIn(title))
         ) {
-            wpEpisodeSeries(url, poster, plot, anime)?.let { return it }
+            wpEpisodeSeries(url, title, poster, plot, anime)?.let { return it }
         }
 
         return if (url.contains("/episode/")) {
@@ -451,7 +452,7 @@ class WeCimaMobileProvider : MainAPI() {
             ) {}
         } else {
             if (Regex("""حلقة\s*-?\s*\d{1,4}""").containsMatchIn(slug)) {
-                wpEpisodeSeries(url, null, null, anime)?.let { return it }
+                wpEpisodeSeries(url, null, null, null, anime)?.let { return it }
             }
             newMovieLoadResponse(
                 clean.ifBlank { url }, url,
@@ -462,31 +463,42 @@ class WeCimaMobileProvider : MainAPI() {
     }
 
     /** Groups a WP episode post into its series via the open WP REST
-     * API. The site hosts only a few episode posts per series on WP
-     * (verified live: سيدو وحورية = E1-E4 + E7/E8, E5/E6/E9/E10 404),
-     * its /series/ hub pages list other shows' latest episodes, and
-     * WP search does not paginate — so the REST post search is the
+     * API. WP episode slugs are unreliable identifiers: long Arabic
+     * titles get TRUNCATED (verified live: طالع نازل subtitle posts
+     * lose the word الحلقة entirely, ending in a bare -N), and
+     * /series/ hub pages list other shows' latest episodes while WP
+     * search does not paginate — so REST + TITLE matching is the
      * only source returning the series' whole WP episode set.
+     * The series identity comes from the post TITLE (series part
+     * before الحلقة N), and candidates match when their series part
+     * equals it or differs only by season words (الموسم الاول...),
+     * which is what separates طالع نازل from طالع نازل: الحب اللي كان
+     * while still admitting E4, whose title drops الموسم الاول.
      * Returns null when the set has < 2 episodes, so the caller
-     * keeps the single-film response: this can never make a title
-     * worse. Episode data is the WP post URL, which loadLinks
-     * already plays through its WP fallback. */
+     * keeps the single-film response. */
     private suspend fun wpEpisodeSeries(
-        url: String, poster: String?, plot: String?, anime: Boolean
+        url: String, displayTitle: String?, poster: String?, plot: String?, anime: Boolean
     ): LoadResponse? {
-        val slugDec = decode(url.trimEnd('/').substringAfterLast("/"))
-        val stem = slugDec.substringBefore("-الحلقة").substringBefore("-حلقة")
-        val seriesTitle = slugDec.replace('-', ' ')
-            .removePrefix("مشاهدة مسلسل ").removePrefix("مشاهدة ").trim()
-            .substringBefore(" الحلقة ").substringBefore(" حلقة ").trim()
-            .removeSuffix("مترجمة").removeSuffix("مترجم").trim()
-        if (seriesTitle.isBlank() || stem.isBlank()) return null
+        val slugWords = decode(url.trimEnd('/').substringAfterLast("/")).replace('-', ' ')
+        val tappedTitle = displayTitle?.ifBlank { null } ?: slugWords
+        if (Regex("""حلقة\s*-?\s*\d{1,4}""").find(tappedTitle) == null) return null
+        val seriesTitle = seriesPartOf(tappedTitle)
+        if (seriesTitle.isBlank()) return null
+        val seasonWords = setOf(
+            "الموسم", "الاول", "الثاني", "الثالث", "الرابع", "الخامس",
+            "السادس", "السابع", "الثامن", "التاسع", "العاشر",
+            "الحادي", "عشر"
+        )
+        val query = seriesTitle.split(" ")
+            .filter { it !in seasonWords && it.toIntOrNull() == null }
+            .joinToString(" ").ifBlank { seriesTitle }
+        val tappedNorm = normSeries(seriesTitle)
         val byKey = LinkedHashMap<String, Episode>()
         for (page in 1..2) {
             val body = runCatching {
                 app.get(
                     "$wpUrl/wp-json/wp/v2/posts?search=" +
-                        java.net.URLEncoder.encode(seriesTitle, "UTF-8") +
+                        java.net.URLEncoder.encode(query, "UTF-8") +
                         "&per_page=100&page=$page",
                     headers = browserHeaders
                 ).text
@@ -496,11 +508,15 @@ class WeCimaMobileProvider : MainAPI() {
             var added = 0
             for (i in 0 until arr.length()) {
                 val obj = arr.optJSONObject(i) ?: continue
-                val postSlug = decode(obj.optString("slug"))
-                if (!postSlug.startsWith(stem)) continue
-                val num = Regex("""حلقة\s*-?\s*(\d{1,4})""").find(postSlug)
+                val postTitle = obj.optJSONObject("title")?.optString("rendered")
+                    ?.replace(Regex("<[^>]+>"), "")
+                    ?.replace(Regex("&#\\d+;"), "")
+                    ?.replace("&amp;", "&")?.trim() ?: continue
+                val num = Regex("""حلقة\s*-?\s*(\d{1,4})""").find(postTitle)
                     ?.groupValues?.get(1)?.toIntOrNull() ?: continue
-                val season = seasonOf(postSlug)
+                val candSeries = seriesPartOf(postTitle)
+                if (!seriesPartMatches(tappedNorm, normSeries(candSeries))) continue
+                val season = seasonOf(postTitle)
                 val key = "$season:$num"
                 if (byKey.containsKey(key)) continue
                 byKey[key] = newEpisode("$wpUrl/" + obj.optString("slug") + "/") {
@@ -525,6 +541,46 @@ class WeCimaMobileProvider : MainAPI() {
             this.posterUrl = poster
             this.plot = plot
         }
+    }
+
+    /** Series part of an episode title: strip the مشاهدة/مسلسل
+     * prefix, then everything from the episode word on (which also
+     * cuts the site suffix that follows it). */
+    private fun seriesPartOf(title: String): String {
+        var t = title.trim()
+            .removePrefix("مشاهدة مسلسل ").removePrefix("مشاهدة ").removePrefix("مسلسل ")
+            .trim()
+        t = t.substringBefore(" الحلقة ").substringBefore(" حلقة ").trim()
+        return t
+    }
+
+    /** Normalizes a series part for comparison: alef variants,
+     * ة→ه, and punctuation/spacing dropped. */
+    private fun normSeries(s: String): String =
+        s.replace("أ", "ا").replace("إ", "ا").replace("آ", "ا").replace("ة", "ه")
+            .replace(" ", "").replace("-", "").replace(":", "")
+            .replace("–", "").replace("_", "").replace("&", "")
+            .replace("\"", "").replace("'", "")
+
+    /** True when two normalized series parts denote the same series:
+     * equal, or one is a prefix of the other with the difference
+     * consisting ONLY of season words (الموسم + ordinal). */
+    private fun seriesPartMatches(tapped: String, cand: String): Boolean {
+        if (tapped == cand) return true
+        val seasonBits = listOf(
+            "الحاديعشر", "الثانيعشر", "الموسم", "الاول", "الثاني",
+            "الثالث", "الرابع", "الخامس", "السادس", "السابع",
+            "الثامن", "التاسع", "العاشر"
+        )
+        fun seasonOnly(extra: String): Boolean {
+            var e = extra
+            for (w in seasonBits) e = e.replace(w, "")
+            e = e.replace(Regex("\\d+"), "")
+            return e.isEmpty()
+        }
+        if (cand.startsWith(tapped)) return seasonOnly(cand.substring(tapped.length))
+        if (tapped.startsWith(cand)) return seasonOnly(tapped.substring(cand.length))
+        return false
     }
 
     // ---------- playback ----------

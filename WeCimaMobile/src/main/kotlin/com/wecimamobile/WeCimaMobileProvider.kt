@@ -72,7 +72,8 @@ import org.jsoup.nodes.Element
  *   found, so a failure names its own stage.
  */
 class WeCimaMobileProvider : MainAPI() {
-    override var mainUrl = "https://wecima.mobile"
+    // v2 (2026-11-03): operator moved the mobile theme to weciema.net.
+    override var mainUrl = "https://weciema.net"
     override var name = "WeCima"
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries, TvType.Anime)
     override var lang = "ar"
@@ -438,7 +439,7 @@ class WeCimaMobileProvider : MainAPI() {
             app.get(fragUrl, headers = browserHeaders, cookies = cookies, referer = watchUrl)
         }.getOrNull() ?: return null
         val finalUrl = fres.url
-        if (finalUrl.startsWith("http") && !finalUrl.contains("wecima.mobile")) {
+        if (finalUrl.startsWith("http") && !finalUrl.contains("wecima.mobile") && !finalUrl.contains("weciema.net")) {
             return finalUrl
         }
         val t = runCatching { fres.text }.getOrNull() ?: return null

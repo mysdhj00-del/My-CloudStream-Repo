@@ -234,11 +234,16 @@ class WeCimaMobileProvider : MainAPI() {
     }
 
     override suspend fun load(url: String): LoadResponse {
-        val document = app.get(url, headers = browserHeaders).document
-        val rawTitle = document.selectFirst("meta[property=\"og:title\"]")?.attr("content")
-            ?: document.title()
-        val title = cleanTitle(rawTitle)
-        if (title.isBlank()) throw ErrorLoadingException("No title")
+        val res = runCatching { app.get(url, headers = browserHeaders) }.getOrNull()
+        val document = res?.takeIf { it.code == 200 }?.document
+        val rawTitle = document?.selectFirst("meta[property=\"og:title\"]")?.attr("content")
+            ?: document?.title()
+        val title = rawTitle?.let { cleanTitle(it) }.orEmpty()
+        // The mobile host rate-blocks the phone's IP (403): instead of
+        // "No title" + retry, return a minimal response from the slug
+        // so the detail screen opens and playback (with its own WP
+        // fallback) still works.
+        if (document == null || title.isBlank()) return loadFromSlug(url)
         val poster = fixUrlNull(document.selectFirst("meta[property=\"og:image\"]")?.attr("content"))
             ?: fixUrlNull(document.selectFirst("img")?.attr("src"))
         val plot = document.selectFirst("meta[name=\"description\"]")?.attr("content")
@@ -291,6 +296,33 @@ class WeCimaMobileProvider : MainAPI() {
                 this.posterUrl = poster
                 this.plot = plot
             }
+        }
+    }
+
+    /** Minimal detail from the URL slug, used when the page itself
+     * is blocked: enough for the detail screen + playback to work. */
+    private suspend fun loadFromSlug(url: String): LoadResponse {
+        val slug = decode(url.trimEnd('/').substringAfterLast("/"))
+        val clean = cleanTitle(slug.replace('-', ' '))
+        val anime = isAnime(decode(url))
+        return if (url.contains("/episode/")) {
+            val num = Regex("""حلقة\s*-?\s*(\d{1,4})""").find(clean)?.groupValues?.get(1)?.toIntOrNull()
+            val ep = newEpisode(url) {
+                this.name = num?.let { "الحلقة $it" } ?: clean
+                this.season = seasonOf(clean)
+                this.episode = num
+            }
+            newTvSeriesLoadResponse(
+                mobileSeriesTitle(slug).ifBlank { clean }, url,
+                if (anime) TvType.Anime else TvType.TvSeries,
+                listOf(ep)
+            ) {}
+        } else {
+            newMovieLoadResponse(
+                clean.ifBlank { url }, url,
+                if (anime) TvType.Anime else TvType.Movie,
+                url
+            ) {}
         }
     }
 

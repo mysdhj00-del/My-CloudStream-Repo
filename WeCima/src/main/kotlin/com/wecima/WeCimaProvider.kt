@@ -874,7 +874,7 @@ class WeCimaProvider : MainAPI() {
                 val videoUrl = Regex("""videoUrl\s*=\s*"([^"]+)"""").find(pageText)
                     ?.groupValues?.get(1)?.replace("\\/", "/")?.trim()
                 if (!videoUrl.isNullOrBlank() && videoUrl.startsWith("http")) {
-                    val isHls = videoUrl.contains(".m3u8")
+                    val isHls = isHlsUrl(videoUrl)
                     // The header set a browser media fetch presents; the
                     // redirector behind videoUrl refuses plainer clients.
                     val streamHeaders = browserHeaders + mapOf(
@@ -1013,7 +1013,7 @@ class WeCimaProvider : MainAPI() {
                     callback(
                         newExtractorLink(
                             name, name, direct,
-                            if (direct.contains(".m3u8") || direct.contains("master.txt")) {
+                            if (isHlsUrl(direct)) {
                                 ExtractorLinkType.M3U8
                             } else {
                                 ExtractorLinkType.VIDEO
@@ -1154,11 +1154,20 @@ class WeCimaProvider : MainAPI() {
     }
 
     /** Emits one direct media URL found inside an embed page. */
+    /** HLS playlists on these hosts hide behind .txt names and /hls*
+     * path segments (verified live: .../hls3/.../master.txt serves
+     * application/vnd.apple.mpegurl, referer-gated, no cookies
+     * needed). Emitting one as VIDEO makes the player fail with
+     * ERROR_CODE_PARSING_CONTAINER_UNSUPPORTED (3003) — the type,
+     * not the URL, is the bug. */
+    private fun isHlsUrl(url: String): Boolean =
+        url.contains(".m3u8") || url.contains("/hls") || url.contains("master.txt")
+
     private suspend fun emitDirect(url: String, referer: String, callback: (ExtractorLink) -> Unit) {
         callback(
             newExtractorLink(
                 name, name, url,
-                if (url.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                if (isHlsUrl(url)) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
             ) {
                 this.referer = referer
                 this.quality = Qualities.Unknown.value
@@ -1704,7 +1713,7 @@ class WeCimaProvider : MainAPI() {
                         callback(
                             newExtractorLink(
                                 name, name, videoUrl,
-                                if (videoUrl.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                                if (isHlsUrl(videoUrl)) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
                             ) {
                                 this.referer = server
                                 this.headers = streamHeaders

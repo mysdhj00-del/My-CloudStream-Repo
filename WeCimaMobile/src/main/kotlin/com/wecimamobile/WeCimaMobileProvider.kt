@@ -74,6 +74,10 @@ import org.jsoup.nodes.Element
 class WeCimaMobileProvider : MainAPI() {
     // v2 (2026-11-03): operator moved the mobile theme to weciema.net.
     override var mainUrl = "https://weciema.net"
+
+    // WordPress backend, used only as a playback fallback when the
+    // mobile resolve chain is gated (human verification, 409).
+    private val wpUrl = "https://wecima.vin"
     override var name = "WeCima"
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries, TvType.Anime)
     override var lang = "ar"
@@ -348,11 +352,14 @@ class WeCimaMobileProvider : MainAPI() {
         val serversJson = Regex("""const servers = (\[.*?\]);""", RegexOption.DOT_MATCHES_ALL)
             .find(text)?.groupValues?.get(1)
         val serverNames = mutableListOf<String>()
+        val serverTokens = mutableListOf<String>()
         if (serversJson != null) {
             val arr = runCatching { org.json.JSONArray(serversJson) }.getOrNull()
             if (arr != null) {
                 for (i in 0 until arr.length()) {
-                    serverNames += arr.optJSONObject(i)?.optString("name") ?: "server$i"
+                    val obj = arr.optJSONObject(i)
+                    serverNames += obj?.optString("name") ?: "server$i"
+                    serverTokens += obj?.optString("resolve_token") ?: ""
                 }
             }
         }
@@ -360,14 +367,31 @@ class WeCimaMobileProvider : MainAPI() {
         if (key == null || csrf == null || serverNames.isEmpty()) return false
 
         // Resolve EVERY server, in the site's order, one at a time.
+        // The site's own player posts {key, token, human_signal} — the
+        // per-server resolve_token, not a positional index.
         val embeds = mutableListOf<String>()
+        var gated = false
         for (i in serverNames.indices) {
-            val embed = resolveOneMobile(i, key, csrf, cookies, watchUrl)
+            val token = serverTokens.getOrNull(i) ?: ""
+            if (token.isBlank()) continue
+            val (embed, isGated) = resolveOneMobile(token, key, csrf, cookies, watchUrl)
+            if (isGated) gated = true
             if (embed != null && embed !in embeds) embeds += embed
             if (i < serverNames.size - 1) Thread.sleep(250)
         }
         diag += "resolved=${embeds.size}"
-        if (embeds.isEmpty()) return false
+        if (gated) diag += "gate=409"
+        if (embeds.isEmpty()) {
+            // The mobile chain is gated (human verification): fall
+            // back to the WordPress chain, which serves a plain HLS
+            // stream with no gate, instead of the DEBUG test video.
+            diag += "wpFb=1"
+            if (wpFallback(text, callback)) {
+                diag += "wpFbHit=1"
+                return true
+            }
+            return false
+        }
 
         // Stage 1: the app's own extractors.
         val unresolved = mutableListOf<String>()
@@ -403,21 +427,27 @@ class WeCimaMobileProvider : MainAPI() {
     }
 
     /** One server: POST /watch/resolve, then follow its fragment to
-     * the real embed URL. The resolve POST is retried once. */
+     * the real embed URL. The resolve POST is retried once. The body
+     * matches the site's own player: {key, token, human_signal} with
+     * a null signal (the no-fingerprint case). Returns the embed plus
+     * whether the site answered with its human-verification gate. */
     private suspend fun resolveOneMobile(
-        index: Int,
+        token: String,
         key: String,
         csrf: String,
         cookies: Map<String, String>,
         watchUrl: String
-    ): String? {
-        val body = JSONObject().put("key", key).put("index", index).toString()
+    ): Pair<String?, Boolean> {
+        val body = JSONObject().put("key", key).put("token", token)
+            .put("human_signal", JSONObject.NULL).toString()
         val headers = browserHeaders + mapOf(
             "X-CSRF-TOKEN" to csrf,
             "X-Requested-With" to "XMLHttpRequest",
+            "X-FP-Event-ID" to "",
             "Accept" to "application/json"
         )
         var fragPath: String? = null
+        var gated = false
         for (attempt in 1..2) {
             val rText = runCatching {
                 app.post(
@@ -428,23 +458,90 @@ class WeCimaMobileProvider : MainAPI() {
                     requestBody = body.toRequestBody("application/json".toMediaType())
                 ).text
             }.getOrNull()
+            if (rText != null && rText.contains("verification_url")) gated = true
             fragPath = rText?.let { runCatching { JSONObject(it) }.getOrNull() }
                 ?.takeIf { it.optBoolean("ok") }?.optString("url")?.takeIf { it.isNotBlank() }
             if (fragPath != null) break
             Thread.sleep(700)
         }
-        val frag = fragPath ?: return null
+        val frag = fragPath ?: return null to gated
         val fragUrl = if (frag.startsWith("http")) frag else mainUrl + frag
         val fres = runCatching {
             app.get(fragUrl, headers = browserHeaders, cookies = cookies, referer = watchUrl)
-        }.getOrNull() ?: return null
+        }.getOrNull() ?: return null to gated
         val finalUrl = fres.url
         if (finalUrl.startsWith("http") && !finalUrl.contains("wecima.mobile") && !finalUrl.contains("weciema.net")) {
-            return finalUrl
+            return finalUrl to gated
         }
-        val t = runCatching { fres.text }.getOrNull() ?: return null
-        return Regex("""url='([^']+)'""").find(t)?.groupValues?.get(1)
-            ?: Regex("""<a href="([^"]+)"""").find(t)?.groupValues?.get(1)
+        val t = runCatching { fres.text }.getOrNull() ?: return null to gated
+        return (Regex("""url='([^']+)'""").find(t)?.groupValues?.get(1)
+            ?: Regex("""<a href="([^"]+)"""").find(t)?.groupValues?.get(1)) to gated
+    }
+
+    /**
+     * WordPress fallback: when the mobile resolve chain is gated, find
+     * the same episode on wecima.vin by title and play its mycima-my
+     * redirector stream (plain HLS, no gate). Returns true on emit.
+     */
+    private suspend fun wpFallback(
+        watchText: String,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        val rawTitle = Regex("""<title>([^<]*)</title>""").find(watchText)
+            ?.groupValues?.get(1)?.trim() ?: return false
+        val clean = rawTitle.substringBefore(" - وي سيما").substringBefore(" | ").trim()
+        if (clean.isBlank()) return false
+        val series = clean.substringBefore(" الحلقة ").trim()
+        val epNum = Regex("""الحلقة\s*-?\s*(\d{1,4})""").find(clean)?.groupValues?.get(1)
+        if (series.isBlank()) return false
+        val norm: (String) -> String = {
+            it.replace("أ", "ا").replace("إ", "ا").replace("آ", "ا")
+                .replace("ة", "ه").replace(" ", "").replace("-", "")
+        }
+        val seriesNorm = norm(series)
+        val epNeedle = if (epNum != null) norm("الحلقة$epNum") else null
+        val queries = mutableListOf<String>()
+        if (epNum != null) queries += "$series الحلقة $epNum"
+        queries += series
+        for (query in queries) {
+            val searchText = runCatching {
+                app.get(
+                    "$wpUrl/?s=" + java.net.URLEncoder.encode(query, "UTF-8"),
+                    headers = browserHeaders
+                ).text
+            }.getOrNull() ?: continue
+            // Any link on the WP search page whose slug holds the
+            // series words (and the episode number, when known).
+            val hrefs = Regex("""<a[^>]+href="([^"]+)"[^>]*>""")
+                .findAll(searchText).map { it.groupValues[1] }.toList()
+            for (href in hrefs) {
+                if (!href.startsWith(wpUrl)) continue
+                val slugRaw = href.trimEnd('/').substringAfterLast("/")
+                val slug = runCatching {
+                    java.net.URLDecoder.decode(slugRaw, "UTF-8")
+                }.getOrNull() ?: slugRaw
+                val slugNorm = norm(slug)
+                if (!slugNorm.contains(seriesNorm)) continue
+                if (epNeedle != null && !slugNorm.contains(epNeedle)) continue
+                val postUrl = fixUrl(href)
+                val postText = runCatching {
+                    app.get(postUrl, headers = browserHeaders).text
+                }.getOrNull() ?: continue
+                val redir = Regex("""data-watch="([^"]+)"""").find(postText)
+                    ?.groupValues?.get(1)?.takeIf { it.startsWith("http") }
+                    ?: continue
+                val redirUrl = fixUrl(redir)
+                val redirText = runCatching {
+                    app.get(redirUrl, headers = browserHeaders, referer = postUrl).text
+                }.getOrNull() ?: continue
+                val direct = extractDirect(redirText)
+                if (direct != null) {
+                    emitDirect(direct, redirUrl, callback)
+                    return true
+                }
+            }
+        }
+        return false
     }
 
     /** Scans a page's text for a direct media URL. */

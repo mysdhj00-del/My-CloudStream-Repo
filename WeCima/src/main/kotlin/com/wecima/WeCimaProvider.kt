@@ -372,7 +372,10 @@ class WeCimaProvider : MainAPI() {
         if (poster == null) {
             val img = selectFirst("img")
             poster = fixUrlNull(img?.attr("data-src")) ?: fixUrlNull(img?.attr("src"))
-                ?.takeIf { !it.contains("load") && !it.contains("blank") }
+                // "loading" (placeholder), NOT "load": every WP poster
+                // lives under /wp-content/uploads/, which contains
+                // "load" — the old filter dropped all of them (v29).
+                ?.takeIf { !it.contains("loading") && !it.contains("blank") }
         }
         val year = Regex("""(19|20)\d{2}""").find(title)?.value?.toIntOrNull()
         val decoded = decode(href)

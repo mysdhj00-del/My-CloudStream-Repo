@@ -17,7 +17,10 @@
 // v7: stronger search — server attempt first, then a full home scan
 // (all navs, pages 1-3, no early exit, capped at 50) matching title,
 // videoName, English slug, plot introduction and tags.
-version = 8
+// v8: server search retried on failure only; home scan over dynamic navs.
+// v9: known-ID search fallback (TEST) — verified shared titles offered
+// directly when normal search finds nothing (IRIS 2009, id 15164).
+version = 9
 
 android {
     namespace = "com.hitv"

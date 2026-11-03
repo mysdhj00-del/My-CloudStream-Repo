@@ -624,23 +624,22 @@ class WeCimaProvider : MainAPI() {
             }
         }
 
-        // An episode post groups into its series via the open WP REST
-        // API: /series/ hub pages list other shows' latest episodes
-        // (verified live), and WP search does not paginate, so REST
-        // is the only source returning the series' whole WP episode
-        // set. Falls through to the film response when the set has
-        // < 2 episodes. Bare حلقة posts are covered too (the old
-        // hub delegation only matched the ال form).
-        if (decoded.contains("حلقة")) {
-            wpEpisodeSeries(url, document.pagePoster(), document.pagePlot(), anime)
-                ?.let { return it }
-        }
-
         val title = cleanTitle(
             document.selectFirst("h1")?.text()
                 ?: document.selectFirst("meta[property=\"og:title\"]")?.attr("content")
                 ?: throw ErrorLoadingException("No title")
         )
+        // An episode post groups into its series via the open WP REST
+        // API (title-based: truncated slugs lose the word حلقة, so
+        // the URL alone cannot identify them). Falls through to the
+        // film response when the set has < 2 episodes.
+        if (decoded.contains("حلقة") ||
+            Regex("""حلقة\s*-?\s*\d{1,4}""").containsMatchIn(title)
+        ) {
+            wpEpisodeSeries(url, title, document.pagePoster(), document.pagePlot(), anime)
+                ?.let { return it }
+        }
+
         return newMovieLoadResponse(
             title, url,
             if (anime) TvType.Anime else TvType.Movie,
@@ -652,27 +651,42 @@ class WeCimaProvider : MainAPI() {
     }
 
     /** Groups a WP episode post into its series via the open WP REST
-     * API (same rationale as the Mobile provider: hub pages mix in
-     * other shows, WP search does not paginate). Returns null when
-     * the set has < 2 episodes, so the caller keeps the film
-     * response. Episode data is the WP post URL, which loadLinks
-     * already plays through its WP fallback. */
+     * API. WP episode slugs are unreliable identifiers: long Arabic
+     * titles get TRUNCATED (verified live: طالع نازل subtitle posts
+     * lose the word الحلقة entirely, ending in a bare -N), and
+     * /series/ hub pages list other shows' latest episodes while WP
+     * search does not paginate — so REST + TITLE matching is the
+     * only source returning the series' whole WP episode set.
+     * The series identity comes from the post TITLE (series part
+     * before الحلقة N), and candidates match when their series part
+     * equals it or differs only by season words (الموسم الاول...),
+     * which is what separates طالع نازل from طالع نازل: الحب اللي كان
+     * while still admitting E4, whose title drops الموسم الاول.
+     * Returns null when the set has < 2 episodes, so the caller
+     * keeps the single-film response. */
     private suspend fun wpEpisodeSeries(
-        url: String, poster: String?, plot: String?, anime: Boolean
+        url: String, displayTitle: String?, poster: String?, plot: String?, anime: Boolean
     ): LoadResponse? {
-        val slugDec = decode(url.trimEnd('/').substringAfterLast("/"))
-        val stem = slugDec.substringBefore("-الحلقة").substringBefore("-حلقة")
-        val seriesTitle = slugDec.replace('-', ' ')
-            .removePrefix("مشاهدة مسلسل ").removePrefix("مشاهدة ").trim()
-            .substringBefore(" الحلقة ").substringBefore(" حلقة ").trim()
-            .removeSuffix("مترجمة").removeSuffix("مترجم").trim()
-        if (seriesTitle.isBlank() || stem.isBlank()) return null
+        val slugWords = decode(url.trimEnd('/').substringAfterLast("/")).replace('-', ' ')
+        val tappedTitle = displayTitle?.ifBlank { null } ?: slugWords
+        if (Regex("""حلقة\s*-?\s*\d{1,4}""").find(tappedTitle) == null) return null
+        val seriesTitle = seriesPartOf(tappedTitle)
+        if (seriesTitle.isBlank()) return null
+        val seasonWords = setOf(
+            "الموسم", "الاول", "الثاني", "الثالث", "الرابع", "الخامس",
+            "السادس", "السابع", "الثامن", "التاسع", "العاشر",
+            "الحادي", "عشر"
+        )
+        val query = seriesTitle.split(" ")
+            .filter { it !in seasonWords && it.toIntOrNull() == null }
+            .joinToString(" ").ifBlank { seriesTitle }
+        val tappedNorm = normSeries(seriesTitle)
         val byKey = LinkedHashMap<String, Episode>()
         for (page in 1..2) {
             val body = runCatching {
                 app.get(
                     "$mainUrl/wp-json/wp/v2/posts?search=" +
-                        java.net.URLEncoder.encode(seriesTitle, "UTF-8") +
+                        java.net.URLEncoder.encode(query, "UTF-8") +
                         "&per_page=100&page=$page",
                     headers = browserHeaders
                 ).text
@@ -682,11 +696,15 @@ class WeCimaProvider : MainAPI() {
             var added = 0
             for (i in 0 until arr.length()) {
                 val obj = arr.optJSONObject(i) ?: continue
-                val postSlug = decode(obj.optString("slug"))
-                if (!postSlug.startsWith(stem)) continue
-                val num = Regex("""حلقة\s*-?\s*(\d{1,4})""").find(postSlug)
+                val postTitle = obj.optJSONObject("title")?.optString("rendered")
+                    ?.replace(Regex("<[^>]+>"), "")
+                    ?.replace(Regex("&#\\d+;"), "")
+                    ?.replace("&amp;", "&")?.trim() ?: continue
+                val num = Regex("""حلقة\s*-?\s*(\d{1,4})""").find(postTitle)
                     ?.groupValues?.get(1)?.toIntOrNull() ?: continue
-                val season = seasonOf(postSlug)
+                val candSeries = seriesPartOf(postTitle)
+                if (!seriesPartMatches(tappedNorm, normSeries(candSeries))) continue
+                val season = seasonOf(postTitle)
                 val key = "$season:$num"
                 if (byKey.containsKey(key)) continue
                 byKey[key] = newEpisode("$mainUrl/" + obj.optString("slug") + "/") {
@@ -711,6 +729,46 @@ class WeCimaProvider : MainAPI() {
             this.posterUrl = poster
             this.plot = plot
         }
+    }
+
+    /** Series part of an episode title: strip the مشاهدة/مسلسل
+     * prefix, then everything from the episode word on (which also
+     * cuts the site suffix that follows it). */
+    private fun seriesPartOf(title: String): String {
+        var t = title.trim()
+            .removePrefix("مشاهدة مسلسل ").removePrefix("مشاهدة ").removePrefix("مسلسل ")
+            .trim()
+        t = t.substringBefore(" الحلقة ").substringBefore(" حلقة ").trim()
+        return t
+    }
+
+    /** Normalizes a series part for comparison: alef variants,
+     * ة→ه, and punctuation/spacing dropped. */
+    private fun normSeries(s: String): String =
+        s.replace("أ", "ا").replace("إ", "ا").replace("آ", "ا").replace("ة", "ه")
+            .replace(" ", "").replace("-", "").replace(":", "")
+            .replace("–", "").replace("_", "").replace("&", "")
+            .replace("\"", "").replace("'", "")
+
+    /** True when two normalized series parts denote the same series:
+     * equal, or one is a prefix of the other with the difference
+     * consisting ONLY of season words (الموسم + ordinal). */
+    private fun seriesPartMatches(tapped: String, cand: String): Boolean {
+        if (tapped == cand) return true
+        val seasonBits = listOf(
+            "الحاديعشر", "الثانيعشر", "الموسم", "الاول", "الثاني",
+            "الثالث", "الرابع", "الخامس", "السادس", "السابع",
+            "الثامن", "التاسع", "العاشر"
+        )
+        fun seasonOnly(extra: String): Boolean {
+            var e = extra
+            for (w in seasonBits) e = e.replace(w, "")
+            e = e.replace(Regex("\\d+"), "")
+            return e.isEmpty()
+        }
+        if (cand.startsWith(tapped)) return seasonOnly(cand.substring(tapped.length))
+        if (tapped.startsWith(cand)) return seasonOnly(tapped.substring(cand.length))
+        return false
     }
 
     // Dean Edwards packer blocks: eval(function(p,a,c,k,e,d){...}('payload',

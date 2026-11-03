@@ -75,9 +75,11 @@ class WeCimaMobileProvider : MainAPI() {
     // v2 (2026-11-03): operator moved the mobile theme to weciema.net.
     override var mainUrl = "https://weciema.net"
 
-    // WordPress backend, used only as a playback fallback when the
-    // mobile resolve chain is gated (human verification, 409).
+    // WordPress backend: the addon's primary source since v7 (the
+    // mobile host blocks the phone's IP) — catalog, search, playback
+    // fallback; mobile stays only as a backup.
     private val wpUrl = "https://wecima.vin"
+    private val wpAltUrl = "https://wecima.tattoo"
     override var name = "WeCima"
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries, TvType.Anime)
     override var lang = "ar"
@@ -210,19 +212,135 @@ class WeCimaMobileProvider : MainAPI() {
         return seen.values.toList()
     }
 
+    // ---------- WordPress cards (v7: twin sections) ----------
+
+    private fun Element.toWpCard(): SearchResponse? {
+        val a = selectFirst(".Thumb--GridItem a") ?: selectFirst("a[href]") ?: return null
+        val href = fixUrl(a.attr("href"))
+        if (!href.startsWith(wpUrl) && !href.startsWith(wpAltUrl)) return null
+        if (href.contains("/category/") || href.contains("/wp-") ||
+            href.endsWith("/movies/") || href.endsWith("/series/") ||
+            href.endsWith("/episodes/") || href == "$wpUrl/" || href == "$wpAltUrl/"
+        ) return null
+        val title = cleanTitle(a.attr("title").ifBlank { a.text() })
+        if (title.isBlank()) return null
+        val style = selectFirst("span[data-lazy-style]")?.attr("data-lazy-style") ?: ""
+        var poster = Regex("""url\((https?://[^)]+)\)""").find(style)?.groupValues?.get(1)
+            ?.let { fixUrlNull(it) }
+        if (poster == null) {
+            val img = selectFirst("img")
+            poster = fixUrlNull(img?.attr("data-src")) ?: fixUrlNull(img?.attr("src"))
+                ?.takeIf { !it.contains("load") && !it.contains("blank") }
+        }
+        val year = Regex("""(19|20)\d{2}""").find(title)?.value?.toIntOrNull()
+        val decoded = decode(href)
+        val anime = isAnime(decoded)
+        val seriesLike = href.contains("/series/") || decoded.contains("مسلسل") ||
+            decoded.contains("الحلقة") || decoded.contains("حلقة")
+        return when {
+            anime -> newAnimeSearchResponse(title, href, TvType.Anime) {
+                this.posterUrl = poster
+                this.year = year
+            }
+            seriesLike -> newTvSeriesSearchResponse(title, href, TvType.TvSeries) {
+                this.posterUrl = poster
+                this.year = year
+            }
+            else -> newMovieSearchResponse(title, href, TvType.Movie) {
+                this.posterUrl = poster
+                this.year = year
+            }
+        }
+    }
+
+    private fun Document.parseWpCards(): List<SearchResponse> {
+        val seen = LinkedHashMap<String, SearchResponse>()
+        select(".GridItem").forEach { item ->
+            val card = runCatching { item.toWpCard() }.getOrNull() ?: return@forEach
+            seen.putIfAbsent(card.url, card)
+        }
+        if (seen.isEmpty()) {
+            select("a[href][title]").forEach { a ->
+                val card = runCatching { a.toWpCard() }.getOrNull() ?: return@forEach
+                seen.putIfAbsent(card.url, card)
+            }
+        }
+        return seen.values.toList()
+    }
+
+    // Maps a mobile section URL to its WordPress twin (v7): the
+    // operator's WP site carries the same categories (verified live),
+    // with two slug renames.
+    private fun wpSectionTwin(url: String): String? {
+        val base = url.trimEnd('/').substringBefore("?page=")
+        if (base == mainUrl) return "$wpUrl/"
+        if (!base.startsWith("$mainUrl/category/")) return null
+        val slug = base.removePrefix("$mainUrl/category/")
+        val mapped = when (slug) {
+            "افلام-اسيوية" -> "افلام-اسيوي"
+            "مسلسلات-عربي" -> "مسلسلات-عربية"
+            else -> slug
+        }
+        return "$wpUrl/category/$mapped/"
+    }
+
     // ---------- browse / search ----------
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
+        // v7: the addon is based on wecima.vin now — the mobile host
+        // blocks the phone's IP, so sections come from the WordPress
+        // twin first (then its alt host), mobile only as a backup.
         // The site paginates home + categories with ?page={n}.
         val base = request.data.trimEnd('/')
         val url = if (page <= 1) base else "$base?page=$page"
-        val items = app.get(url, headers = browserHeaders).document.parseMobileCards()
+        var items: List<SearchResponse> = emptyList()
+        if (page <= 1) {
+            wpSectionTwin(url)?.let { twin ->
+                for (candidate in listOf(twin, twin.replace(wpUrl, wpAltUrl))) {
+                    val wpItems = runCatching {
+                        app.get(candidate, headers = browserHeaders).document.parseWpCards()
+                    }.getOrNull().orEmpty()
+                    if (wpItems.isNotEmpty()) {
+                        items = wpItems
+                        break
+                    }
+                }
+            }
+        }
+        if (items.isEmpty()) {
+            items = runCatching {
+                app.get(url, headers = browserHeaders).document.parseMobileCards()
+            }.getOrNull().orEmpty()
+        }
         return newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
-        val url = mainUrl + "/search?s=" + java.net.URLEncoder.encode(query, "UTF-8")
-        return app.get(url, headers = browserHeaders).document.parseMobileCards()
+        // v7: WordPress first (the working host), mobile second, one
+        // entry per title (WP wins ties).
+        val seen = LinkedHashMap<String, SearchResponse>()
+        val wpItems = runCatching {
+            app.get(
+                "$wpUrl/?s=" + java.net.URLEncoder.encode(query, "UTF-8"),
+                headers = browserHeaders
+            ).document.parseWpCards()
+        }.getOrNull().orEmpty()
+        wpItems.forEach { seen.putIfAbsent(searchKey(it.name), it) }
+        val mobItems = runCatching {
+            app.get(
+                mainUrl + "/search?s=" + java.net.URLEncoder.encode(query, "UTF-8"),
+                headers = browserHeaders
+            ).document.parseMobileCards()
+        }.getOrNull().orEmpty()
+        mobItems.forEach { seen.putIfAbsent(searchKey(it.name), it) }
+        return seen.values.toList()
+    }
+
+    private fun searchKey(title: String): String {
+        var t = title.trim()
+        t = t.removePrefix("مشاهدة ").removePrefix("مسلسل ").removePrefix("فيلم ")
+        return t.replace("أ", "ا").replace("إ", "ا").replace("آ", "ا")
+            .replace("ة", "ه").replace(" ", "").replace("-", "")
     }
 
     // ---------- title page ----------

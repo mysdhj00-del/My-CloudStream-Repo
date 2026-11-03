@@ -1276,6 +1276,10 @@ class WeCimaProvider : MainAPI() {
         val hits = java.util.Collections.synchronizedList(mutableListOf<Pair<Int, String>>())
         val fails = java.util.Collections.synchronizedList(mutableListOf<Int>())
         val gates = java.util.Collections.synchronizedList(mutableListOf<Boolean>())
+        // The gate is session-wide: once one server 409s, the rest
+        // will too — queued tasks skip instead of firing doomed POSTs
+        // that invite a 403 block on the next play press.
+        val gateHit = java.util.concurrent.atomic.AtomicBoolean(false)
         val pool = java.util.concurrent.Executors.newFixedThreadPool(3)
         val latch = java.util.concurrent.CountDownLatch(tokens.size)
         val t0 = System.currentTimeMillis()
@@ -1283,11 +1287,11 @@ class WeCimaProvider : MainAPI() {
             pool.execute {
                 try {
                     val token = tokens[index]
-                    if (token.isBlank()) {
+                    if (token.isBlank() || gateHit.get()) {
                         fails += index
                     } else {
                         val (embed, gated) = resolveOneMobile(token, key, csrf, cookieHeader, watchUrl)
-                        if (gated) gates += true
+                        if (gated) { gates += true; gateHit.set(true) }
                         if (embed != null) hits += index to embed else fails += index
                     }
                 } catch (e: Exception) {

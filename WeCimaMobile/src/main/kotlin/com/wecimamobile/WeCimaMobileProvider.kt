@@ -509,18 +509,23 @@ class WeCimaMobileProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         if (clean.isBlank()) return false
-        val series = clean.substringBefore(" الحلقة ").trim()
-        val epNum = Regex("""الحلقة\s*-?\s*(\d{1,4})""").find(clean)?.groupValues?.get(1)
+        val series = clean.substringBefore(" الحلقة ").substringBefore(" حلقة ").trim()
+        val epNum = Regex("""حلقة\s*-?\s*(\d{1,4})""").find(clean)?.groupValues?.get(1)
         if (series.isBlank()) return false
         // An episode whose number cannot be read must not guess:
         // playing the wrong episode is worse than DEBUG.
-        if (clean.contains("الحلقة") && epNum == null) return false
+        if (clean.contains("حلقة") && epNum == null) return false
         val norm: (String) -> String = {
             it.replace("أ", "ا").replace("إ", "ا").replace("آ", "ا")
                 .replace("ة", "ه").replace(" ", "").replace("-", "")
         }
         val seriesNorm = norm(series)
-        val epNeedle = if (epNum != null) norm("الحلقة$epNum") else null
+        // WP episode slugs come in two spellings: الحلقة-N (early
+        // episodes) and bare حلقة-N (later ones, e.g. سيدو وحورية
+        // E7/E8). The bare form is a substring of the ال form, so one
+        // bare needle matches both — with a digit boundary so E7
+        // never matches E70/E17.
+        val epNeedle = if (epNum != null) Regex("""حلقه$epNum(?!\d)""") else null
         val queries = mutableListOf<String>()
         if (epNum != null) queries += "$series الحلقة $epNum"
         queries += series
@@ -543,7 +548,7 @@ class WeCimaMobileProvider : MainAPI() {
                 }.getOrNull() ?: slugRaw
                 val slugNorm = norm(slug)
                 if (!slugNorm.contains(seriesNorm)) continue
-                if (epNeedle != null && !slugNorm.contains(epNeedle)) continue
+                if (epNeedle != null && !epNeedle.containsMatchIn(slugNorm)) continue
                 val postUrl = fixUrl(href)
                 val postText = runCatching {
                     app.get(postUrl, headers = browserHeaders).text

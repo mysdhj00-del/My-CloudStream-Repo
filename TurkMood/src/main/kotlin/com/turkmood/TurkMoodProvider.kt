@@ -107,6 +107,11 @@ import java.util.concurrent.atomic.AtomicBoolean
  * MiraVD/Mwdy ONLY, skip dig AND sniff, answer in ~2-3s and emit
  * DEBUG at once. If the v12 line appears, v13 = fast path
  * (cached cookies + fast sniff); if not, time is exonerated.
+ * v13: SITE-WALK port of 3isk (panel hunt: no standalone extractor
+ * exists) — 3iskk.xyz /search/ title -> candidates -> episode pick
+ * -> watch-form POST dance -> 3esk.onl servers 1..5 -> media;
+ * HTTP-only, once per title, stops at first media; DEBUG codes
+ * walk/notitle/nosearch/nocand/noep/noform/nopost/noiframe/nomedia.
  * DEBUG lines now carry a v8 marker so the phone proves which code ran.
  *
  * v7 (Faselhd WebView sniff, user-approved 2026-11-02): last resort
@@ -765,6 +770,165 @@ class TurkMoodProvider(private val appContext: Context? = null) : MainAPI() {
         }
     }
 
+    /**
+     * v13 SITE-WALK (panel hunt verdict 2026-11-03: all 8 voices agree no
+     * standalone extractor exists for miravd/mwdy; the 3isk site-walk is
+     * the only proven path). Port of the 3isk provider's own flow
+     * (module 3isk, Abodabodd/re-3arabi, eishk.kt — studied in full):
+     * search 3iskk.xyz for the title -> candidate watch pages -> episode
+     * pick (series) or direct (movies) -> watch-form POST dance -> the
+     * 3esk.onl embed servers 1..5 -> media. HTTP-only (no WebView),
+     * stops at the first media found, runs ONCE per title (cached).
+     * Mapping note: the TurkMood API carries NO site-page link (verified
+     * full JSON keys), so the title itself is the mapping key; the
+     * site's /search/<query>/ route works from sandbox (verified
+     * 2026-11-03: returns candidate /watch/ links). WP REST search and
+     * sitemaps are DEAD on 3iskk.xyz (REST root returns [], sitemaps
+     * 404), and embed IDs differ from site post IDs, so ID-probing is
+     * dead too. Correctness caveat: candidates are tried in search
+     * order; if the first media-yielding candidate is the wrong series
+     * (same name, different year), the wrong title plays — year/slug
+     * filtering is the follow-up if that is reported.
+     */
+    private fun decodeBase64Compat(encoded: String): String? {
+        var s = encoded.trim()
+        val mod = s.length % 4
+        if (mod != 0) s += "=".repeat(4 - mod)
+        val flagsToTry = listOf(
+            android.util.Base64.DEFAULT,
+            android.util.Base64.NO_WRAP,
+            android.util.Base64.URL_SAFE or android.util.Base64.NO_PADDING or android.util.Base64.NO_WRAP
+        )
+        for (flags in flagsToTry) {
+            try {
+                val bytes = android.util.Base64.decode(s, flags)
+                return try { String(bytes, Charsets.UTF_8) } catch (_: Exception) { String(bytes) }
+            } catch (_: IllegalArgumentException) { }
+        }
+        return null
+    }
+
+    private fun resolveUrl(base: String, rel: String): String {
+        if (rel.startsWith("http")) return rel
+        if (rel.startsWith("//")) return "https:" + rel
+        val scheme = base.substringBefore("://")
+        val host = base.substringAfter("://").substringBefore("/")
+        if (rel.startsWith("/")) return "$scheme://$host$rel"
+        return base.substringBeforeLast("/") + "/" + rel
+    }
+
+    private suspend fun walkEmbedMedia(embedUrl: String, referer: String): Set<String> {
+        val out = LinkedHashSet<String>()
+        val r = runCatching { app.get(embedUrl, referer = referer, headers = apiHeaders) }.getOrNull() ?: return out
+        val t = runCatching { r.text }.getOrNull() ?: return out
+        out += extractMediaLinks(t)
+        unpackPacker(t)?.let { out += extractMediaLinks(it) }
+        val doc = runCatching { org.jsoup.Jsoup.parse(t) }.getOrNull()
+        val nested = doc?.select("iframe")?.mapNotNull { it.attr("src").ifBlank { null } }?.firstOrNull { it.startsWith("http") }
+        if (nested != null) {
+            val r2 = runCatching { app.get(nested, referer = embedUrl, headers = apiHeaders) }.getOrNull()
+            val t2 = r2?.let { runCatching { it.text }.getOrNull() }
+            if (t2 != null) {
+                out += extractMediaLinks(t2)
+                unpackPacker(t2)?.let { out += extractMediaLinks(it) }
+            }
+        }
+        return out
+    }
+
+    private suspend fun walkWatchPage(pageUrl: String, pageText: String): Pair<Set<String>, String> {
+        val doc = runCatching { org.jsoup.Jsoup.parse(pageText) }.getOrNull() ?: return emptySet<String>() to "noparse"
+        var form = doc.selectFirst("button.single-watch-btn")?.parent()
+        if (form == null) {
+            for (f in doc.select("form")) {
+                val act = f.attr("action")
+                if (act.contains("3isk") || act.contains("aa.3isk") || act.contains("watch")) { form = f; break }
+            }
+        }
+        if (form == null) return emptySet<String>() to "noform"
+        val actionRaw = form.attr("action")
+        if (actionRaw.isBlank()) return emptySet<String>() to "noform"
+        val postUrl = resolveUrl(pageUrl, actionRaw)
+        val formData = form.select("input[type=hidden]").associate { it.attr("name") to it.attr("value") }.toMutableMap()
+        val btn = doc.selectFirst("button.single-watch-btn")
+        if (btn != null) {
+            val bn = btn.attr("name")
+            if (bn.isNotBlank()) formData[bn] = btn.attr("value")
+        }
+        val r1 = runCatching { app.post(postUrl, data = formData, referer = pageUrl, headers = apiHeaders) }.getOrNull() ?: return emptySet<String>() to "post1err"
+        val t1 = runCatching { r1.text }.getOrNull() ?: ""
+        val mUrl = Regex("""var\s+myUrl\s*=\s*["']([^"']+)["']""").find(t1)
+        val mNews = Regex("""myInput\.value\s*=\s*["']([^"']+)["']""").find(t1)
+        if (mUrl == null || mNews == null) return emptySet<String>() to "nopost"
+        val nextPost = mUrl.groupValues[1]
+        val newsVal = mNews.groupValues[1]
+        val r2 = runCatching { app.post(nextPost, data = mapOf("news" to newsVal, "u" to "", "submit" to "submit"), referer = r1.url, headers = apiHeaders) }.getOrNull() ?: return emptySet<String>() to "post2err"
+        val t2 = runCatching { r2.text }.getOrNull() ?: ""
+        val doc2 = runCatching { org.jsoup.Jsoup.parse(t2) }.getOrNull()
+        val baseIframe = doc2?.select("iframe")?.mapNotNull { it.attr("src").ifBlank { null } }?.firstOrNull { it.startsWith("http") }
+        if (baseIframe == null) return emptySet<String>() to "noiframe"
+        val em = Regex("""(https://3esk\.onl/embed/)(\d+)/(.*)""").find(baseIframe)
+        if (em != null) {
+            val prefix = em.groupValues[1]
+            val trailing = em.groupValues[3]
+            for (sn in 1..5) {
+                val media = walkEmbedMedia("$prefix$sn/$trailing", r2.url)
+                if (media.isNotEmpty()) return media to "walk"
+            }
+            return emptySet<String>() to "nomedia"
+        }
+        val media = walkEmbedMedia(baseIframe, r2.url)
+        return media to if (media.isNotEmpty()) "walk" else "nomedia"
+    }
+
+    private suspend fun siteWalkMedia(origTitle: String, arTitle: String, epNum: Int?): Pair<Set<String>, String> {
+        val queries = listOf(origTitle, arTitle).map { it.trim() }.filter { it.isNotBlank() }.distinct()
+        if (queries.isEmpty()) return emptySet<String>() to "notitle"
+        var lastCode = "nosearch"
+        for (q in queries) {
+            val enc = try { java.net.URLEncoder.encode(q, "UTF-8") } catch (_: Exception) { continue }
+            val searchUrl = "https://3iskk.xyz/search/$enc/"
+            val sr = runCatching { app.get(searchUrl, headers = apiHeaders, referer = "https://3iskk.xyz/") }.getOrNull() ?: continue
+            val st = runCatching { sr.text }.getOrNull() ?: continue
+            val cands = Regex("""href="(https://3iskk\.xyz/watch/[^"]+)"""").findAll(st).map { it.groupValues[1] }.distinct().take(2).toList()
+            if (cands.isEmpty()) { lastCode = "nocand"; continue }
+            for (cand in cands) {
+                if (epNum != null) {
+                    val sp = runCatching { app.get(cand, headers = apiHeaders, referer = searchUrl) }.getOrNull() ?: continue
+                    val spt = runCatching { sp.text }.getOrNull() ?: continue
+                    val sdoc = runCatching { org.jsoup.Jsoup.parse(spt) }.getOrNull() ?: continue
+                    val eps = ArrayList<Pair<Int?, String>>()
+                    for (seasonDiv in sdoc.select("div.season-eps")) {
+                        for (epA in seasonDiv.select("a.ep-num")) {
+                            val raw = epA.attr("data-clse").ifBlank { epA.attr("href") }
+                            if (raw.isBlank()) continue
+                            val epUrl = if (raw.startsWith("http")) raw else (decodeBase64Compat(raw) ?: epA.attr("href"))
+                            if (epUrl.isBlank()) continue
+                            eps += epA.attr("data-ep-num").toIntOrNull() to epUrl
+                        }
+                    }
+                    if (eps.isEmpty()) { lastCode = "noep"; continue }
+                    val target = eps.firstOrNull { it.first == epNum }?.second
+                        ?: eps.getOrNull(epNum - 1)?.second
+                        ?: continue
+                    val ep = runCatching { app.get(target, headers = apiHeaders, referer = cand) }.getOrNull() ?: continue
+                    val ept = runCatching { ep.text }.getOrNull() ?: continue
+                    val (media, code) = walkWatchPage(ep.url, ept)
+                    lastCode = code
+                    if (media.isNotEmpty()) return media to "walk"
+                } else {
+                    val mp = runCatching { app.get(cand, headers = apiHeaders, referer = searchUrl) }.getOrNull() ?: continue
+                    val mpt = runCatching { mp.text }.getOrNull() ?: continue
+                    val (media, code) = walkWatchPage(mp.url, mpt)
+                    lastCode = code
+                    if (media.isNotEmpty()) return media to "walk"
+                }
+            }
+        }
+        return emptySet<String>() to lastCode
+    }
+
+
     private suspend fun loadLinksInner(
         data: String,
         isCasting: Boolean,
@@ -858,7 +1022,13 @@ class TurkMoodProvider(private val appContext: Context? = null) : MainAPI() {
         var found = false
         val startedAt = System.currentTimeMillis()
         var dug = 0
-        var webviewAttempts = 0
+        var walkDone = false
+        var walkMedia: Set<String>? = null
+        var walkCode = ""
+        val titleHolder = if (isEpisode) json.optJSONObject("series") else json.optJSONObject("item")
+        val walkTitleOrig = titleHolder?.optString("original_title", "")?.trim() ?: ""
+        val walkTitleAr = titleHolder?.optString("title", "")?.trim() ?: ""
+        val walkEpNum = if (isEpisode) holder.optInt("episode_number", 0).takeIf { it > 0 } else null
         for ((_, _, entry) in ranked) {
             val (nm, link) = entry
             if (!seen.add(link)) continue
@@ -868,18 +1038,42 @@ class TurkMoodProvider(private val appContext: Context? = null) : MainAPI() {
                 found = true
                 continue
             }
-            // v12 FAST DIAGNOSTIC: v11's warm-up (~24s) also produced an
-            // empty list with NO debug line, like v7-v10. If slow calls
-            // are discarded by the player, no slow fix can ever show a
-            // result. For these hosts ONLY, answer FAST (API fetch +
-            // loadExtractor only, ~2-3s) and emit the DEBUG line at once.
-            // If the v12 line APPEARS, slow calls are the cause and v13
-            // becomes a FAST path (cached cookies + fast sniff). If it
-            // still does NOT appear, time is not the cause. The warm-up
-            // function stays in the file, uncalled, for v13.
+            // v13 SITE-WALK (panel hunt verdict: no standalone extractor
+            // exists; 3isk-style site-walk is the only proven path):
+            // search 3iskk.xyz for the title -> candidate watch pages ->
+            // episode pick (series) or direct (movies) -> 3isk watch-form
+            // POST dance -> 3esk.onl embed servers 1..5 -> media. Runs
+            // ONCE per title (cached); HTTP-only, stops at first media.
+            // If the walk fails, the DEBUG line carries the walk code.
             val host = hostOf(link)
             if (host.contains("miravd") || host.contains("mwdy")) {
-                outcomes += "$nm:FASTDIAG"
+                if (!walkDone) {
+                    walkDone = true
+                    val (wmedia, wcode) = runCatching { siteWalkMedia(walkTitleOrig, walkTitleAr, walkEpNum) }.getOrDefault(emptySet<String>() to "err")
+                    walkMedia = wmedia
+                    walkCode = wcode
+                }
+                val wm = walkMedia
+                if (wm != null && wm.isNotEmpty()) {
+                    for (media in wm) {
+                        runCatching {
+                            callback(
+                                newExtractorLink(
+                                    name,
+                                    nm,
+                                    media,
+                                    ExtractorLinkType.M3U8
+                                ) {
+                                    this.quality = Qualities.Unknown.value
+                                }
+                            )
+                        }
+                    }
+                    outcomes += "$nm:WALK(${wm.size})"
+                    found = true
+                } else {
+                    outcomes += "$nm:FAIL+$walkCode"
+                }
             } else if (dug < 4 && System.currentTimeMillis() - startedAt < 12000) {
                 dug++
                 val (links, code) = runCatching { digEmbed(link, detailUrl) }.getOrDefault(emptySet<String>() to "err")
@@ -926,7 +1120,7 @@ class TurkMoodProvider(private val appContext: Context? = null) : MainAPI() {
             callback(
                 newExtractorLink(
                     name,
-                    "DEBUG v12 | " + diag.joinToString(" | "),
+                    "DEBUG v13 | " + diag.joinToString(" | "),
                     "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8",
                     ExtractorLinkType.M3U8
                 ) {

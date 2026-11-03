@@ -343,7 +343,17 @@ class WeCimaMobileProvider : MainAPI() {
         }
         diag += "watch=${res?.code ?: "err"}"
         if (watchErr != null) diag += "werr=$watchErr"
-        if (res == null) return false
+        if (res == null || res.code != 200) {
+            // The watch page itself is blocked (403 rate-limit): the
+            // WordPress host is a different host — try it from the
+            // episode slug instead of dying here.
+            diag += "wpFb=1"
+            if (wpFallbackFromSlug(data, callback)) {
+                diag += "wpFbHit=1"
+                return true
+            }
+            return false
+        }
 
         val cookies = runCatching { res.cookies }.getOrNull().orEmpty()
         val text = res.text
@@ -364,7 +374,14 @@ class WeCimaMobileProvider : MainAPI() {
             }
         }
         diag += "servers=${serverNames.size}"
-        if (key == null || csrf == null || serverNames.isEmpty()) return false
+        if (key == null || csrf == null || serverNames.isEmpty()) {
+            diag += "wpFb=1"
+            if (wpFallbackFromSlug(data, callback)) {
+                diag += "wpFbHit=1"
+                return true
+            }
+            return false
+        }
 
         // Resolve EVERY server, in the site's order, one at a time.
         // The site's own player posts {key, token, human_signal} — the
@@ -375,7 +392,10 @@ class WeCimaMobileProvider : MainAPI() {
             val token = serverTokens.getOrNull(i) ?: ""
             if (token.isBlank()) continue
             val (embed, isGated) = resolveOneMobile(token, key, csrf, cookies, watchUrl)
-            if (isGated) gated = true
+            // The gate is session-wide, not per-server: once one
+            // server 409s, the rest will too — stop the burst here
+            // instead of firing 16 doomed POSTs that invite a 403.
+            if (isGated) { gated = true; break }
             if (embed != null && embed !in embeds) embeds += embed
             if (i < serverNames.size - 1) Thread.sleep(250)
         }
@@ -386,7 +406,7 @@ class WeCimaMobileProvider : MainAPI() {
             // back to the WordPress chain, which serves a plain HLS
             // stream with no gate, instead of the DEBUG test video.
             diag += "wpFb=1"
-            if (wpFallback(text, callback)) {
+            if (wpFallbackFromTitle(text, callback)) {
                 diag += "wpFbHit=1"
                 return true
             }
@@ -459,6 +479,7 @@ class WeCimaMobileProvider : MainAPI() {
                 ).text
             }.getOrNull()
             if (rText != null && rText.contains("verification_url")) gated = true
+            if (gated) break
             fragPath = rText?.let { runCatching { JSONObject(it) }.getOrNull() }
                 ?.takeIf { it.optBoolean("ok") }?.optString("url")?.takeIf { it.isNotBlank() }
             if (fragPath != null) break
@@ -484,16 +505,16 @@ class WeCimaMobileProvider : MainAPI() {
      * redirector stream (plain HLS, no gate). Returns true on emit.
      */
     private suspend fun wpFallback(
-        watchText: String,
+        clean: String,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val rawTitle = Regex("""<title>([^<]*)</title>""").find(watchText)
-            ?.groupValues?.get(1)?.trim() ?: return false
-        val clean = rawTitle.substringBefore(" - وي سيما").substringBefore(" | ").trim()
         if (clean.isBlank()) return false
         val series = clean.substringBefore(" الحلقة ").trim()
         val epNum = Regex("""الحلقة\s*-?\s*(\d{1,4})""").find(clean)?.groupValues?.get(1)
         if (series.isBlank()) return false
+        // An episode whose number cannot be read must not guess:
+        // playing the wrong episode is worse than DEBUG.
+        if (clean.contains("الحلقة") && epNum == null) return false
         val norm: (String) -> String = {
             it.replace("أ", "ا").replace("إ", "ا").replace("آ", "ا")
                 .replace("ة", "ه").replace(" ", "").replace("-", "")
@@ -542,6 +563,32 @@ class WeCimaMobileProvider : MainAPI() {
             }
         }
         return false
+    }
+
+    /** WP fallback from a loaded watch page's <title>. */
+    private suspend fun wpFallbackFromTitle(
+        watchText: String,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        val rawTitle = Regex("""<title>([^<]*)</title>""").find(watchText)
+            ?.groupValues?.get(1)?.trim() ?: return false
+        val clean = rawTitle.substringBefore(" - وي سيما").substringBefore(" | ").trim()
+        return wpFallback(clean, callback)
+    }
+
+    /** WP fallback from the episode/film slug, used when the watch
+     * page itself never loads (403 block page carries no title). */
+    private suspend fun wpFallbackFromSlug(
+        data: String,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        val slugRaw = data.trimEnd('/').substringAfterLast("/")
+        if (slugRaw.isBlank()) return false
+        val slug = runCatching {
+            java.net.URLDecoder.decode(slugRaw, "UTF-8")
+        }.getOrNull() ?: slugRaw
+        val clean = slug.replace('-', ' ').trim()
+        return wpFallback(clean, callback)
     }
 
     /** Scans a page's text for a direct media URL. */

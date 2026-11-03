@@ -27,6 +27,7 @@ import com.lagradost.cloudstream3.utils.loadExtractor
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.toRequestBody
+import org.json.JSONArray
 import org.json.JSONObject
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
@@ -371,6 +372,16 @@ class WeCimaMobileProvider : MainAPI() {
             ?.trim()?.ifBlank { null }
         val anime = isAnime(decode(url))
 
+        // A WP episode post opens its whole series, not a lone film:
+        // the WP episode set for the series (REST) becomes the
+        // episode list. Falls through to the film response when the
+        // set has < 2 episodes.
+        if ((url.startsWith(wpUrl) || url.startsWith(wpAltUrl)) &&
+            Regex("""حلقة\s*-?\s*\d{1,4}""").containsMatchIn(decode(url))
+        ) {
+            wpEpisodeSeries(url, poster, plot, anime)?.let { return it }
+        }
+
         return if (url.contains("/episode/")) {
             // The episode page links its series' other episodes; the
             // same-series set shares this slug's stem (verified live:
@@ -439,11 +450,80 @@ class WeCimaMobileProvider : MainAPI() {
                 listOf(ep)
             ) {}
         } else {
+            if (Regex("""حلقة\s*-?\s*\d{1,4}""").containsMatchIn(slug)) {
+                wpEpisodeSeries(url, null, null, anime)?.let { return it }
+            }
             newMovieLoadResponse(
                 clean.ifBlank { url }, url,
                 if (anime) TvType.Anime else TvType.Movie,
                 url
             ) {}
+        }
+    }
+
+    /** Groups a WP episode post into its series via the open WP REST
+     * API. The site hosts only a few episode posts per series on WP
+     * (verified live: سيدو وحورية = E1-E4 + E7/E8, E5/E6/E9/E10 404),
+     * its /series/ hub pages list other shows' latest episodes, and
+     * WP search does not paginate — so the REST post search is the
+     * only source returning the series' whole WP episode set.
+     * Returns null when the set has < 2 episodes, so the caller
+     * keeps the single-film response: this can never make a title
+     * worse. Episode data is the WP post URL, which loadLinks
+     * already plays through its WP fallback. */
+    private suspend fun wpEpisodeSeries(
+        url: String, poster: String?, plot: String?, anime: Boolean
+    ): LoadResponse? {
+        val slugDec = decode(url.trimEnd('/').substringAfterLast("/"))
+        val stem = slugDec.substringBefore("-الحلقة").substringBefore("-حلقة")
+        val seriesTitle = slugDec.replace('-', ' ')
+            .removePrefix("مشاهدة مسلسل ").removePrefix("مشاهدة ").trim()
+            .substringBefore(" الحلقة ").substringBefore(" حلقة ").trim()
+            .removeSuffix("مترجمة").removeSuffix("مترجم").trim()
+        if (seriesTitle.isBlank() || stem.isBlank()) return null
+        val byKey = LinkedHashMap<String, Episode>()
+        for (page in 1..2) {
+            val body = runCatching {
+                app.get(
+                    "$wpUrl/wp-json/wp/v2/posts?search=" +
+                        java.net.URLEncoder.encode(seriesTitle, "UTF-8") +
+                        "&per_page=100&page=$page",
+                    headers = browserHeaders
+                ).text
+            }.getOrNull() ?: break
+            val arr = runCatching { JSONArray(body) }.getOrNull() ?: break
+            if (arr.length() == 0) break
+            var added = 0
+            for (i in 0 until arr.length()) {
+                val obj = arr.optJSONObject(i) ?: continue
+                val postSlug = decode(obj.optString("slug"))
+                if (!postSlug.startsWith(stem)) continue
+                val num = Regex("""حلقة\s*-?\s*(\d{1,4})""").find(postSlug)
+                    ?.groupValues?.get(1)?.toIntOrNull() ?: continue
+                val season = seasonOf(postSlug)
+                val key = "$season:$num"
+                if (byKey.containsKey(key)) continue
+                byKey[key] = newEpisode("$wpUrl/" + obj.optString("slug") + "/") {
+                    this.name = "الحلقة $num"
+                    this.season = season
+                    this.episode = num
+                }
+                added++
+            }
+            if (added == 0) break
+            if (arr.length() < 100) break
+        }
+        if (byKey.size < 2) return null
+        val episodes = byKey.values.sortedWith(
+            compareBy({ it.season ?: 1 }, { it.episode ?: 0 })
+        )
+        return newTvSeriesLoadResponse(
+            seriesTitle, url,
+            if (anime) TvType.Anime else TvType.TvSeries,
+            episodes
+        ) {
+            this.posterUrl = poster
+            this.plot = plot
         }
     }
 
@@ -714,9 +794,28 @@ class WeCimaMobileProvider : MainAPI() {
                     app.get(redirUrl, headers = browserHeaders, referer = postUrl).text
                 }.getOrNull() ?: continue
                 val direct = extractDirect(redirText)
+                    ?: unpackPackedJs(redirText).firstNotNullOfOrNull { extractDirect(it) }
                 if (direct != null) {
                     emitDirect(direct, redirUrl, callback)
                     return true
+                }
+                // One nested iframe level: embed pages often frame
+                // the real player (same coverage as scanEmbed).
+                val nested = Regex("""<iframe[^>]+src="([^"]+)"""")
+                    .find(redirText)?.groupValues?.get(1)
+                    ?.takeIf { it.startsWith("http") }
+                if (nested != null) {
+                    val nestedText = runCatching {
+                        app.get(fixUrl(nested), headers = browserHeaders, referer = redirUrl).text
+                    }.getOrNull()
+                    val nestedDirect = nestedText?.let {
+                        extractDirect(it)
+                            ?: unpackPackedJs(it).firstNotNullOfOrNull { d -> extractDirect(d) }
+                    }
+                    if (nestedDirect != null) {
+                        emitDirect(nestedDirect, fixUrl(nested), callback)
+                        return true
+                    }
                 }
             }
         }

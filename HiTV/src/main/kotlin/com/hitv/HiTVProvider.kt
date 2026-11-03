@@ -67,6 +67,12 @@ import javax.crypto.spec.SecretKeySpec
  *   Iris-class deep titles remain unlikely via home scan — the scan
  *   covers popular/recent titles only, no full-catalog endpoint
  *   exists in this H5 API.
+ * v9: known-ID search fallback (TEST) — titles the user shared from
+ *   the native app carry a verified (category, id) that H5 search
+ *   cannot discover; when normal search finds nothing and the query
+ *   names such a title, offer it directly. Detail/playback still use
+ *   the normal paths, so this tests only whether H5 serves the title
+ *   from the phone's region (sandbox: detail B0300, play A0001).
  */
 class HiTVProvider : MainAPI() {
     override var mainUrl = "https://h5-api.hitv.ltd"
@@ -276,6 +282,23 @@ class HiTVProvider : MainAPI() {
     // so a query like "رعب" or "زومبي" also finds titles tagged that
     // way even when the word is not in the title.
 
+    // Verified shared titles: IDs come ONLY from share links the user
+    // sent, never invented. (match = lowercase query substring.)
+    private data class KnownTitle(
+        val match: String, val name: String,
+        val category: Int, val id: Int, val poster: String
+    )
+    private val KNOWN_SHARED_TITLES = listOf(
+        // IRIS 2009 — share link sent by the user 2026-11-03:
+        // share/detail?id=15164&category=1&episodeId=86609;
+        // cover filename IRIS_15164.
+        KnownTitle(
+            "iris", "IRIS 2009 (اختبار)",
+            1, 15164,
+            "https://img.netpop.app/cover/20220419/1650339771962_0103d4cc77be5d49021ad41dc9fea3dbIRIS_15164横板.png?imageMogr2/format/webp"
+        )
+    )
+
     override suspend fun search(query: String): List<SearchResponse> {
         val q = query.trim()
         if (q.isBlank()) return emptyList()
@@ -312,6 +335,20 @@ class HiTVProvider : MainAPI() {
                         if (results.size >= 50) return results
                     }
                 }
+            }
+        }
+        // (3) Known-ID fallback: if normal search found nothing and the
+        // query names a verified shared title, offer it directly.
+        if (results.isEmpty()) {
+            for (known in KNOWN_SHARED_TITLES) {
+                if (!nq.contains(known.match)) continue
+                val card = newTvSeriesSearchResponse(
+                    known.name,
+                    "https://hitv.local/${known.category}/${known.id}",
+                    TvType.TvSeries
+                )
+                if (known.poster.isNotBlank()) card.posterUrl = known.poster
+                results += card
             }
         }
         return results

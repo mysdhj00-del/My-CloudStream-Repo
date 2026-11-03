@@ -102,6 +102,11 @@ import java.util.concurrent.atomic.AtomicBoolean
  * + app-context WebView fallback (never noactivity) + single-
  * countdown latch; site-walk fallback deferred until warm-up
  * reports cf1-disabled (panel priority: test warm-up first).
+ * v12: FAST DIAGNOSTIC — v11 also gave an empty list with NO debug
+ * line, so slow-call discard is now the leading theory. For
+ * MiraVD/Mwdy ONLY, skip dig AND sniff, answer in ~2-3s and emit
+ * DEBUG at once. If the v12 line appears, v13 = fast path
+ * (cached cookies + fast sniff); if not, time is exonerated.
  * DEBUG lines now carry a v8 marker so the phone proves which code ran.
  *
  * v7 (Faselhd WebView sniff, user-approved 2026-11-02): last resort
@@ -863,43 +868,18 @@ class TurkMoodProvider(private val appContext: Context? = null) : MainAPI() {
                 found = true
                 continue
             }
-            // v11 (panel consensus, 7/8 voices): MiraVD/Mwdy go to the
-            // warm-up sniff — host root first (CF settle + referrer),
-            // then the embed in the SAME WebView. The plain dig cannot
-            // open them and only burns seconds. Other hosts keep dig.
+            // v12 FAST DIAGNOSTIC: v11's warm-up (~24s) also produced an
+            // empty list with NO debug line, like v7-v10. If slow calls
+            // are discarded by the player, no slow fix can ever show a
+            // result. For these hosts ONLY, answer FAST (API fetch +
+            // loadExtractor only, ~2-3s) and emit the DEBUG line at once.
+            // If the v12 line APPEARS, slow calls are the cause and v13
+            // becomes a FAST path (cached cookies + fast sniff). If it
+            // still does NOT appear, time is not the cause. The warm-up
+            // function stays in the file, uncalled, for v13.
             val host = hostOf(link)
-            if ((host.contains("miravd") || host.contains("mwdy")) && webviewAttempts < 2 && (webviewAttempts == 0 || System.currentTimeMillis() - startedAt < 8000)) {
-                webviewAttempts++
-                val (wlinks, wcode) = runCatching { sniffWithWarmup(link, detailUrl) }.getOrDefault(emptySet<String>() to "err")
-                if (wlinks.isNotEmpty()) {
-                    for (media in wlinks) {
-                        val isHls = media.contains(".m3u8")
-                        val cookies = runCatching { CookieManager.getInstance().getCookie(media) ?: CookieManager.getInstance().getCookie(link) ?: "" }.getOrDefault("")
-                        runCatching {
-                            callback(
-                                newExtractorLink(
-                                    name,
-                                    nm,
-                                    media,
-                                    if (isHls) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
-                                ) {
-                                    this.referer = link
-                                    this.quality = Qualities.Unknown.value
-                                    val hdrs = mutableMapOf(
-                                        "User-Agent" to "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36",
-                                        "Referer" to link
-                                    )
-                                    if (cookies.isNotBlank()) hdrs["Cookie"] = cookies
-                                    this.headers = hdrs
-                                }
-                            )
-                        }
-                    }
-                    outcomes += "$nm:WARMUP(${wlinks.size})"
-                    found = true
-                } else {
-                    outcomes += "$nm:FAIL+$wcode"
-                }
+            if (host.contains("miravd") || host.contains("mwdy")) {
+                outcomes += "$nm:FASTDIAG"
             } else if (dug < 4 && System.currentTimeMillis() - startedAt < 12000) {
                 dug++
                 val (links, code) = runCatching { digEmbed(link, detailUrl) }.getOrDefault(emptySet<String>() to "err")
@@ -946,7 +926,7 @@ class TurkMoodProvider(private val appContext: Context? = null) : MainAPI() {
             callback(
                 newExtractorLink(
                     name,
-                    "DEBUG v11 | " + diag.joinToString(" | "),
+                    "DEBUG v12 | " + diag.joinToString(" | "),
                     "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8",
                     ExtractorLinkType.M3U8
                 ) {

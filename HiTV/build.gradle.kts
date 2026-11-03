@@ -20,7 +20,9 @@
 // v8: server search retried on failure only; home scan over dynamic navs.
 // v9: known-ID search fallback (TEST) — verified shared titles offered
 // directly when normal search finds nothing (IRIS 2009, id 15164).
-version = 9
+// v10: visible play errors — failed getPlayInfo emits an error-named
+// source (code + Arabic reason) instead of silent "no links".
+version = 10
 
 android {
     namespace = "com.hitv"

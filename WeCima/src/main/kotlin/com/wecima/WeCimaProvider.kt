@@ -300,7 +300,8 @@ class WeCimaProvider : MainAPI() {
         return Fetched(res.document, res.code, mainUrl)
     }
 
-    // Sections mirror wecima.mobile's own category menu (v9).
+    // Sections mirror the mobile theme's own category menu (v9, now weciema.net),
+    // plus the WP home row (v23) so home covers both backends.
     override val mainPage = mainPageOf(
         "$mobileUrl/" to "المضاف حديثا",
         "$mobileUrl/category/افلام-اجنبي" to "أفلام أجنبية",
@@ -319,6 +320,7 @@ class WeCimaProvider : MainAPI() {
         "$mobileUrl/category/برامج-تلفزيونية" to "برامج تلفزيونية",
         "$mobileUrl/category/عروض-مصارعة" to "عروض مصارعة",
         "$mobileUrl/category/مسلسلات-رمضان-2026" to "مسلسلات رمضان 2026",
+        "$mainUrl/" to "آخر الإضافات",
     )
 
     // ---------- helpers ----------
@@ -505,13 +507,39 @@ class WeCimaProvider : MainAPI() {
         return newHomePageResponse(request.name, items, hasNext = hasNext)
     }
 
+    // v23: COMPREHENSIVE search — both backends, merged. Mobile search
+    // and WP search return DIFFERENT sets (verified live 2026-11-03:
+    // "immortal" → mobile has Immortal Emperor's Urban Life, WP has
+    // Immortal 2026 + Beyond Immortals; neither is a superset).
+    // Mobile items first (richer resolve chain); exact-normalized
+    // title duplicates merged, the rest kept (two entries for one
+    // episode = two playback routes, not a bug).
+    private fun searchKey(title: String): String {
+        var t = title.trim()
+        t = t.removePrefix("مشاهدة ").removePrefix("مسلسل ").removePrefix("فيلم ")
+        t = t.removeSuffix(" مترجمة").removeSuffix(" مترجم")
+            .removeSuffix(" مدبلجة").removeSuffix(" مدبلج")
+        t = t.replace('أ', 'ا').replace('إ', 'ا').replace('آ', 'ا').replace('ة', 'ه')
+        return t.trim()
+    }
+
     override suspend fun search(query: String): List<SearchResponse> {
-        val url = mobileUrl + "/search?s=" + java.net.URLEncoder.encode(query, "UTF-8")
-        val items = fetchPage(url).document.parseCards()
-        if (items.isNotEmpty()) return items
+        val enc = java.net.URLEncoder.encode(query, "UTF-8")
+        val mUrl = mobileUrl + "/search?s=" + enc
+        val wUrl = mainUrl + "/?s=" + enc
+        val mobileItems = runCatching { fetchPage(mUrl).document.parseCards() }.getOrDefault(emptyList())
+        val wpItems = runCatching { fetchPage(wUrl).document.parseCards() }.getOrDefault(emptyList())
+        val seen = LinkedHashSet<String>()
+        val out = ArrayList<SearchResponse>()
+        for (item in mobileItems + wpItems) {
+            val key = searchKey(item.name)
+            if (key.isNotBlank() && !seen.add(key)) continue
+            out += item
+        }
+        if (out.isNotEmpty()) return out
         // v16: distinguish "no results" from "fetch failed" visibly.
         return listOf(
-            newMovieSearchResponse("DEBUG search cards=0", url, TvType.Movie) {}
+            newMovieSearchResponse("DEBUG search cards=0 mobile=${mobileItems.size} wp=${wpItems.size}", mUrl, TvType.Movie) {}
         )
     }
 

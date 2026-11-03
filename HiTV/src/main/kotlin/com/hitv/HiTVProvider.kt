@@ -59,6 +59,14 @@ import javax.crypto.spec.SecretKeySpec
  *   sign = MD5hex(Base64(AES-128-ECB( ts + Base64url(sorted param
  *   values concatenated) ))); aesKey = RSA/PKCS1-encrypted random
  *   16-char key with the public key shipped in that same JS.
+ * v8: server search retried on failure (3 attempts, 6s — an empty
+ *   00000 array is the index's dead behaviour, not a failure, so it
+ *   still returns at once); search home scan uses navigationBar
+ *   live, filtered to HOME (Shorts 1000090 joins; Coming Soon
+ *   MOVIE_RESERVE skipped), falling back to the hardcoded navs.
+ *   Iris-class deep titles remain unlikely via home scan — the scan
+ *   covers popular/recent titles only, no full-catalog endpoint
+ *   exists in this H5 API.
  */
 class HiTVProvider : MainAPI() {
     override var mainUrl = "https://h5-api.hitv.ltd"
@@ -227,6 +235,26 @@ class HiTVProvider : MainAPI() {
     //
     // Probed 2026-11-01, method corrected from the site's own JS (POST,
     // not GET — GET returns "Request method 'GET' not supported"):
+    /** v8: navigationBar fetched live (android client, apiData already
+     *  retries A0201) and filtered to HOME sections, so new sections
+     *  (e.g. Shorts 1000090) join the search scan automatically;
+     *  Coming Soon (MOVIE_RESERVE) is reservations-only and skipped.
+     *  Falls back to the hardcoded navs if the fetch fails or yields
+     *  nothing. */
+    private suspend fun dynamicNavs(): List<Int> {
+        val fallback = listOf(1000004, 1000016, 1000017, 1000018, 1000019)
+        val data = apiData("/home/h5/navigationBar", emptyMap(), "android_hitv1128", "216") ?: return fallback
+        val items = data.optJSONArray("navigationBarItemList") ?: return fallback
+        val navs = ArrayList<Int>()
+        for (i in 0 until items.length()) {
+            val it = items.optJSONObject(i) ?: continue
+            if (it.optString("redirectContentType") != "HOME") continue
+            val id = it.optInt("id", 0)
+            if (id != 0) navs += id
+        }
+        return navs.ifEmpty { fallback }
+    }
+
     // POST /cms/v2/h5/search/searchWithKeyWord with the accepted body
     // {keyword, page, size} returns code 00000 but an EMPTY array for
     // every keyword tried, including "a", "Colony", "Blue" and "القلعة";
@@ -241,7 +269,8 @@ class HiTVProvider : MainAPI() {
     // v7 therefore makes the scan as strong as the API allows:
     // (1) try the server search first (cheap; if its index ever
     // recovers, those results win), (2) scan ALL home pages 1-3 for
-    // ALL 5 navs (no early exit after page 1), deduplicated, capped
+    // all HOME navs (dynamic, Shorts included; no early exit after
+    // page 1), deduplicated, capped
     // at 50 results, and (3) match against title, videoName, the
     // English slug in cid, the plot introduction, AND the tag list —
     // so a query like "رعب" or "زومبي" also finds titles tagged that
@@ -261,8 +290,8 @@ class HiTVProvider : MainAPI() {
             cardForSearch(it, id)?.let { results += it }
             if (results.size >= 50) return results
         }
-        // (2) Full home scan, pages 1-3, all navs, no early exit.
-        val navs = listOf(1000004, 1000016, 1000017, 1000018, 1000019)
+        // (2) Full home scan, pages 1-3, all HOME navs (dynamic), no early exit.
+        val navs = dynamicNavs()
         for (page in 1..3) {
             for (nav in navs) {
                 val data = apiData(
@@ -333,46 +362,58 @@ class HiTVProvider : MainAPI() {
 
     /** POST searchWithKeyWord via raw HttpURLConnection (sign over the
      *  JSON body fields, exactly as the site's own JS signs POSTs).
-     *  Returns the raw result items, or empty when the endpoint gives
-     *  nothing (its current behaviour for every keyword). */
+     *  v8: failures (non-2xx, non-00000 code, exception) are retried
+     *  3 times with 6s spacing, like apiData — the service is
+     *  burst-sensitive (A0201). An empty 00000 array is the index's
+     *  current (dead) behaviour, NOT a failure, so it returns at once
+     *  instead of burning retries. Returns the raw result items. */
     private fun serverSearch(query: String): List<JSONObject> {
-        return try {
-            val body = JSONObject()
-            body.put("keyword", query)
-            body.put("page", 1)
-            body.put("size", 20)
-            val params = mapOf("keyword" to query, "page" to "1", "size" to "20")
-            val ts = System.currentTimeMillis()
-            val conn = java.net.URL("$API/cms/v2/h5/search/searchWithKeyWord")
-                .openConnection() as java.net.HttpURLConnection
-            conn.requestMethod = "POST"
-            conn.doOutput = true
-            conn.connectTimeout = 15000
-            conn.readTimeout = 15000
-            conn.setRequestProperty("Content-Type", "application/json")
-            conn.setRequestProperty("Accept", "application/json")
-            for ((k, v) in signedHeaders(params, "H5", "32", ts)) {
-                conn.setRequestProperty(k, v)
+        for (attempt in 0..2) {
+            try {
+                val body = JSONObject()
+                body.put("keyword", query)
+                body.put("page", 1)
+                body.put("size", 20)
+                val params = mapOf("keyword" to query, "page" to "1", "size" to "20")
+                val ts = System.currentTimeMillis()
+                val conn = java.net.URL("$API/cms/v2/h5/search/searchWithKeyWord")
+                    .openConnection() as java.net.HttpURLConnection
+                conn.requestMethod = "POST"
+                conn.doOutput = true
+                conn.connectTimeout = 15000
+                conn.readTimeout = 15000
+                conn.setRequestProperty("Content-Type", "application/json")
+                conn.setRequestProperty("Accept", "application/json")
+                for ((k, v) in signedHeaders(params, "H5", "32", ts)) {
+                    conn.setRequestProperty(k, v)
+                }
+                conn.outputStream.bufferedWriter(Charsets.UTF_8).use {
+                    it.write(body.toString())
+                }
+                if (conn.responseCode !in 200..299) {
+                    if (attempt < 2) { Thread.sleep(6000); continue }
+                    return emptyList()
+                }
+                val text = conn.inputStream.bufferedReader(Charsets.UTF_8).readText()
+                val json = JSONObject(text)
+                if (json.optString("code") != "00000") {
+                    if (attempt < 2) { Thread.sleep(6000); continue }
+                    return emptyList()
+                }
+                val data = json.opt("data") ?: return emptyList()
+                val arr = when (data) {
+                    is org.json.JSONArray -> data
+                    is JSONObject -> data.optJSONArray("list")
+                        ?: data.optJSONArray("searchResults")
+                        ?: return emptyList()
+                    else -> return emptyList()
+                }
+                return (0 until arr.length()).mapNotNull { arr.optJSONObject(it) }
+            } catch (e: Exception) {
+                if (attempt < 2) Thread.sleep(6000) else return emptyList()
             }
-            conn.outputStream.bufferedWriter(Charsets.UTF_8).use {
-                it.write(body.toString())
-            }
-            if (conn.responseCode !in 200..299) return emptyList()
-            val text = conn.inputStream.bufferedReader(Charsets.UTF_8).readText()
-            val json = JSONObject(text)
-            if (json.optString("code") != "00000") return emptyList()
-            val data = json.opt("data") ?: return emptyList()
-            val arr = when (data) {
-                is org.json.JSONArray -> data
-                is JSONObject -> data.optJSONArray("list")
-                    ?: data.optJSONArray("searchResults")
-                    ?: return emptyList()
-                else -> return emptyList()
-            }
-            (0 until arr.length()).mapNotNull { arr.optJSONObject(it) }
-        } catch (e: Exception) {
-            emptyList()
         }
+        return emptyList()
     }
 
     // ---------- detail ----------

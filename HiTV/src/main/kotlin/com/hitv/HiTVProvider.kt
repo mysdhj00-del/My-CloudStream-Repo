@@ -73,6 +73,11 @@ import javax.crypto.spec.SecretKeySpec
  *   names such a title, offer it directly. Detail/playback still use
  *   the normal paths, so this tests only whether H5 serves the title
  *   from the phone's region (sandbox: detail B0300, play A0001).
+ * v10: visible play errors (user order 2026-11-03) — when getPlayInfo
+ *   fails, loadLinks no longer dies with a silent "no links": it
+ *   emits one clearly-labeled error source (Mux test stream) whose
+ *   name carries the server code + Arabic reason, restoring the
+ *   pre-v3 DEBUG visibility the user asked back for.
  */
 class HiTVProvider : MainAPI() {
     override var mainUrl = "https://h5-api.hitv.ltd"
@@ -158,6 +163,10 @@ class HiTVProvider : MainAPI() {
         )
     }
 
+    // Last API failure, for visible error reporting in loadLinks (v10).
+    private var lastApiCode = ""
+    private var lastApiMsg = ""
+
     /** Signed GET, retried on the burst-sensitive A0201 code. Returns data or null. */
     private suspend fun apiData(
         path: String,
@@ -174,8 +183,12 @@ class HiTVProvider : MainAPI() {
                 val json = runCatching { JSONObject(text) }.getOrNull()
                 if (json != null) {
                     if (json.optString("code") == "00000") {
+                        lastApiCode = ""
+                        lastApiMsg = ""
                         return json.optJSONObject("data")
                     }
+                    lastApiCode = json.optString("code")
+                    lastApiMsg = json.optString("msg")
                     // Any non-success code: retry once more after a pause,
                     // the service is flaky under bursts (A0201 especially).
                     if (attempt < 2) Thread.sleep(6000) else return null
@@ -538,6 +551,9 @@ class HiTVProvider : MainAPI() {
         // 2026-11-01: definition=GROOT_HD returns a real 1080p playlist
         // on Blue Brick Man, Lupin and Colony, with subtitles intact.
         // Fall back to the default stream when HD is not returned.
+        // v10: fresh error state for this play attempt.
+        lastApiCode = ""
+        lastApiMsg = ""
         val playHd = apiData(
             "/cms/web/ios_h5/movieDrama/getPlayInfo",
             mapOf("category" to cat, "id" to id, "episodeId" to epId, "definition" to "GROOT_HD"),
@@ -551,9 +567,9 @@ class HiTVProvider : MainAPI() {
             mapOf("category" to cat, "id" to id, "episodeId" to epId),
             "H5", "32"
         )
-        if (play == null) return false
+        if (play == null) return emitPlayError(callback)
         val mediaUrl = play.optString("mediaUrl")
-        if (mediaUrl.isBlank()) return false
+        if (mediaUrl.isBlank()) return emitPlayError(callback, "الخادم لم يرجع رابط تشغيل")
         // v6 dual subtitles: HiTV titles that carry subtitle files
         // usually carry both English and Arabic (e.g. Colony: en + ar
         // among 11 languages). CloudStream shows one subtitle track at
@@ -606,6 +622,40 @@ class HiTVProvider : MainAPI() {
                 this.quality = if (isHd) Qualities.P1080.value else Qualities.Unknown.value
             }
         )
+        return true
+    }
+
+    /**
+     * v10: a failed play attempt becomes one visible error source
+     * instead of a silent "no links". The name carries the server
+     * code + Arabic reason; the URL is the Mux test stream (same
+     * diagnostic pattern TurkMood uses), so tapping it proves the
+     * player works and the block is the content, not the player.
+     */
+    private suspend fun emitPlayError(
+        callback: (ExtractorLink) -> Unit,
+        reasonOverride: String? = null,
+    ): Boolean {
+        val reason = reasonOverride ?: when (lastApiCode) {
+            "A0001" -> "المحتوى غير متاح بناءً على طلب حامل الحقوق"
+            "A0201" -> "خطأ في المعاملات (جرّب مجدداً)"
+            "B0300" -> "المورد غير موجود"
+            "" -> "تعذر الاتصال بالخادم"
+            else -> lastApiMsg.ifBlank { "خطأ غير معروف" }
+        }
+        val label = if (lastApiCode.isNotBlank()) "خطأ $lastApiCode: $reason" else "خطأ: $reason"
+        runCatching {
+            callback(
+                newExtractorLink(
+                    "HiTV",
+                    label,
+                    "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8",
+                    ExtractorLinkType.M3U8
+                ) {
+                    this.quality = Qualities.Unknown.value
+                }
+            )
+        }
         return true
     }
 

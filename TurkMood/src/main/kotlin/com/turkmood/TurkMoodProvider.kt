@@ -112,6 +112,9 @@ import java.util.concurrent.atomic.AtomicBoolean
  * -> watch-form POST dance -> 3esk.onl servers 1..5 -> media;
  * HTTP-only, once per title, stops at first media; DEBUG codes
  * walk/notitle/nosearch/nocand/noep/noform/nopost/noiframe/nomedia.
+ * v14: collections row ("سلاسل الأفلام التركية", /collections-turkish)
+ * + collection detail: member movies as episodes whose data is the
+ * movie API URL, so playback reuses the normal movie flow.
  * DEBUG lines now carry a v8 marker so the phone proves which code ran.
  *
  * v7 (Faselhd WebView sniff, user-approved 2026-11-02): last resort
@@ -175,6 +178,7 @@ class TurkMoodProvider(private val appContext: Context? = null) : MainAPI() {
         "$api/series-turkish-dubbed" to "مسلسلات تركية مدبلجة",
         "$api/movies-turkish-translated" to "أفلام تركية مترجمة",
         "$api/movies-turkish-dubbed" to "أفلام تركية مدبلجة",
+        "$api/collections-turkish" to "سلاسل الأفلام التركية",
     )
 
     // ---------- JSON helpers ----------
@@ -207,6 +211,14 @@ class TurkMoodProvider(private val appContext: Context? = null) : MainAPI() {
         val poster = poster()
         val year = optYear()
         return when {
+            rowUrl.contains("/collections") -> {
+                // v14: collection cards open the collection detail page,
+                // which lists the member movies as episodes.
+                newTvSeriesSearchResponse(title, "$api/collections-turkish/$id", TvType.TvSeries) {
+                    this.posterUrl = poster
+                    this.year = year
+                }
+            }
             rowUrl.contains("/episodes/latest") -> {
                 // Latest-episode items link to their series page; the
                 // series page lists every episode for playback.
@@ -300,9 +312,35 @@ class TurkMoodProvider(private val appContext: Context? = null) : MainAPI() {
         val item = json.optJSONObject("item") ?: throw ErrorLoadingException("No item")
         val title = item.optStr("title") ?: throw ErrorLoadingException("No title")
         val poster = item.poster()
-        val plot = item.optStr("description")
+        val plot = item.optStr("description", "overview_ar", "overview_en")
         val year = item.optYear()
-        return if (url.contains("/series/")) {
+        return if (url.contains("/collections-")) {
+            // v14: collection detail — members are regular movies; each
+            // member becomes an "episode" whose data is the movie API
+            // URL, so loadLinks plays it through the normal movie flow
+            // (including the v13 site-walk for MiraVD/Mwdy).
+            val movies = item.optJSONArray("movies")
+            if (movies == null || movies.length() == 0) throw ErrorLoadingException("No movies")
+            val episodes = ArrayList<com.lagradost.cloudstream3.Episode>()
+            for (m in 0 until movies.length()) {
+                val mv = movies.optJSONObject(m) ?: continue
+                val mvId = mv.optInt("id", -1)
+                if (mvId < 0) continue
+                val mvTitle = mv.optStr("title") ?: continue
+                episodes += newEpisode("$api/movies/$mvId") {
+                    this.name = mvTitle
+                    this.posterUrl = mv.poster()
+                    this.season = 1
+                    this.episode = m + 1
+                }
+            }
+            if (episodes.isEmpty()) throw ErrorLoadingException("No movies")
+            newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
+                this.posterUrl = poster
+                this.plot = plot
+                this.year = year
+            }
+        } else if (url.contains("/series/")) {
             val episodes = ArrayList<com.lagradost.cloudstream3.Episode>()
             val seasons = item.optJSONArray("seasons")
             if (seasons != null) {

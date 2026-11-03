@@ -648,7 +648,9 @@ class WeCimaProvider : MainAPI() {
         // source when nothing playable is found.
         val diag = mutableListOf<String>()
         if (data.contains("wecima.mobile") || data.contains("weciema.net")) {
-            return loadLinksMobile(data, diag, subtitleCallback, callback)
+            val ok = loadLinksMobile(data, diag, subtitleCallback, callback)
+            if (!ok) emitDebug(diag, callback)
+            return true
         }
         // A WordPress-domain item (an old gripe/tattoo entry, e.g. from
         // the user's history) whose slug also exists on wecima.mobile is
@@ -704,7 +706,12 @@ class WeCimaProvider : MainAPI() {
             }
             if (twinFound != null) {
                 diag += "twin=hit"
-                return loadLinksMobile(twinFound, diag, subtitleCallback, callback)
+                val twinOk = loadLinksMobile(twinFound, diag, subtitleCallback, callback)
+                if (twinOk) return true
+                // The mobile chain is gated (or dead): fall through to
+                // the WordPress chain on the original post instead of
+                // the DEBUG test video.
+                diag += "twinFail=1"
             }
         }
         val fetched = runCatching { fetchPage(data) }.getOrNull()
@@ -1102,14 +1109,15 @@ class WeCimaProvider : MainAPI() {
     }
 
     /**
-     * Mobile playback (traced end-to-end live on 2026-10-16): the post's
-     * /watch/{slug} page carries an inline `const servers = [...]` list
-     * (12-13 standard hosts), a per-page watchResolveKey and a CSRF
-     * token. POST /watch/resolve {key, index} with the session cookies
-     * answers {ok, url:"/m/{hash}"}; that fragment 302s / meta-refreshes
-     * to the server's real embed (verified: m1xdrop -> m1xdrop.bz/e/...,
-     * earnvids -> fastvid.cam/embed/...). EVERY server is resolved and
-     * handed to the extractors — no first-hit stop (Mohamed's rule).
+     * Mobile playback: the post's /watch/{slug} page carries an inline
+     * `const servers = [...]` list, a per-page watchResolveKey and a
+     * CSRF token. POST /watch/resolve {key, token, human_signal}
+     * with the session cookies answers {ok, url:"/m/{hash}"}; that
+     * fragment redirects to the server's real embed. EVERY server is
+     * resolved and handed to the extractors — no first-hit stop
+     * (Mohamed's rule). Since the 2026-11 domain move the site gates
+     * resolve behind human verification (409 + verification_url) —
+     * then the WordPress chain is the playback fallback.
      */
     /**
      * Percent-encodes any non-ASCII characters of a URL string. The
@@ -1158,19 +1166,21 @@ class WeCimaProvider : MainAPI() {
      * would download the whole embed page just to learn its URL).
      */
     private fun resolveOneMobile(
-        index: Int,
+        token: String,
         key: String,
         csrf: String,
         cookieHeader: String,
         watchUrl: String
-    ): String? {
+    ): Pair<String?, Boolean> {
         val ua = browserHeaders["User-Agent"] ?: "Mozilla/5.0"
-        val body = JSONObject().put("key", key).put("index", index).toString()
+        val body = JSONObject().put("key", key).put("token", token)
+            .put("human_signal", JSONObject.NULL).toString()
         val postReq = okhttp3.Request.Builder()
             .url("$mobileUrl/watch/resolve")
             .header("User-Agent", ua)
             .header("X-CSRF-TOKEN", csrf)
             .header("X-Requested-With", "XMLHttpRequest")
+            .header("X-FP-Event-ID", "")
             .header("Accept", "application/json")
             .header("Content-Type", "application/json")
             .header("Referer", watchUrl)
@@ -1178,17 +1188,19 @@ class WeCimaProvider : MainAPI() {
             .post(body.toRequestBody("application/json".toMediaType()))
             .build()
         var rText: String? = null
+        var gated = false
         for (attempt in 1..2) {
             awaitPace()
             rText = runCatching {
                 rawClient.newCall(postReq).execute().use { it.body?.string() }
             }.getOrNull()
+            if (rText != null && rText.contains("verification_url")) gated = true
             if (rText != null) break
             Thread.sleep(700)
         }
         val frag = (rText?.let { runCatching { JSONObject(it) }.getOrNull() })
             ?.takeIf { it.optBoolean("ok") }?.optString("url")?.takeIf { it.isNotBlank() }
-            ?: return null
+            ?: return null to gated
         val fragUrl = if (frag.startsWith("http")) frag else mobileUrl + frag
         val getReq = okhttp3.Request.Builder()
             .url(fragUrl)
@@ -1208,7 +1220,7 @@ class WeCimaProvider : MainAPI() {
                         ?: Regex("""<a href="([^"]+)"""").find(t)?.groupValues?.get(1)
                 }
             }
-        }.getOrNull()
+        }.getOrNull() to gated
     }
 
     private companion object {
@@ -1254,7 +1266,7 @@ class WeCimaProvider : MainAPI() {
      * resolves servers 0..count-1 to embed URLs, in server order.
      */
     private fun phase1Mobile(
-        count: Int,
+        tokens: List<String>,
         key: String,
         csrf: String,
         cookieHeader: String,
@@ -1263,14 +1275,21 @@ class WeCimaProvider : MainAPI() {
     ): List<Pair<Int, String>> {
         val hits = java.util.Collections.synchronizedList(mutableListOf<Pair<Int, String>>())
         val fails = java.util.Collections.synchronizedList(mutableListOf<Int>())
+        val gates = java.util.Collections.synchronizedList(mutableListOf<Boolean>())
         val pool = java.util.concurrent.Executors.newFixedThreadPool(3)
-        val latch = java.util.concurrent.CountDownLatch(count)
+        val latch = java.util.concurrent.CountDownLatch(tokens.size)
         val t0 = System.currentTimeMillis()
-        for (index in 0 until count) {
+        for (index in tokens.indices) {
             pool.execute {
                 try {
-                    val embed = resolveOneMobile(index, key, csrf, cookieHeader, watchUrl)
-                    if (embed != null) hits += index to embed else fails += index
+                    val token = tokens[index]
+                    if (token.isBlank()) {
+                        fails += index
+                    } else {
+                        val (embed, gated) = resolveOneMobile(token, key, csrf, cookieHeader, watchUrl)
+                        if (gated) gates += true
+                        if (embed != null) hits += index to embed else fails += index
+                    }
                 } catch (e: Exception) {
                     fails += index
                 } finally {
@@ -1282,6 +1301,7 @@ class WeCimaProvider : MainAPI() {
         pool.shutdown()
         diag += "p1ms=${System.currentTimeMillis() - t0}"
         if (fails.isNotEmpty()) diag += "fails=${fails.sorted()}"
+        if (gates.isNotEmpty()) diag += "gate=409"
         return hits.sortedBy { it.first }
     }
 
@@ -1334,11 +1354,15 @@ class WeCimaProvider : MainAPI() {
                     ?.groupValues?.get(1) ?: return@runCatching
                 val serversJson = Regex("""const servers = (\[.*?\]);""", RegexOption.DOT_MATCHES_ALL)
                     .find(text)?.groupValues?.get(1) ?: return@runCatching
-                val count = runCatching { org.json.JSONArray(serversJson).length() }
-                    .getOrDefault(0)
-                if (count == 0) return@runCatching
+                val tokens = runCatching {
+                    val arr = org.json.JSONArray(serversJson)
+                    (0 until arr.length()).map { i ->
+                        arr.optJSONObject(i)?.optString("resolve_token") ?: ""
+                    }
+                }.getOrDefault(emptyList())
+                if (tokens.isEmpty()) return@runCatching
                 val sink = mutableListOf<String>()
-                val hits = phase1Mobile(count, key, csrf, session.second, watchUrl, sink)
+                val hits = phase1Mobile(tokens, key, csrf, session.second, watchUrl, sink)
                 if (hits.isNotEmpty()) {
                     playCache[url] = System.currentTimeMillis() to hits.map { it.second }
                 }
@@ -1381,10 +1405,7 @@ class WeCimaProvider : MainAPI() {
             }
             diag += "watch=${res?.code ?: "err"}"
             if (watchErr != null) diag += "werr=$watchErr"
-            if (res == null) {
-                emitDebug(diag, callback)
-                return true
-            }
+            if (res == null) return false
             val cookies = runCatching { res.cookies }.getOrNull().orEmpty()
             val text = res.text
             val key = Regex("""watchResolveKey\s*=\s*"([^"]+)"""").find(text)?.groupValues?.get(1)
@@ -1392,21 +1413,21 @@ class WeCimaProvider : MainAPI() {
             val serversJson = Regex("""const servers = (\[.*?\]);""", RegexOption.DOT_MATCHES_ALL)
                 .find(text)?.groupValues?.get(1)
             val servers = mutableListOf<String>()
+            val serverTokens = mutableListOf<String>()
             if (serversJson != null) {
                 val arr = runCatching { org.json.JSONArray(serversJson) }.getOrNull()
                 if (arr != null) {
                     for (i in 0 until arr.length()) {
-                        servers += arr.optJSONObject(i)?.optString("name") ?: "server$i"
+                        val obj = arr.optJSONObject(i)
+                        servers += obj?.optString("name") ?: "server$i"
+                        serverTokens += obj?.optString("resolve_token") ?: ""
                     }
                 }
             }
             diag += "servers=${servers.size}"
-            if (key == null || csrf == null || servers.isEmpty()) {
-                emitDebug(diag, callback)
-                return true
-            }
+            if (key == null || csrf == null || servers.isEmpty()) return false
             val cookieHeader = cookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
-            var hits = phase1Mobile(servers.size, key, csrf, cookieHeader, watchUrl, diag)
+            var hits = phase1Mobile(serverTokens, key, csrf, cookieHeader, watchUrl, diag)
             if (hits.isEmpty()) {
                 // Re-warm once: fresh watch page -> fresh session.
                 diag += "rewarm=1"
@@ -1423,7 +1444,7 @@ class WeCimaProvider : MainAPI() {
                 val cookies2 = res2?.let { runCatching { it.cookies }.getOrNull() }.orEmpty()
                 if (key2 != null && csrf2 != null) {
                     hits = phase1Mobile(
-                        servers.size, key2, csrf2,
+                        serverTokens, key2, csrf2,
                         cookies2.entries.joinToString("; ") { e -> "${e.key}=${e.value}" },
                         watchUrl, diag
                     )
@@ -1467,10 +1488,6 @@ class WeCimaProvider : MainAPI() {
             }
             diag += "relay=$relayed"
             if (relayed > 0) found = true
-        }
-        if (!found) {
-            emitDebug(diag, callback)
-            return true
         }
         return found
     }

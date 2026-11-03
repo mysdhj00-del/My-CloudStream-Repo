@@ -1388,6 +1388,7 @@ class WeCimaProvider : MainAPI() {
         // this title's embeds — then the play press skips everything
         // below and goes straight to the extractors.
         var embeds: List<String>? = null
+        var watchTitle: String? = null
         val cached = playCache[data]
         if (cached != null && System.currentTimeMillis() - cached.first < 10 * 60 * 1000L) {
             diag += "cache=hit"
@@ -1412,6 +1413,7 @@ class WeCimaProvider : MainAPI() {
             if (res == null) return false
             val cookies = runCatching { res.cookies }.getOrNull().orEmpty()
             val text = res.text
+            watchTitle = Regex("""<title>([^<]*)</title>""").find(text)?.groupValues?.get(1)?.trim()
             val key = Regex("""watchResolveKey\s*=\s*"([^"]+)"""").find(text)?.groupValues?.get(1)
             val csrf = Regex("""csrfToken\s*=\s*"([^"]+)"""").find(text)?.groupValues?.get(1)
             val serversJson = Regex("""const servers = (\[.*?\]);""", RegexOption.DOT_MATCHES_ALL)
@@ -1493,7 +1495,117 @@ class WeCimaProvider : MainAPI() {
             diag += "relay=$relayed"
             if (relayed > 0) found = true
         }
+        if (!found) {
+            // Direct-mobile items have no twin to fall back to: try
+            // the WordPress chain (search by title/slug) before DEBUG.
+            diag += "wpFb=1"
+            if (wpFallbackMobile(data, watchTitle, subtitleCallback, callback)) {
+                diag += "wpFbHit=1"
+                return true
+            }
+        }
         return found
+    }
+
+    /**
+     * WordPress fallback for direct-mobile items: when the mobile
+     * chain yields nothing (gated resolve, blocked watch page), find
+     * the same episode on wecima.vin by title (or episode slug) and
+     * play its redirector stream (plain videoUrl, no gate).
+     */
+    private suspend fun wpFallbackMobile(
+        data: String,
+        watchTitle: String?,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        val titleClean = watchTitle
+            ?.substringBefore(" - وي سيما")?.substringBefore(" | ")?.trim()
+            ?.takeIf { it.isNotBlank() }
+        val clean = titleClean ?: run {
+            val slugRaw = data.trimEnd('/').substringAfterLast("/")
+            if (slugRaw.isBlank()) return false
+            val slug = runCatching {
+                java.net.URLDecoder.decode(slugRaw, "UTF-8")
+            }.getOrNull() ?: slugRaw
+            slug.replace('-', ' ').trim()
+        }
+        if (clean.isBlank()) return false
+        val series = clean.substringBefore(" الحلقة ").trim()
+        val epNum = Regex("""الحلقة\s*-?\s*(\d{1,4})""").find(clean)?.groupValues?.get(1)
+        if (series.isBlank()) return false
+        // An episode whose number cannot be read must not guess:
+        // playing the wrong episode is worse than DEBUG.
+        if (clean.contains("الحلقة") && epNum == null) return false
+        val norm: (String) -> String = {
+            it.replace("أ", "ا").replace("إ", "ا").replace("آ", "ا")
+                .replace("ة", "ه").replace(" ", "").replace("-", "")
+        }
+        val seriesNorm = norm(series)
+        val epNeedle = if (epNum != null) norm("الحلقة$epNum") else null
+        val queries = mutableListOf<String>()
+        if (epNum != null) queries += "$series الحلقة $epNum"
+        queries += series
+        for (query in queries) {
+            val searchText = runCatching {
+                app.get(
+                    "$mainUrl/?s=" + java.net.URLEncoder.encode(query, "UTF-8"),
+                    headers = browserHeaders
+                ).text
+            }.getOrNull() ?: continue
+            val hrefs = Regex("""<a[^>]+href="([^"]+)"[^>]*>""")
+                .findAll(searchText).map { it.groupValues[1] }.toList()
+            for (href in hrefs) {
+                if (!href.startsWith(mainUrl)) continue
+                val slugRaw = href.trimEnd('/').substringAfterLast("/")
+                val slug = runCatching {
+                    java.net.URLDecoder.decode(slugRaw, "UTF-8")
+                }.getOrNull() ?: slugRaw
+                val slugNorm = norm(slug)
+                if (!slugNorm.contains(seriesNorm)) continue
+                if (epNeedle != null && !slugNorm.contains(epNeedle)) continue
+                val postUrl = fixUrl(href)
+                val postDoc = runCatching { fetchPage(postUrl) }.getOrNull()?.document
+                    ?: continue
+                val servers = LinkedHashSet<String>()
+                postDoc.select("[data-watch]").forEach {
+                    val link = it.attr("data-watch").trim()
+                    if (link.startsWith("http")) servers += fixUrl(link)
+                }
+                postDoc.select(".WatchArea iframe[src]").forEach {
+                    val src = it.attr("src").trim()
+                    if (src.startsWith("http")) servers += fixUrl(src)
+                }
+                for (server in servers) {
+                    if (loadExtractor(server, postUrl, subtitleCallback, callback)) return true
+                    val pageText = runCatching {
+                        app.get(server, headers = browserHeaders, referer = postUrl).text
+                    }.getOrNull() ?: continue
+                    val videoUrl = Regex("""videoUrl\s*=\s*"([^"]+)"""").find(pageText)
+                        ?.groupValues?.get(1)?.replace("\\/", "/")?.trim()
+                    if (!videoUrl.isNullOrBlank() && videoUrl.startsWith("http")) {
+                        val streamHeaders = browserHeaders + mapOf(
+                            "Accept" to "*/*",
+                            "Sec-Fetch-Dest" to "video",
+                            "Sec-Fetch-Mode" to "no-cors",
+                            "Sec-Fetch-Site" to "cross-site"
+                        )
+                        callback(
+                            newExtractorLink(
+                                name, name, videoUrl,
+                                if (videoUrl.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                            ) {
+                                this.referer = server
+                                this.headers = streamHeaders
+                                this.quality = Qualities.Unknown.value
+                            }
+                        )
+                        return true
+                    }
+                }
+            }
+        }
+        return false
     }
 
     /** Emits the collected stage markers as one playable debug source. */

@@ -486,6 +486,16 @@ class WeCimaProvider : MainAPI() {
         val fetched = fetchPage(url)
         var items = fetched.document.parseCards()
         var isDebug = false
+        if (items.isEmpty() && page <= 1) {
+            // v27: the mobile host rate-blocks the phone's IP (403) —
+            // fall back to the WordPress twin category, which lives
+            // on a different host with the same content, before DEBUG.
+            wpSectionTwin(url)?.let { twin ->
+                val wpItems = runCatching { fetchPage(twin) }.getOrNull()
+                    ?.document?.parseCards().orEmpty()
+                if (wpItems.isNotEmpty()) items = wpItems
+            }
+        }
         if (items.isEmpty()) {
             // v16: surface WHAT the app received as a visible card, so
             // an "empty catalog" report carries its own diagnosis (the
@@ -505,6 +515,24 @@ class WeCimaProvider : MainAPI() {
             sectionCache[url] = Triple(System.currentTimeMillis(), items, hasNext)
         }
         return newHomePageResponse(request.name, items, hasNext = hasNext)
+    }
+
+    // Maps a mobile section URL to its WordPress twin (v27): the
+    // operator's WP site carries the same categories (verified live:
+    // /category/افلام-اجنبي/ → 92 GridItems), with two slug renames.
+    // Non-mobile URLs stay null; a twin that yields nothing falls
+    // through to DEBUG (four niche sections have no WP twin).
+    private fun wpSectionTwin(url: String): String? {
+        val base = url.trimEnd('/').substringBefore("?page=")
+        if (base == mobileUrl) return "$mainUrl/"
+        if (!base.startsWith("$mobileUrl/category/")) return null
+        val slug = base.removePrefix("$mobileUrl/category/")
+        val mapped = when (slug) {
+            "افلام-اسيوية" -> "افلام-اسيوي"
+            "مسلسلات-عربي" -> "مسلسلات-عربية"
+            else -> slug
+        }
+        return "$mainUrl/category/$mapped/"
     }
 
     // v23: COMPREHENSIVE search — both backends, merged. Mobile search

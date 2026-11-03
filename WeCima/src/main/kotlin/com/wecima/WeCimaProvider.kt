@@ -27,6 +27,7 @@ import com.lagradost.cloudstream3.utils.loadExtractor
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.toRequestBody
+import org.json.JSONArray
 import org.json.JSONObject
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
@@ -586,6 +587,14 @@ class WeCimaProvider : MainAPI() {
                     ?: document.selectFirst("meta[property=\"og:title\"]")?.attr("content")
                     ?: throw ErrorLoadingException("No title")
             )
+            // The hub page mixes other shows' latest episodes in:
+            // keep only links carrying every word of this hub's own
+            // series name (archives, whose slug has no Arabic words,
+            // keep the old unfiltered behaviour).
+            val hubBase = decode(url.trimEnd('/').substringAfterLast("/"))
+                .substringBefore("-الموسم")
+            val hubWords = hubBase.split("-")
+                .filter { it.length > 1 && it.any { c -> c.code > 127 } }
             val episodes = mutableListOf<Episode>()
             val seen = HashSet<String>()
             document.select("a[href]").forEach { a ->
@@ -594,8 +603,9 @@ class WeCimaProvider : MainAPI() {
                     href == url || !seen.add(href)
                 ) return@forEach
                 val dec = decode(href)
-                if (!dec.contains("الحلقة")) return@forEach
-                val num = Regex("""الحلقة\s*-?\s*(\d{1,4})""").find(dec)?.groupValues?.get(1)?.toIntOrNull()
+                if (!dec.contains("حلقة")) return@forEach
+                if (hubWords.isNotEmpty() && !hubWords.all { dec.contains(it) }) return@forEach
+                val num = Regex("""حلقة\s*-?\s*(\d{1,4})""").find(dec)?.groupValues?.get(1)?.toIntOrNull()
                 episodes += newEpisode(href) {
                     this.name = num?.let { "الحلقة $it" } ?: cleanTitle(a.attr("title"))
                     this.season = seasonOf(dec)
@@ -614,13 +624,16 @@ class WeCimaProvider : MainAPI() {
             }
         }
 
-        // An episode post delegates to its series hub when the page links one,
-        // so the user lands on the full episode list.
-        if (decoded.contains("الحلقة")) {
-            val hub = document.select("a[href*=\"/series/\"]")
-                .map { fixUrl(it.attr("href")) }
-                .firstOrNull { it.contains("/series/") && it != url }
-            if (hub != null) return load(hub)
+        // An episode post groups into its series via the open WP REST
+        // API: /series/ hub pages list other shows' latest episodes
+        // (verified live), and WP search does not paginate, so REST
+        // is the only source returning the series' whole WP episode
+        // set. Falls through to the film response when the set has
+        // < 2 episodes. Bare حلقة posts are covered too (the old
+        // hub delegation only matched the ال form).
+        if (decoded.contains("حلقة")) {
+            wpEpisodeSeries(url, document.pagePoster(), document.pagePlot(), anime)
+                ?.let { return it }
         }
 
         val title = cleanTitle(
@@ -635,6 +648,68 @@ class WeCimaProvider : MainAPI() {
         ) {
             this.posterUrl = document.pagePoster()
             this.plot = document.pagePlot()
+        }
+    }
+
+    /** Groups a WP episode post into its series via the open WP REST
+     * API (same rationale as the Mobile provider: hub pages mix in
+     * other shows, WP search does not paginate). Returns null when
+     * the set has < 2 episodes, so the caller keeps the film
+     * response. Episode data is the WP post URL, which loadLinks
+     * already plays through its WP fallback. */
+    private suspend fun wpEpisodeSeries(
+        url: String, poster: String?, plot: String?, anime: Boolean
+    ): LoadResponse? {
+        val slugDec = decode(url.trimEnd('/').substringAfterLast("/"))
+        val stem = slugDec.substringBefore("-الحلقة").substringBefore("-حلقة")
+        val seriesTitle = slugDec.replace('-', ' ')
+            .removePrefix("مشاهدة مسلسل ").removePrefix("مشاهدة ").trim()
+            .substringBefore(" الحلقة ").substringBefore(" حلقة ").trim()
+            .removeSuffix("مترجمة").removeSuffix("مترجم").trim()
+        if (seriesTitle.isBlank() || stem.isBlank()) return null
+        val byKey = LinkedHashMap<String, Episode>()
+        for (page in 1..2) {
+            val body = runCatching {
+                app.get(
+                    "$mainUrl/wp-json/wp/v2/posts?search=" +
+                        java.net.URLEncoder.encode(seriesTitle, "UTF-8") +
+                        "&per_page=100&page=$page",
+                    headers = browserHeaders
+                ).text
+            }.getOrNull() ?: break
+            val arr = runCatching { JSONArray(body) }.getOrNull() ?: break
+            if (arr.length() == 0) break
+            var added = 0
+            for (i in 0 until arr.length()) {
+                val obj = arr.optJSONObject(i) ?: continue
+                val postSlug = decode(obj.optString("slug"))
+                if (!postSlug.startsWith(stem)) continue
+                val num = Regex("""حلقة\s*-?\s*(\d{1,4})""").find(postSlug)
+                    ?.groupValues?.get(1)?.toIntOrNull() ?: continue
+                val season = seasonOf(postSlug)
+                val key = "$season:$num"
+                if (byKey.containsKey(key)) continue
+                byKey[key] = newEpisode("$mainUrl/" + obj.optString("slug") + "/") {
+                    this.name = "الحلقة $num"
+                    this.season = season
+                    this.episode = num
+                }
+                added++
+            }
+            if (added == 0) break
+            if (arr.length() < 100) break
+        }
+        if (byKey.size < 2) return null
+        val episodes = byKey.values.sortedWith(
+            compareBy({ it.season ?: 1 }, { it.episode ?: 0 })
+        )
+        return newTvSeriesLoadResponse(
+            seriesTitle, url,
+            if (anime) TvType.Anime else TvType.TvSeries,
+            episodes
+        ) {
+            this.posterUrl = poster
+            this.plot = plot
         }
     }
 

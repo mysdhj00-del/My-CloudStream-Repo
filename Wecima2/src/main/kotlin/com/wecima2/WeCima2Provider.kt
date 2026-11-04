@@ -126,28 +126,24 @@ import org.jsoup.nodes.Element
  *   cookie (expires, leaks a session — CloudflareKiller solves it
  *   properly instead) and its decode variant (prepends "aHR0c";
  *   cx's drop(3) decode is verified live and stays).
- * - v9 (user 2026-11-04 23:11-23:13: "أصبح جيد لكن اريد
- *   جميع الأقسام تظهر وتعرض كل محتوى الأقسام بتمرير الجانبي
- *   بالكامل" + "مثل قسم مسلسلات رمضان 2025" + "في الإضافة
- *   cloudstream وهكذا كل الأقسام"): (a) mainPage is now the
- *   site's FULL nav, 22 sections in nav order (verified live
- *   from the homepage: 7 film, 6 series, Ramadan 2026 + 2021..
- *   2025, anime-series, tv-shows, wwe-shows) — the 10 missing
- *   ones (asian-movies, indian/asian-series, Ramadan 2021-2025,
- *   tv/wwe-shows) are added; (b) each section row now carries
- *   its FULL catalog, not just page 1: pages are fetched until
- *   a page adds zero NEW cards (the site clamps past-the-end
- *   pages to a repeated tail — verified on Ramadan 2025: 28 +
- *   28 + 24 + 5, then 5 repeated) or a 5-page cap (140 cards),
- *   with cross-page dedupe; hasNext stays true only when the
- *   cap was hit with new cards still coming, so the section
- *   detail view continues pagination from there; (c) the
- *   search-fallback section-type rule now reads the URL slug
- *   (contains "-series") instead of the label, so Ramadan-year
- *   sections fall back to series queries, not movies.
- *   Sections still load sequentially (safe with the shared
- *   CloudflareKiller cookie store); rows render progressively
- *   as each section completes.
+ * - v10 (user 2026-11-04 23:32: "لا تكرر اسم الحلقات يكفي
+ *   واحدة العنوان واسفلها الحلقات بدل المتكرر طبقها على كل
+ *   الأقسام", with screenshots of the tv-shows grid repeating
+ *   one card per episode — e.g. مدفع رمضان حلقة 23..30 — and a
+ *   Mux-only episode tap): episode cards (-sNN-eNN URLs) in
+ *   EVERY section are now collapsed into ONE card per show:
+ *   the first episode kept, retitled to the clean show name
+ *   (episode markers cut: "الحلقة/حلقة N", "مN:حN", "مشاهدة "
+ *   lead-in), typed TvSeries. Tapping it runs load() on the
+ *   episode URL, which resolves to the full series hub (verified
+ *   live: episode pages link their series, e.g. ramez-level-
+ *   elwahsh-s01-e30 -> ramez-level-elwahsh-2026-series via the
+ *   existing stem match, both -series and bare-year slug forms),
+ *   so the episodes sit beneath the title. Verified live that
+ *   TV-episode watch pages DO carry real servers (ramez e30: 4
+ *   btn decoded to luluvdo/dhcplay/doodstream), so a Mux-only
+ *   episode tap on-phone is a phone-context failure, not an
+ *   empty watch page — re-test asked on v10.
  */
 class WeCima2Provider : MainAPI() {
     override var mainUrl = "https://wecima.cx"
@@ -373,11 +369,57 @@ class WeCima2Provider : MainAPI() {
         }
         if (items.isEmpty()) {
             val o = outcome
-            val debugTitle = "DEBUG v9 home ${request.name} cat=$catCount pages=$pagesFetched q=$q a=${o?.attempt ?: "-"} code=${o?.code ?: 0} len=${o?.bodyLen ?: 0} r=${o?.reason ?: "nocat"} fb=$feedCount"
+            val debugTitle = "DEBUG v10 home ${request.name} cat=$catCount pages=$pagesFetched q=$q a=${o?.attempt ?: "-"} code=${o?.code ?: 0} len=${o?.bodyLen ?: 0} r=${o?.reason ?: "nocat"} fb=$feedCount"
             items = listOf(newMovieSearchResponse(debugTitle, request.data, TvType.Movie) {})
+        }
+        if (items.isNotEmpty()) {
+            // v10: one card per show, episodes beneath the title.
+            // (The DEBUG card is created only in the empty branch
+            // above, so it can never reach this grouping.)
+            items = groupEpisodes(items)
         }
         val hasNext = fromCategory && moreMayExist
         return newHomePageResponse(sectionName, items, hasNext = hasNext)
+    }
+
+    /**
+     * v10: collapse episode cards (-sNN-eNN URLs) into ONE card
+     * per show — first episode kept, retitled to the clean show
+     * name, typed TvSeries — in every section, whatever the
+     * source (category, search fallback, feed). Non-episode
+     * cards pass through in order.
+     */
+    private fun groupEpisodes(items: List<SearchResponse>): List<SearchResponse> {
+        val out = ArrayList<SearchResponse>()
+        val seenShows = HashSet<String>()
+        for (item in items) {
+            val m = episodeUrlRegex.find(item.url)
+            if (m == null) {
+                out.add(item)
+                continue
+            }
+            val stem = item.url.substring(0, m.range.first)
+            if (!seenShows.add(stem)) continue
+            val showTitle = cleanShowTitle(item.name)
+            out.add(newTvSeriesSearchResponse(showTitle, item.url, TvType.TvSeries) {
+                this.posterUrl = item.posterUrl
+                this.posterHeaders = item.posterHeaders
+            })
+        }
+        return out
+    }
+
+    /** Strips episode markers from a card title, leaving the show name. */
+    private fun cleanShowTitle(raw: String): String {
+        var t = raw.trim().removePrefix("مشاهدة ").trim()
+        Regex("""\s*(الحلقة|حلقة)\s*\d+.*$""").find(t)?.let {
+            t = t.substring(0, it.range.first).trim()
+        }
+        Regex("""\s*["'“”]?\s*م\d+\s*:\s*ح\d+.*$""").find(t)?.let {
+            t = t.substring(0, it.range.first).trim()
+        }
+        t = t.substringBefore(" |").trim()
+        return t.ifEmpty { raw }
     }
 
     // ---------- search ----------

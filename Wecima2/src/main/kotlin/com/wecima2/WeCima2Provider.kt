@@ -69,6 +69,13 @@ import org.jsoup.nodes.Element
  *   DEBUG card carrying page length, card-marker, challenge-marker,
  *   status and page title, so an empty section on the phone is
  *   diagnosable from a screenshot instead of silent.
+ * - v4 (panel-driven): when a section still parses 0 cards, fall back
+ *   to the site's own RSS feed (/feed/, 40 latest items with posters),
+ *   then to the working search API with a broad Latin query
+ *   ("2026" for series sections, "love" for movie sections — Arabic
+ *   generics return 0, verified live). Fallback sections are marked
+ *   "(بديل)" in their name. Category GETs also carry Referer + Accept
+ *   headers now (panel suggestion: compare against the working POST).
  * - No coroutine imports anywhere (CI classpath law): plain code,
  *   Thread-free, suspend functions only where the API requires them.
  */
@@ -97,6 +104,8 @@ class WeCima2Provider : MainAPI() {
     private val headers = mapOf(
         "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
         "Accept-Language" to "ar,en;q=0.9",
+        "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Referer" to "https://wecima.cx/",
     )
 
     // ---------- cards ----------
@@ -202,13 +211,38 @@ class WeCima2Provider : MainAPI() {
             // Fall through to the DEBUG card below: an empty section
             // must never be silent about what the fetch returned.
         }
+        var sectionName = request.name
+        var feedCount = 0
+        var searchCount = 0
+        if (items.isEmpty()) {
+            // Fallback 1: the site's own RSS feed (latest items).
+            val feedItems = try { fetchFeedItems() } catch (e: Exception) { emptyList() }
+            feedCount = feedItems.size
+            if (feedItems.isNotEmpty()) {
+                items = feedItems
+                sectionName = request.name + " (بديل)"
+            } else {
+                // Fallback 2: the working search API with a broad
+                // query. Latin words match; Arabic generics return 0
+                // (verified live: "فيلم"/"مسلسل"/"أنمي" -> 0, while
+                // "2026" -> 20 series-heavy, "love" -> 20 movie-heavy).
+                val q = if (request.name.contains("مسلسلات")) "2026" else "love"
+                val searchItems = try { runSearch(q) } catch (e: Exception) { emptyList() }
+                searchCount = searchItems.size
+                if (searchItems.isNotEmpty()) {
+                    items = searchItems
+                    sectionName = request.name + " (بديل)"
+                }
+            }
+        }
         if (items.isEmpty()) {
             val debugTitle = "DEBUG home ${request.name} cards=0 len=$pageLen " +
-                "card=$hasCardMarker chal=$challenge code=$code t=$pageTitle"
+                "card=$hasCardMarker chal=$challenge code=$code fb=$feedCount/$searchCount t=$pageTitle"
             items = listOf(newMovieSearchResponse(debugTitle, url, TvType.Movie) {})
         }
-        val hasNext = doc?.selectFirst("a[href$=\"/page/${page + 1}\"]") != null
-        return newHomePageResponse(request.name, items, hasNext = hasNext)
+        val hasNext = if (sectionName != request.name) false
+            else doc?.selectFirst("a[href$=\"/page/${page + 1}\"]") != null
+        return newHomePageResponse(sectionName, items, hasNext = hasNext)
     }
 
     // ---------- search ----------
@@ -240,6 +274,11 @@ class WeCima2Provider : MainAPI() {
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
+        return runSearch(query)
+    }
+
+    /** POSTs the site's search API (field q=) and maps its items. */
+    private fun runSearch(query: String): List<SearchResponse> {
         val text = try {
             val form = okhttp3.FormBody.Builder().add("q", query).build()
             val req = okhttp3.Request.Builder()
@@ -262,6 +301,41 @@ class WeCima2Provider : MainAPI() {
             }
         } catch (e: Exception) {
             // Unknown shape: never crash search, just return what we have.
+        }
+        return out
+    }
+
+    /**
+     * The site's own RSS feed (/feed/): 40 latest items with title,
+     * link and poster. Verified live 2026-11-04. Used only as a
+     * fallback when a category page yields no cards on the phone.
+     */
+    private fun fetchFeedItems(): List<SearchResponse> {
+        val text = try {
+            app.get("$mainUrl/feed/", headers = headers).text
+        } catch (e: Exception) {
+            return emptyList()
+        }
+        val out = ArrayList<SearchResponse>()
+        val seen = HashSet<String>()
+        val itemRegex = Regex("""<item>(.*?)</item>""", RegexOption.DOT_MATCHES_ALL)
+        for (block in itemRegex.findAll(text)) {
+            val body = block.groupValues[1]
+            val title = Regex("""<title>([^<]*)</title>""").find(body)?.groupValues?.get(1)?.trim()
+                ?.ifEmpty { null } ?: continue
+            val link = Regex("""<link>([^<]*)</link>""").find(body)?.groupValues?.get(1)?.trim()
+                ?.ifEmpty { null } ?: continue
+            if (!seen.add(link)) continue
+            val poster = Regex("""<media:content[^>]+url="([^"]+)"""").find(body)?.groupValues?.get(1)
+            if (link.contains("/series/")) {
+                out.add(newTvSeriesSearchResponse(title, link, TvType.TvSeries) {
+                    this.posterUrl = poster
+                })
+            } else {
+                out.add(newMovieSearchResponse(title, link, TvType.Movie) {
+                    this.posterUrl = poster
+                })
+            }
         }
         return out
     }

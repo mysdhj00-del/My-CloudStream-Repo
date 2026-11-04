@@ -76,6 +76,14 @@ import org.jsoup.nodes.Element
  *   generics return 0, verified live). Fallback sections are marked
  *   "(بديل)" in their name. Category GETs also carry Referer + Accept
  *   headers now (panel suggestion: compare against the working POST).
+ * - v5 (on-device v4 verdict: home STILL shows DEBUG cards after a
+ *   full restart, so feed + search fallbacks also failed from the
+ *   home context while search from the search box works): warm-up —
+ *   one homepage visit per client per process before sections, so
+ *   any session cookie is present (panel: shared session) — plus a
+ *   POST-category retry, because POST to a category URL returns the
+ *   same full page as GET from the sandbox, and the edge already
+ *   lets the search POST through on the phone while GETs fail.
  * - No coroutine imports anywhere (CI classpath law): plain code,
  *   Thread-free, suspend functions only where the API requires them.
  */
@@ -169,6 +177,54 @@ class WeCima2Provider : MainAPI() {
         "Accept-Language" to "ar,en;q=0.9",
     )
 
+    // Warm-up flags: one homepage visit per client per process, so
+    // any session cookie the site sets is present before sections
+    // are fetched (panel: shared session / warm-up). Duplicates
+    // from concurrent section loads are harmless idempotent GETs.
+    private var warmedApp = false
+    private var warmedSearch = false
+
+    private suspend fun warmUp() {
+        if (!warmedApp) {
+            warmedApp = true
+            try { app.get(mainUrl, headers = headers) } catch (e: Exception) { }
+        }
+        if (!warmedSearch) {
+            warmedSearch = true
+            try {
+                val req = okhttp3.Request.Builder()
+                    .url(mainUrl)
+                    .header("User-Agent", headers["User-Agent"] ?: "Mozilla/5.0")
+                    .header("Referer", "$mainUrl/")
+                    .build()
+                searchClient.newCall(req).execute().close()
+            } catch (e: Exception) { }
+        }
+    }
+
+    /**
+     * Fetches a category page with POST instead of GET. Verified
+     * live: POST to a category URL returns the same full page as
+     * GET. Used when GET yields 0 cards on the phone: if the edge
+     * filters GET patterns but lets POST through (as it lets the
+     * search POST through), this returns the real page.
+     */
+    private fun postCategory(url: String): Document? {
+        return try {
+            val form = okhttp3.FormBody.Builder().build()
+            val req = okhttp3.Request.Builder()
+                .url(url)
+                .header("User-Agent", headers["User-Agent"] ?: "Mozilla/5.0")
+                .header("Referer", "$mainUrl/")
+                .post(form)
+                .build()
+            val body = searchClient.newCall(req).execute().use { it.body?.string() } ?: return null
+            org.jsoup.Jsoup.parse(body, url)
+        } catch (e: Exception) {
+            null
+        }
+    }
+
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = if (page > 1) request.data.trimEnd('/') + "/page/$page" else request.data
         var items: List<SearchResponse> = emptyList()
@@ -178,6 +234,8 @@ class WeCima2Provider : MainAPI() {
         var hasCardMarker = false
         var challenge = false
         var code = 0
+        var postCards = 0
+        try { warmUp() } catch (e: Exception) { }
         try {
             val res = app.get(url, headers = headers)
             val text = res.text
@@ -211,6 +269,20 @@ class WeCima2Provider : MainAPI() {
             // Fall through to the DEBUG card below: an empty section
             // must never be silent about what the fetch returned.
         }
+        if (items.isEmpty()) {
+            // POST-category retry: same page as GET from the
+            // sandbox, but POSTs already pass the edge on the
+            // phone (search POST works there) while GETs fail.
+            val postDoc = postCategory(url)
+            if (postDoc != null) {
+                val postItems = parseCards(postDoc)
+                postCards = postItems.size
+                if (postItems.isNotEmpty()) {
+                    items = postItems
+                    doc = postDoc
+                }
+            }
+        }
         var sectionName = request.name
         var feedCount = 0
         var searchCount = 0
@@ -237,7 +309,7 @@ class WeCima2Provider : MainAPI() {
         }
         if (items.isEmpty()) {
             val debugTitle = "DEBUG home ${request.name} cards=0 len=$pageLen " +
-                "card=$hasCardMarker chal=$challenge code=$code fb=$feedCount/$searchCount t=$pageTitle"
+                "card=$hasCardMarker chal=$challenge code=$code fb=$feedCount/$searchCount pc=$postCards t=$pageTitle"
             items = listOf(newMovieSearchResponse(debugTitle, url, TvType.Movie) {})
         }
         val hasNext = if (sectionName != request.name) false

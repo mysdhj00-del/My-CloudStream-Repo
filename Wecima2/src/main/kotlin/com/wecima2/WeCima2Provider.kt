@@ -24,7 +24,6 @@ import com.lagradost.cloudstream3.utils.newExtractorLink
 import org.json.JSONObject
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
-import java.net.URLEncoder
 
 /**
  * Wecima2 provider for CloudStream 3 — dedicated to https://wecima.cx.
@@ -48,14 +47,17 @@ import java.net.URLEncoder
  *   doodstream / mixdrop / luluvdo / dhcplay / savefiles / byselapuix /
  *   vidspeed / 1vid / bysesukior / hgcloud / playmogo embeds — all
  *   standard file-host embeds handed to loadExtractor.
- * - Search: GET /search?s=<q> returns JSON {status, results, sections}.
- *   NOTE (2026-11-04): the endpoint returns status:false + empty
- *   arrays for every query probed from outside the browser, including
- *   known-existing titles, so search() is implemented defensively
- *   against the documented shape and will light up if the site's
- *   index starts answering; a real-browser check of the site's own
- *   search box is still pending. Search never throws: empty in,
- *   empty out.
+ * - Search: POST https://wecima.cx/search with form field q=<query>
+ *   (CRACKED 2026-11-04: the field NAME is the key — GET /search?s=
+ *   and POST with s=/search=/keyword= all return status:false + empty,
+ *   even from inside a real browser session; POST q= returns
+ *   status:true + results[]. Item shape: {title, year, slug, image,
+ *   istv, ribbon, rating, quality, genre}; istv 0 = film
+ *   (slug ends -movie -> /watch/<slug>), 1 = series (slug ends
+ *   -series -> /series/<slug>), 2 = episode (slug -sNN-eMM ->
+ *   /watch/<slug>, and load() resolves it to its series).
+ *   Verified live: "between steps" -> 8 results (series + E1-E7),
+ *   "avengers" -> 7 film results.
  * - Catalog note: cx is a DIFFERENT catalog from vin/mobile (verified
  *   via its 52-file sitemap): no Sido, no subtitle طالع نازل — but it
  *   uniquely covers turkish-series, korean-series, tv-shows and
@@ -157,45 +159,52 @@ class WeCima2Provider : MainAPI() {
 
     // ---------- search ----------
 
+    private val searchClient by lazy {
+        okhttp3.OkHttpClient.Builder()
+            .connectTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
+            .readTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
+            .build()
+    }
+
     private fun searchItem(obj: JSONObject): SearchResponse? {
-        val href = obj.optString("url").ifEmpty { obj.optString("link") }
-            .ifEmpty { obj.optString("href") }
-        if (href.isEmpty()) return null
-        val title = obj.optString("title").ifEmpty { obj.optString("name") }
-        if (title.isEmpty()) return null
-        val poster = obj.optString("poster").ifEmpty { obj.optString("image") }
-            .ifEmpty { obj.optString("thumbnail") }
-        val fixed = fixUrl(href)
-        return if (fixed.contains("/series/")) {
-            newTvSeriesSearchResponse(title, fixed, TvType.TvSeries) {
-                this.posterUrl = poster.ifEmpty { null }
+        val slug = obj.optString("slug")
+        val title = obj.optString("title")
+        if (slug.isEmpty() || title.isEmpty()) return null
+        val poster = obj.optString("image").ifEmpty { null }
+        return when (obj.optInt("istv", 0)) {
+            1 -> newTvSeriesSearchResponse(title, "$mainUrl/series/$slug", TvType.TvSeries) {
+                this.posterUrl = poster
             }
-        } else {
-            newMovieSearchResponse(title, fixed, TvType.Movie) {
-                this.posterUrl = poster.ifEmpty { null }
+            2 -> newTvSeriesSearchResponse(title, "$mainUrl/watch/$slug", TvType.TvSeries) {
+                // Episode hit: load() resolves it to its full series.
+                this.posterUrl = poster
+            }
+            else -> newMovieSearchResponse(title, "$mainUrl/watch/$slug", TvType.Movie) {
+                this.posterUrl = poster
             }
         }
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
-        val encoded = URLEncoder.encode(query, "UTF-8")
         val text = try {
-            app.get("$mainUrl/search?s=$encoded", headers = headers).text
+            val form = okhttp3.FormBody.Builder().add("q", query).build()
+            val req = okhttp3.Request.Builder()
+                .url("$mainUrl/search")
+                .header("User-Agent", headers["User-Agent"] ?: "Mozilla/5.0")
+                .header("Referer", "$mainUrl/")
+                .post(form)
+                .build()
+            searchClient.newCall(req).execute().use { it.body?.string() } ?: return emptyList()
         } catch (e: Exception) {
             return emptyList()
         }
         val out = ArrayList<SearchResponse>()
         val seen = HashSet<String>()
         try {
-            val root = JSONObject(text)
-            val arrays = listOf(root.optJSONArray("results"), root.optJSONArray("sections"))
-            for (arr in arrays) {
-                if (arr == null) continue
-                for (i in 0 until arr.length()) {
-                    val obj = arr.optJSONObject(i) ?: continue
-                    val item = searchItem(obj) ?: continue
-                    if (seen.add(item.url)) out.add(item)
-                }
+            val arr = JSONObject(text).optJSONArray("results") ?: return out
+            for (i in 0 until arr.length()) {
+                val item = searchItem(arr.optJSONObject(i) ?: continue) ?: continue
+                if (seen.add(item.url)) out.add(item)
             }
         } catch (e: Exception) {
             // Unknown shape: never crash search, just return what we have.

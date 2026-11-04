@@ -126,6 +126,18 @@ import org.jsoup.nodes.Element
  *   cookie (expires, leaks a session — CloudflareKiller solves it
  *   properly instead) and its decode variant (prepends "aHR0c";
  *   cx's drop(3) decode is verified live and stays).
+ * - v11 (user 2026-11-05 00:31: "تكرار الأفلام ومسلسلات
+ *   بنفس الاسم ... طبق الإصلاح على كل من يعني نفس المشكلة"
+ *   + بهار Mux-only): v10 grouped episodes only, so hub +
+ *   episodes of one show still duplicated the name. merge
+ *   ShowCards now keys hub and episode cards by one show-key
+ *   (hub slug minus -series/-YYYY == episode stem) and keeps
+ *   ONE card per show (hub preferred) plus exact same-title
+ *   dedupe, in every section. Bahar: all episodes verified to
+ *   carry only an "Update Server" placeholder btn (watchUpdate,
+ *   no real servers) — site-side absence, not a decode bug;
+ *   loadLinks now labels that case "no-servers-on-site" in the
+ *   source list instead of a bare Mux.
  * - v10 (user 2026-11-04 23:32: "لا تكرر اسم الحلقات يكفي
  *   واحدة العنوان واسفلها الحلقات بدل المتكرر طبقها على كل
  *   الأقسام", with screenshots of the tv-shows grid repeating
@@ -369,44 +381,86 @@ class WeCima2Provider : MainAPI() {
         }
         if (items.isEmpty()) {
             val o = outcome
-            val debugTitle = "DEBUG v10 home ${request.name} cat=$catCount pages=$pagesFetched q=$q a=${o?.attempt ?: "-"} code=${o?.code ?: 0} len=${o?.bodyLen ?: 0} r=${o?.reason ?: "nocat"} fb=$feedCount"
+            val debugTitle = "DEBUG v11 home ${request.name} cat=$catCount pages=$pagesFetched q=$q a=${o?.attempt ?: "-"} code=${o?.code ?: 0} len=${o?.bodyLen ?: 0} r=${o?.reason ?: "nocat"} fb=$feedCount"
             items = listOf(newMovieSearchResponse(debugTitle, request.data, TvType.Movie) {})
         }
         if (items.isNotEmpty()) {
-            // v10: one card per show, episodes beneath the title.
+            // v11: one card per show/title, episodes beneath the title.
             // (The DEBUG card is created only in the empty branch
-            // above, so it can never reach this grouping.)
-            items = groupEpisodes(items)
+            // above, so it can never reach this merging.)
+            items = mergeShowCards(items)
         }
         val hasNext = fromCategory && moreMayExist
         return newHomePageResponse(sectionName, items, hasNext = hasNext)
     }
 
     /**
-     * v10: collapse episode cards (-sNN-eNN URLs) into ONE card
-     * per show — first episode kept, retitled to the clean show
-     * name, typed TvSeries — in every section, whatever the
-     * source (category, search fallback, feed). Non-episode
-     * cards pass through in order.
+     * v11 (user 2026-11-05 00:31: "تكرار الأفلام ومسلسلات
+     * بنفس الاسم ... طبق الإصلاح على كل من يعني نفس المشكلة"):
+     * v10 grouped episodes only, so a section holding BOTH a
+     * series hub card (istv=1, e.g. bahar-2024-series) AND its
+     * episode cards still showed the same name twice. This
+     * merges EVERYTHING belonging to one show/title into ONE
+     * card, in every section, whatever the source:
+     * - series items (hub or episode) are keyed by show-key:
+     *   episode stem (URL minus -sNN-eNN) == hub slug minus
+     *   "-series" minus a trailing "-YYYY" (verified: bahar
+     *   hub "bahar-2024-series" -> "bahar" == episode stem
+     *   "bahar"; ramiz-movie-star-2022 -> "ramiz-movie-star").
+     *   The HUB card wins (load() goes straight to the series);
+     *   with episodes only, the first episode is kept, retitled
+     *   to the clean show name, typed TvSeries.
+     * - leftover exact same-name cards (films under two slugs,
+     *   etc.) are deduped by normalized title + URL shape.
+     * Order: the merged card sits where its first item was.
      */
-    private fun groupEpisodes(items: List<SearchResponse>): List<SearchResponse> {
-        val out = ArrayList<SearchResponse>()
-        val seenShows = HashSet<String>()
+    private fun showKeyFor(url: String): String? {
+        episodeUrlRegex.find(url)?.let {
+            return url.substring(0, it.range.first).substringAfter("/watch/")
+        }
+        if (url.contains("/series/")) {
+            var slug = url.substringAfter("/series/").trimEnd('/')
+            slug = slug.removeSuffix("-series")
+            slug = Regex("""-\d{4}$""").replace(slug, "")
+            return slug
+        }
+        return null
+    }
+
+    private fun mergeShowCards(items: List<SearchResponse>): List<SearchResponse> {
+        val hubByKey = HashMap<String, SearchResponse>()
+        val epByKey = HashMap<String, SearchResponse>()
         for (item in items) {
-            val m = episodeUrlRegex.find(item.url)
-            if (m == null) {
-                out.add(item)
+            val key = showKeyFor(item.url) ?: continue
+            if (item.url.contains("/series/")) hubByKey.putIfAbsent(key, item)
+            else epByKey.putIfAbsent(key, item)
+        }
+        val merged = ArrayList<SearchResponse>()
+        val emitted = HashSet<String>()
+        for (item in items) {
+            val key = showKeyFor(item.url)
+            if (key == null) {
+                merged.add(item)
                 continue
             }
-            val stem = item.url.substring(0, m.range.first)
-            if (!seenShows.add(stem)) continue
-            val showTitle = cleanShowTitle(item.name)
-            out.add(newTvSeriesSearchResponse(showTitle, item.url, TvType.TvSeries) {
-                this.posterUrl = item.posterUrl
-                this.posterHeaders = item.posterHeaders
-            })
+            if (!emitted.add(key)) continue
+            val hub = hubByKey[key]
+            if (hub != null) merged.add(hub)
+            else {
+                val ep = epByKey[key]!!
+                merged.add(newTvSeriesSearchResponse(cleanShowTitle(ep.name), ep.url, TvType.TvSeries) {
+                    this.posterUrl = ep.posterUrl
+                    this.posterHeaders = ep.posterHeaders
+                })
+            }
         }
-        return out
+        // Exact same-name leftovers (same title, different slugs).
+        val seenTitles = HashSet<String>()
+        return merged.filter { item ->
+            val shape = if (item.url.contains("/series/")) "series" else "watch"
+            val title = item.name.trim().replace(Regex("""\s+"""), " ")
+            seenTitles.add("$shape|$title")
+        }
     }
 
     /** Strips episode markers from a card title, leaving the show name. */
@@ -764,9 +818,16 @@ class WeCima2Provider : MainAPI() {
             // Fall through to the DEBUG marker below: an empty list
             // on the phone must mean loadLinks never ran, not silence.
         }
+        // v11: when the site attached no real servers (e.g.
+        // Bahar: only an "Update Server" placeholder btn),
+        // say so in the source list instead of a bare Mux.
+        val debugName = if (okCount == 0)
+            "DEBUG v11 | no-servers-on-site | page=$pageCode | btn=$btnCount | dec=$decodedCount | ok=0"
+        else
+            "DEBUG v11 | play | page=$pageCode | btn=$btnCount | dec=$decodedCount | ok=$okCount"
         callback(
             newExtractorLink(
-                "DEBUG v1 | play | page=$pageCode | btn=$btnCount | dec=$decodedCount | ok=$okCount",
+                debugName,
                 "Mux",
                 "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8",
                 ExtractorLinkType.M3U8

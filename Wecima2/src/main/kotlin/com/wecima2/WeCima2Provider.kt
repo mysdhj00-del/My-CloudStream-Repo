@@ -16,6 +16,7 @@ import com.lagradost.cloudstream3.newMovieLoadResponse
 import com.lagradost.cloudstream3.newMovieSearchResponse
 import com.lagradost.cloudstream3.newTvSeriesLoadResponse
 import com.lagradost.cloudstream3.newTvSeriesSearchResponse
+import com.lagradost.cloudstream3.network.CloudflareKiller
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
@@ -100,6 +101,31 @@ import org.jsoup.nodes.Element
  *   which code is actually installed.
  * - No coroutine imports anywhere (CI classpath law): plain code,
  *   Thread-free, suspend functions only where the API requires them.
+ * - v7 (on-device v6 verdict 2026-11-04 20:19: the visible cards
+ *   are NOT real titles — "مكتوب عليها", i.e. DEBUG cards again;
+ *   search-from-home AND feed-from-home still yield 0 while the
+ *   search box works; plus the user's redirect to study the Arab
+ *   repo's extensions): Arab repo = arb343, Abodabodd/re-3arabi,
+ *   whose WeCima (wecima.ac, sibling WecimaEngine frontend) was
+ *   read in full. Its lessons, adapted here: (a) EVERY card carries
+ *   posterHeaders with the Cloudflare clearance cookie — phone
+ *   image loads run on a separate stack (Coil) and hit CF without
+ *   it, so posters get posterHeaders here too; (b) requests run
+ *   through CloudflareKiller (the app's own CF solver: passthrough
+ *   unless CF answers 403/503, then WebView-solves and retries
+ *   with the harvested cf_clearance) — the search POST now goes
+ *   through app.post + CloudflareKiller FIRST, with the raw client
+ *   only as a fallback, so a phone-side CF challenge no longer
+ *   silently empties home; (c) sequentialMainPage = true (no
+ *   12-section burst tripping the edge); (d) type filtering
+ *   (build-off Luna idea): series sections keep istv 1 only,
+ *   movie sections keep everything except istv 1; (e) DEBUG cards
+ *   now carry the failure reason + response metadata (attempt,
+ *   HTTP code, body length), so the next screenshot is decisive.
+ *   NOT copied from the Arab provider: its hardcoded cf_clearance
+ *   cookie (expires, leaks a session — CloudflareKiller solves it
+ *   properly instead) and its decode variant (prepends "aHR0c";
+ *   cx's drop(3) decode is verified live and stays).
  */
 class WeCima2Provider : MainAPI() {
     override var mainUrl = "https://wecima.cx"
@@ -107,6 +133,33 @@ class WeCima2Provider : MainAPI() {
     override val hasMainPage = true
     override var lang = "ar"
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries, TvType.Anime)
+
+    // v7 (Arab-repo lesson): sections load one after another, never
+    // as a 12-way burst that could trip the edge before any reply.
+    override var sequentialMainPage = true
+
+    // v7: the app's own Cloudflare solver (passthrough unless CF
+    // answers 403/503, then WebView-solves and retries with the
+    // harvested cf_clearance, cached per host in savedCookies).
+    private val cloudflareKiller by lazy { CloudflareKiller() }
+
+    /**
+     * v7 (Arab-repo lesson): poster loads run on a separate stack
+     * (Coil) from API requests, so cards must carry the headers
+     * themselves — browser UA + Referer, plus the cf_clearance
+     * cookie once CloudflareKiller has solved one.
+     */
+    private fun posterHeaders(): Map<String, String> {
+        val out = HashMap<String, String>()
+        out["User-Agent"] = headers["User-Agent"] ?: "Mozilla/5.0"
+        out["Referer"] = "$mainUrl/"
+        cloudflareKiller.savedCookies["wecima.cx"]?.let { cookies ->
+            if (cookies.isNotEmpty()) {
+                out["Cookie"] = cookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
+            }
+        }
+        return out
+    }
 
     override val mainPage = mainPageOf(
         "$mainUrl/category/foreign-movies" to "أفلام أجنبي",
@@ -212,16 +265,19 @@ class WeCima2Provider : MainAPI() {
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        // v6: home sections come ONLY from the working search POST.
-        // Category GETs (and the POST-category retry) are gone: on
-        // the phone they all failed, and firing them first may poison
-        // the session / trip the edge before the search even runs.
-        // The search UI path (same client, same POST, same headers)
-        // is the one proven path on his phone, so home now issues
-        // exactly that request, first and alone, per section.
+        // v7: home sections come from the search POST through
+        // app.post + CloudflareKiller FIRST (Arab-repo lesson: a
+        // phone-side CF challenge no longer silently empties home),
+        // raw client only as fallback; sections load sequentially;
+        // cards are type-filtered per section; DEBUG cards carry
+        // the failure reason + response metadata.
         try { warmUp() } catch (e: Exception) { }
         val q = if (request.name.contains("مسلسلات")) "2026" else "love"
-        var items: List<SearchResponse> = try { runSearch(q) } catch (e: Exception) { emptyList() }
+        val mode = if (request.name.contains("مسلسلات")) "series" else "movies"
+        val outcome = try { runSearchDetailed(q, mode) } catch (e: Exception) {
+            SearchOutcome(emptyList(), "none", 0, 0, "network")
+        }
+        var items: List<SearchResponse> = outcome.items
         var sectionName = request.name
         var feedCount = 0
         if (items.isEmpty()) {
@@ -234,7 +290,7 @@ class WeCima2Provider : MainAPI() {
             }
         }
         if (items.isEmpty()) {
-            val debugTitle = "DEBUG v6 home ${request.name} q=$q s=0 fb=$feedCount"
+            val debugTitle = "DEBUG v7 home ${request.name} q=$q a=${outcome.attempt} code=${outcome.code} len=${outcome.bodyLen} r=${outcome.reason} fb=$feedCount"
             items = listOf(newMovieSearchResponse(debugTitle, request.data, TvType.Movie) {})
         }
         return newHomePageResponse(sectionName, items, hasNext = false)
@@ -254,26 +310,98 @@ class WeCima2Provider : MainAPI() {
         val title = obj.optString("title")
         if (slug.isEmpty() || title.isEmpty()) return null
         val poster = obj.optString("image").ifEmpty { null }
+        val ph = posterHeaders()
         return when (obj.optInt("istv", 0)) {
             1 -> newTvSeriesSearchResponse(title, "$mainUrl/series/$slug", TvType.TvSeries) {
                 this.posterUrl = poster
+                this.posterHeaders = ph
             }
             2 -> newTvSeriesSearchResponse(title, "$mainUrl/watch/$slug", TvType.TvSeries) {
                 // Episode hit: load() resolves it to its full series.
                 this.posterUrl = poster
+                this.posterHeaders = ph
             }
             else -> newMovieSearchResponse(title, "$mainUrl/watch/$slug", TvType.Movie) {
                 this.posterUrl = poster
+                this.posterHeaders = ph
             }
         }
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
-        return runSearch(query)
+        return runSearchDetailed(query, "all").items
     }
 
-    /** POSTs the site's search API (field q=) and maps its items. */
-    private fun runSearch(query: String): List<SearchResponse> {
+    /** Search outcome with diagnostics for the v7 DEBUG card. */
+    private class SearchOutcome(
+        val items: List<SearchResponse>,
+        val attempt: String,
+        val code: Int,
+        val bodyLen: Int,
+        val reason: String,
+    )
+
+    /** Parses one search-API body into cards (mode: all/series/movies). */
+    private fun parseSearchBody(text: String, mode: String): List<SearchResponse> {
+        val out = ArrayList<SearchResponse>()
+        val seen = HashSet<String>()
+        try {
+            val arr = JSONObject(text).optJSONArray("results") ?: return out
+            for (i in 0 until arr.length()) {
+                val obj = arr.optJSONObject(i) ?: continue
+                val istv = obj.optInt("istv", 0)
+                // v7 type filtering (build-off Luna idea): series
+                // sections keep series only; movie sections drop
+                // series hits; the search box ("all") keeps all.
+                if (mode == "series" && istv != 1) continue
+                if (mode == "movies" && istv == 1) continue
+                val item = searchItem(obj) ?: continue
+                if (seen.add(item.url)) out.add(item)
+            }
+        } catch (e: Exception) {
+            // Unknown shape: never crash search, just return what we have.
+        }
+        return out
+    }
+
+    /**
+     * POSTs the site's search API (field q=). Attempt A goes through
+     * app.post + CloudflareKiller (Arab-repo lesson); attempt B is
+     * the raw client, used only when A throws or answers non-2xx.
+     * A 2xx empty body is accepted as genuinely empty — no second
+     * attempt, so the DEBUG card reports the true first cause.
+     */
+    private suspend fun runSearchDetailed(query: String, mode: String): SearchOutcome {
+        // Attempt A: app.post + CloudflareKiller.
+        try {
+            val resp = app.post(
+                "$mainUrl/search",
+                data = mapOf("q" to query),
+                headers = mapOf(
+                    "User-Agent" to (headers["User-Agent"] ?: "Mozilla/5.0"),
+                    "Referer" to "$mainUrl/",
+                    "Accept" to "application/json, text/javascript, */*; q=0.01",
+                    "X-Requested-With" to "XMLHttpRequest",
+                ),
+                interceptor = cloudflareKiller,
+            )
+            val text = resp.text
+            val code = resp.code
+            if (code in 200..299) {
+                val items = parseSearchBody(text, mode)
+                val reason = if (items.isEmpty()) "empty" else "ok"
+                return SearchOutcome(items, "ck", code, text.length, reason)
+            }
+            // Non-2xx: fall through to the raw client below.
+            val ckOutcome = SearchOutcome(emptyList(), "ck", code, text.length, "http")
+            return runSearchRaw(query, mode, ckOutcome)
+        } catch (e: Exception) {
+            return runSearchRaw(query, mode, SearchOutcome(emptyList(), "ck", 0, 0, "network"))
+        }
+    }
+
+    /** Attempt B: the raw OkHttp client (pre-v7 path). */
+    private fun runSearchRaw(query: String, mode: String, prior: SearchOutcome): SearchOutcome {
         val raw: ByteArray = try {
             val form = okhttp3.FormBody.Builder().add("q", query).build()
             val req = okhttp3.Request.Builder()
@@ -282,23 +410,14 @@ class WeCima2Provider : MainAPI() {
                 .header("Referer", "$mainUrl/")
                 .post(form)
                 .build()
-            searchClient.newCall(req).execute().use { it.body?.bytes() } ?: return emptyList()
+            searchClient.newCall(req).execute().use { it.body?.bytes() } ?: return prior
         } catch (e: Exception) {
-            return emptyList()
+            return SearchOutcome(emptyList(), "raw", 0, 0, "network")
         }
         val text = gunzipIfNeeded(raw)
-        val out = ArrayList<SearchResponse>()
-        val seen = HashSet<String>()
-        try {
-            val arr = JSONObject(text).optJSONArray("results") ?: return out
-            for (i in 0 until arr.length()) {
-                val item = searchItem(arr.optJSONObject(i) ?: continue) ?: continue
-                if (seen.add(item.url)) out.add(item)
-            }
-        } catch (e: Exception) {
-            // Unknown shape: never crash search, just return what we have.
-        }
-        return out
+        val items = parseSearchBody(text, mode)
+        val reason = if (items.isEmpty()) "empty" else "ok"
+        return SearchOutcome(items, "raw", 200, text.length, reason)
     }
 
     /**
@@ -344,10 +463,12 @@ class WeCima2Provider : MainAPI() {
             if (link.contains("/series/")) {
                 out.add(newTvSeriesSearchResponse(title, link, TvType.TvSeries) {
                     this.posterUrl = poster
+                    this.posterHeaders = posterHeaders()
                 })
             } else {
                 out.add(newMovieSearchResponse(title, link, TvType.Movie) {
                     this.posterUrl = poster
+                    this.posterHeaders = posterHeaders()
                 })
             }
         }

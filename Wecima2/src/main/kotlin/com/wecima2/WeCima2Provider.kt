@@ -126,6 +126,25 @@ import org.jsoup.nodes.Element
  *   cookie (expires, leaks a session — CloudflareKiller solves it
  *   properly instead) and its decode variant (prepends "aHR0c";
  *   cx's drop(3) decode is verified live and stays).
+ * - v8 (on-device v7 verdict 2026-11-04 22:49: home retrieval AND
+ *   posters WORK — real cards with posters in every section — but
+ *   two new faults, both with one root cause: (1) "كتالوج مكرر
+ *   وغير مضبوط": every section shows the same q=love / q=2026
+ *   results, because generic search cannot tell sections apart;
+ *   (2) tapping a real card plays only the Mux test (player title
+ *   "die-my-love-2025-movie" = load()'s slug fallback, i.e. the
+ *   detail page never loaded on the phone, so 0 buttons): detail
+ *   and watch GETs still ran WITHOUT CloudflareKiller. Fix: the
+ *   category page itself becomes the home source again — fetched
+ *   through CloudflareKiller, which is what fixed search — so each
+ *   section shows its true catalog; search stays only as fallback,
+ *   then feed, then a DEBUG v8 card (now also carrying the
+ *   category count). CloudflareKiller is added to load(),
+ *   loadLinks() and warmUp() too, so detail/playback pages get
+ *   the same solver that fixed home. Parsed cards also get
+ *   posterHeaders + fixUrl on posters. Category pagination:
+ *   page N fetches <category>/page/N, hasNext when a full 28-card
+ *   page comes back.
  */
 class WeCima2Provider : MainAPI() {
     override var mainUrl = "https://wecima.cx"
@@ -223,14 +242,16 @@ class WeCima2Provider : MainAPI() {
                 ?: a.selectFirst("strong.Wecima-Card__title, h2.Wecima-Card__title")?.text()?.trim()?.ifEmpty { null }
                 ?: a.attr("title").trim().ifEmpty { null }
                 ?: return@forEach
-            val poster = cardPoster(a, card)
+            val poster = cardPoster(a, card)?.let { fixUrl(it) }
             if (href.contains("/series/")) {
                 out.add(newTvSeriesSearchResponse(title, href, TvType.TvSeries) {
                     this.posterUrl = poster
+                    this.posterHeaders = posterHeaders()
                 })
             } else {
                 out.add(newMovieSearchResponse(title, href, TvType.Movie) {
                     this.posterUrl = poster
+                    this.posterHeaders = posterHeaders()
                 })
             }
         }
@@ -249,7 +270,7 @@ class WeCima2Provider : MainAPI() {
     private suspend fun warmUp() {
         if (!warmedApp) {
             warmedApp = true
-            try { app.get(mainUrl, headers = headers) } catch (e: Exception) { }
+            try { app.get(mainUrl, headers = headers, interceptor = cloudflareKiller) } catch (e: Exception) { }
         }
         if (!warmedSearch) {
             warmedSearch = true
@@ -265,21 +286,38 @@ class WeCima2Provider : MainAPI() {
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        // v7: home sections come from the search POST through
-        // app.post + CloudflareKiller FIRST (Arab-repo lesson: a
-        // phone-side CF challenge no longer silently empties home),
-        // raw client only as fallback; sections load sequentially;
-        // cards are type-filtered per section; DEBUG cards carry
-        // the failure reason + response metadata.
+        // v8: the category page itself is the home source again —
+        // fetched through CloudflareKiller, the solver that fixed
+        // search — so each section shows its TRUE catalog instead
+        // of the same generic search results in every section.
+        // Search stays only as fallback, then feed, then DEBUG.
         try { warmUp() } catch (e: Exception) { }
-        val q = if (request.name.contains("مسلسلات")) "2026" else "love"
-        val mode = if (request.name.contains("مسلسلات")) "series" else "movies"
-        val outcome = try { runSearchDetailed(q, mode) } catch (e: Exception) {
-            SearchOutcome(emptyList(), "none", 0, 0, "network")
-        }
-        var items: List<SearchResponse> = outcome.items
+        val pageUrl = if (page > 1) "${request.data}/page/$page" else request.data
+        var items: List<SearchResponse> = emptyList()
         var sectionName = request.name
+        var catCount = -1
+        var fromCategory = false
+        var outcome: SearchOutcome? = null
         var feedCount = 0
+        try {
+            val doc = app.get(pageUrl, headers = headers, interceptor = cloudflareKiller).document
+            val parsed = parseCards(doc)
+            catCount = parsed.size
+            if (parsed.isNotEmpty()) {
+                items = parsed
+                fromCategory = true
+            }
+        } catch (e: Exception) {
+            catCount = -1
+        }
+        if (items.isEmpty()) {
+            val q = if (request.name.contains("مسلسلات")) "2026" else "love"
+            val mode = if (request.name.contains("مسلسلات")) "series" else "movies"
+            outcome = try { runSearchDetailed(q, mode) } catch (e: Exception) {
+                SearchOutcome(emptyList(), "none", 0, 0, "network")
+            }
+            items = outcome.items
+        }
         if (items.isEmpty()) {
             // Second source only: the site's own RSS feed.
             val feedItems = try { fetchFeedItems() } catch (e: Exception) { emptyList() }
@@ -290,10 +328,12 @@ class WeCima2Provider : MainAPI() {
             }
         }
         if (items.isEmpty()) {
-            val debugTitle = "DEBUG v7 home ${request.name} q=$q a=${outcome.attempt} code=${outcome.code} len=${outcome.bodyLen} r=${outcome.reason} fb=$feedCount"
+            val o = outcome
+            val debugTitle = "DEBUG v8 home ${request.name} cat=$catCount q=${if (request.name.contains("مسلسلات")) "2026" else "love"} a=${o?.attempt ?: "-"} code=${o?.code ?: 0} len=${o?.bodyLen ?: 0} r=${o?.reason ?: "nocat"} fb=$feedCount"
             items = listOf(newMovieSearchResponse(debugTitle, request.data, TvType.Movie) {})
         }
-        return newHomePageResponse(sectionName, items, hasNext = false)
+        val hasNext = fromCategory && catCount >= 28
+        return newHomePageResponse(sectionName, items, hasNext = hasNext)
     }
 
     // ---------- search ----------
@@ -494,7 +534,10 @@ class WeCima2Provider : MainAPI() {
     private val episodeUrlRegex = Regex("""-s(\d+)-e(\d+)$""")
 
     override suspend fun load(url: String): LoadResponse {
-        val doc = app.get(url, headers = headers).document
+        // v8: detail pages go through CloudflareKiller too — v7
+        // proved the phone's plain GETs get challenged (slug title
+        // + 0 buttons on a real card tap).
+        val doc = app.get(url, headers = headers, interceptor = cloudflareKiller).document
         val title = cleanOgTitle(og(doc, "og:title")).ifEmpty { url.substringAfterLast('/').trim() }
         val poster = og(doc, "og:image")
         val plot = og(doc, "og:description")
@@ -618,7 +661,7 @@ class WeCima2Provider : MainAPI() {
         var decodedCount = 0
         var okCount = 0
         try {
-            val doc = app.get(data, headers = headers).document
+            val doc = app.get(data, headers = headers, interceptor = cloudflareKiller).document
             pageCode = 200
             val btns = doc.select("btn[data-url]")
             btnCount = btns.size

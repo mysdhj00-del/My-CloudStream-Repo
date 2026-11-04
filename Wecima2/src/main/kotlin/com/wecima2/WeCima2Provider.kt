@@ -84,6 +84,20 @@ import org.jsoup.nodes.Element
  *   POST-category retry, because POST to a category URL returns the
  *   same full page as GET from the sandbox, and the edge already
  *   lets the search POST through on the phone while GETs fail.
+ * - v6 (on-device v5 verdict: STILL the same failure after a full
+ *   close; AI CodeOps path dead — OAuth not_configured, manual
+ *   token rejected — do not pursue unless he reopens it): home
+ *   sections come ONLY from the working search POST (q=2026 for
+ *   series sections, q=love for movie sections). Category GETs AND
+ *   the POST-category retry are GONE: on the phone they all failed,
+ *   and firing them first may poison the session / trip the edge
+ *   before the search even runs. The search UI path (same client,
+ *   same POST, same headers) is the only proven path on his phone,
+ *   so home now issues exactly that request, first and alone.
+ *   runSearch also gunzips manually if the body still arrives
+ *   gzip-compressed (panel gzip check). DEBUG cards are now
+ *   version-tagged ("DEBUG v6 home ...") so any screenshot proves
+ *   which code is actually installed.
  * - No coroutine imports anywhere (CI classpath law): plain code,
  *   Thread-free, suspend functions only where the API requires them.
  */
@@ -172,11 +186,6 @@ class WeCima2Provider : MainAPI() {
 
     // ---------- home ----------
 
-    private val mobileHeaders = mapOf(
-        "User-Agent" to "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36",
-        "Accept-Language" to "ar,en;q=0.9",
-    )
-
     // Warm-up flags: one homepage visit per client per process, so
     // any session cookie the site sets is present before sections
     // are fetched (panel: shared session / warm-up). Duplicates
@@ -202,119 +211,33 @@ class WeCima2Provider : MainAPI() {
         }
     }
 
-    /**
-     * Fetches a category page with POST instead of GET. Verified
-     * live: POST to a category URL returns the same full page as
-     * GET. Used when GET yields 0 cards on the phone: if the edge
-     * filters GET patterns but lets POST through (as it lets the
-     * search POST through), this returns the real page.
-     */
-    private fun postCategory(url: String): Document? {
-        return try {
-            val form = okhttp3.FormBody.Builder().build()
-            val req = okhttp3.Request.Builder()
-                .url(url)
-                .header("User-Agent", headers["User-Agent"] ?: "Mozilla/5.0")
-                .header("Referer", "$mainUrl/")
-                .post(form)
-                .build()
-            val body = searchClient.newCall(req).execute().use { it.body?.string() } ?: return null
-            org.jsoup.Jsoup.parse(body, url)
-        } catch (e: Exception) {
-            null
-        }
-    }
-
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val url = if (page > 1) request.data.trimEnd('/') + "/page/$page" else request.data
-        var items: List<SearchResponse> = emptyList()
-        var doc: Document? = null
-        var pageLen = 0
-        var pageTitle = ""
-        var hasCardMarker = false
-        var challenge = false
-        var code = 0
-        var postCards = 0
+        // v6: home sections come ONLY from the working search POST.
+        // Category GETs (and the POST-category retry) are gone: on
+        // the phone they all failed, and firing them first may poison
+        // the session / trip the edge before the search even runs.
+        // The search UI path (same client, same POST, same headers)
+        // is the one proven path on his phone, so home now issues
+        // exactly that request, first and alone, per section.
         try { warmUp() } catch (e: Exception) { }
-        try {
-            val res = app.get(url, headers = headers)
-            val text = res.text
-            pageLen = text.length
-            doc = res.document
-            code = 200
-            hasCardMarker = text.contains("Wecima-Card__link")
-            challenge = text.contains("Just a moment") ||
-                text.contains("cf-challenge") ||
-                text.contains("Attention Required")
-            pageTitle = doc.selectFirst("title")?.text()?.take(50) ?: ""
-            items = parseCards(doc)
-            if (items.isEmpty()) {
-                // One retry with a mobile UA: some edge rules treat
-                // it differently, and it costs nothing when cards load.
-                try {
-                    val res2 = app.get(url, headers = mobileHeaders)
-                    val doc2 = res2.document
-                    val items2 = parseCards(doc2)
-                    if (items2.isNotEmpty()) {
-                        items = items2
-                        doc = doc2
-                        pageLen = res2.text.length
-                        hasCardMarker = true
-                        challenge = false
-                    }
-                } catch (e: Exception) {
-                }
-            }
-        } catch (e: Exception) {
-            // Fall through to the DEBUG card below: an empty section
-            // must never be silent about what the fetch returned.
-        }
-        if (items.isEmpty()) {
-            // POST-category retry: same page as GET from the
-            // sandbox, but POSTs already pass the edge on the
-            // phone (search POST works there) while GETs fail.
-            val postDoc = postCategory(url)
-            if (postDoc != null) {
-                val postItems = parseCards(postDoc)
-                postCards = postItems.size
-                if (postItems.isNotEmpty()) {
-                    items = postItems
-                    doc = postDoc
-                }
-            }
-        }
+        val q = if (request.name.contains("مسلسلات")) "2026" else "love"
+        var items: List<SearchResponse> = try { runSearch(q) } catch (e: Exception) { emptyList() }
         var sectionName = request.name
         var feedCount = 0
-        var searchCount = 0
         if (items.isEmpty()) {
-            // Fallback 1: the site's own RSS feed (latest items).
+            // Second source only: the site's own RSS feed.
             val feedItems = try { fetchFeedItems() } catch (e: Exception) { emptyList() }
             feedCount = feedItems.size
             if (feedItems.isNotEmpty()) {
                 items = feedItems
                 sectionName = request.name + " (بديل)"
-            } else {
-                // Fallback 2: the working search API with a broad
-                // query. Latin words match; Arabic generics return 0
-                // (verified live: "فيلم"/"مسلسل"/"أنمي" -> 0, while
-                // "2026" -> 20 series-heavy, "love" -> 20 movie-heavy).
-                val q = if (request.name.contains("مسلسلات")) "2026" else "love"
-                val searchItems = try { runSearch(q) } catch (e: Exception) { emptyList() }
-                searchCount = searchItems.size
-                if (searchItems.isNotEmpty()) {
-                    items = searchItems
-                    sectionName = request.name + " (بديل)"
-                }
             }
         }
         if (items.isEmpty()) {
-            val debugTitle = "DEBUG home ${request.name} cards=0 len=$pageLen " +
-                "card=$hasCardMarker chal=$challenge code=$code fb=$feedCount/$searchCount pc=$postCards t=$pageTitle"
-            items = listOf(newMovieSearchResponse(debugTitle, url, TvType.Movie) {})
+            val debugTitle = "DEBUG v6 home ${request.name} q=$q s=0 fb=$feedCount"
+            items = listOf(newMovieSearchResponse(debugTitle, request.data, TvType.Movie) {})
         }
-        val hasNext = if (sectionName != request.name) false
-            else doc?.selectFirst("a[href$=\"/page/${page + 1}\"]") != null
-        return newHomePageResponse(sectionName, items, hasNext = hasNext)
+        return newHomePageResponse(sectionName, items, hasNext = false)
     }
 
     // ---------- search ----------
@@ -351,7 +274,7 @@ class WeCima2Provider : MainAPI() {
 
     /** POSTs the site's search API (field q=) and maps its items. */
     private fun runSearch(query: String): List<SearchResponse> {
-        val text = try {
+        val raw: ByteArray = try {
             val form = okhttp3.FormBody.Builder().add("q", query).build()
             val req = okhttp3.Request.Builder()
                 .url("$mainUrl/search")
@@ -359,10 +282,11 @@ class WeCima2Provider : MainAPI() {
                 .header("Referer", "$mainUrl/")
                 .post(form)
                 .build()
-            searchClient.newCall(req).execute().use { it.body?.string() } ?: return emptyList()
+            searchClient.newCall(req).execute().use { it.body?.bytes() } ?: return emptyList()
         } catch (e: Exception) {
             return emptyList()
         }
+        val text = gunzipIfNeeded(raw)
         val out = ArrayList<SearchResponse>()
         val seen = HashSet<String>()
         try {
@@ -375,6 +299,24 @@ class WeCima2Provider : MainAPI() {
             // Unknown shape: never crash search, just return what we have.
         }
         return out
+    }
+
+    /**
+     * If the body still arrives gzip-compressed (panel gzip check),
+     * decompress it; otherwise decode as UTF-8. OkHttp normally
+     * decompresses transparently, but if any layer sets
+     * Accept-Encoding manually that breaks — this is the safety net.
+     */
+    private fun gunzipIfNeeded(bytes: ByteArray): String {
+        return try {
+            if (bytes.size > 2 && bytes[0] == 0x1f.toByte() && bytes[1] == 0x8b.toByte()) {
+                java.util.zip.GZIPInputStream(bytes.inputStream()).readBytes().toString(Charsets.UTF_8)
+            } else {
+                String(bytes, Charsets.UTF_8)
+            }
+        } catch (e: Exception) {
+            String(bytes, Charsets.UTF_8)
+        }
     }
 
     /**

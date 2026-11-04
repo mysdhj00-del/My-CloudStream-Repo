@@ -126,25 +126,28 @@ import org.jsoup.nodes.Element
  *   cookie (expires, leaks a session — CloudflareKiller solves it
  *   properly instead) and its decode variant (prepends "aHR0c";
  *   cx's drop(3) decode is verified live and stays).
- * - v8 (on-device v7 verdict 2026-11-04 22:49: home retrieval AND
- *   posters WORK — real cards with posters in every section — but
- *   two new faults, both with one root cause: (1) "كتالوج مكرر
- *   وغير مضبوط": every section shows the same q=love / q=2026
- *   results, because generic search cannot tell sections apart;
- *   (2) tapping a real card plays only the Mux test (player title
- *   "die-my-love-2025-movie" = load()'s slug fallback, i.e. the
- *   detail page never loaded on the phone, so 0 buttons): detail
- *   and watch GETs still ran WITHOUT CloudflareKiller. Fix: the
- *   category page itself becomes the home source again — fetched
- *   through CloudflareKiller, which is what fixed search — so each
- *   section shows its true catalog; search stays only as fallback,
- *   then feed, then a DEBUG v8 card (now also carrying the
- *   category count). CloudflareKiller is added to load(),
- *   loadLinks() and warmUp() too, so detail/playback pages get
- *   the same solver that fixed home. Parsed cards also get
- *   posterHeaders + fixUrl on posters. Category pagination:
- *   page N fetches <category>/page/N, hasNext when a full 28-card
- *   page comes back.
+ * - v9 (user 2026-11-04 23:11-23:13: "أصبح جيد لكن اريد
+ *   جميع الأقسام تظهر وتعرض كل محتوى الأقسام بتمرير الجانبي
+ *   بالكامل" + "مثل قسم مسلسلات رمضان 2025" + "في الإضافة
+ *   cloudstream وهكذا كل الأقسام"): (a) mainPage is now the
+ *   site's FULL nav, 22 sections in nav order (verified live
+ *   from the homepage: 7 film, 6 series, Ramadan 2026 + 2021..
+ *   2025, anime-series, tv-shows, wwe-shows) — the 10 missing
+ *   ones (asian-movies, indian/asian-series, Ramadan 2021-2025,
+ *   tv/wwe-shows) are added; (b) each section row now carries
+ *   its FULL catalog, not just page 1: pages are fetched until
+ *   a page adds zero NEW cards (the site clamps past-the-end
+ *   pages to a repeated tail — verified on Ramadan 2025: 28 +
+ *   28 + 24 + 5, then 5 repeated) or a 5-page cap (140 cards),
+ *   with cross-page dedupe; hasNext stays true only when the
+ *   cap was hit with new cards still coming, so the section
+ *   detail view continues pagination from there; (c) the
+ *   search-fallback section-type rule now reads the URL slug
+ *   (contains "-series") instead of the label, so Ramadan-year
+ *   sections fall back to series queries, not movies.
+ *   Sections still load sequentially (safe with the shared
+ *   CloudflareKiller cookie store); rows render progressively
+ *   as each section completes.
  */
 class WeCima2Provider : MainAPI() {
     override var mainUrl = "https://wecima.cx"
@@ -180,19 +183,32 @@ class WeCima2Provider : MainAPI() {
         return out
     }
 
+    // v9: the site's FULL nav, 22 sections in nav order (verified
+    // live from the homepage 2026-11-04) — every section the site
+    // lists, not just the 12 core ones.
     override val mainPage = mainPageOf(
         "$mainUrl/category/foreign-movies" to "أفلام أجنبي",
         "$mainUrl/category/arabic-movies" to "أفلام عربي",
+        "$mainUrl/category/indian-movies" to "أفلام هندي",
+        "$mainUrl/category/asian-movies" to "أفلام آسيوية",
         "$mainUrl/category/turkish-movies" to "أفلام تركي",
         "$mainUrl/category/anime-movies" to "أفلام أنمي",
         "$mainUrl/category/dubbed-movies" to "أفلام مدبلجة",
-        "$mainUrl/category/indian-movies" to "أفلام هندي",
         "$mainUrl/category/foreign-series" to "مسلسلات أجنبي",
         "$mainUrl/category/arabic-series" to "مسلسلات عربية",
+        "$mainUrl/category/indian-series" to "مسلسلات هندية",
+        "$mainUrl/category/asian-series" to "مسلسلات آسيوية",
         "$mainUrl/category/turkish-series" to "مسلسلات تركية",
         "$mainUrl/category/korean-series" to "مسلسلات كورية",
-        "$mainUrl/category/anime-series" to "مسلسلات أنمي",
         "$mainUrl/category/ramadan-series-2026" to "مسلسلات رمضان 2026",
+        "$mainUrl/category/ramadan-series-2021" to "رمضان 2021",
+        "$mainUrl/category/ramadan-series-2022" to "رمضان 2022",
+        "$mainUrl/category/ramadan-series-2023" to "رمضان 2023",
+        "$mainUrl/category/ramadan-series-2024" to "رمضان 2024",
+        "$mainUrl/category/ramadan-series-2025" to "رمضان 2025",
+        "$mainUrl/category/anime-series" to "مسلسلات أنمي",
+        "$mainUrl/category/tv-shows" to "برامج تلفزيونية",
+        "$mainUrl/category/wwe-shows" to "عروض مصارعة",
     )
 
     private val headers = mapOf(
@@ -286,33 +302,61 @@ class WeCima2Provider : MainAPI() {
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        // v8: the category page itself is the home source again —
-        // fetched through CloudflareKiller, the solver that fixed
-        // search — so each section shows its TRUE catalog instead
-        // of the same generic search results in every section.
-        // Search stays only as fallback, then feed, then DEBUG.
+        // v9: the category page itself is the home source — and
+        // the row now carries the section's FULL catalog, not
+        // just page 1: pages are fetched until one adds zero NEW
+        // cards (the site clamps past-the-end pages to a repeated
+        // tail) or a 5-page cap (140 cards). Search stays only
+        // as fallback, then feed, then DEBUG.
         try { warmUp() } catch (e: Exception) { }
-        val pageUrl = if (page > 1) "${request.data}/page/$page" else request.data
         var items: List<SearchResponse> = emptyList()
         var sectionName = request.name
         var catCount = -1
+        var pagesFetched = 0
+        var moreMayExist = false
         var fromCategory = false
         var outcome: SearchOutcome? = null
         var feedCount = 0
-        try {
-            val doc = app.get(pageUrl, headers = headers, interceptor = cloudflareKiller).document
-            val parsed = parseCards(doc)
-            catCount = parsed.size
-            if (parsed.isNotEmpty()) {
-                items = parsed
+        run {
+            val allCards = ArrayList<SearchResponse>()
+            val seenUrls = HashSet<String>()
+            var p = page
+            while (pagesFetched < 5) {
+                val pageUrl = if (p == 1) request.data else "${request.data}/page/$p"
+                val parsed = try {
+                    app.get(pageUrl, headers = headers, interceptor = cloudflareKiller).document
+                        .let { parseCards(it) }
+                } catch (e: Exception) {
+                    emptyList()
+                }
+                pagesFetched++
+                if (parsed.isEmpty()) break
+                var added = 0
+                for (c in parsed) {
+                    if (seenUrls.add(c.url)) {
+                        allCards.add(c)
+                        added++
+                    }
+                }
+                if (added == 0) break
+                if (pagesFetched >= 5) {
+                    moreMayExist = true
+                    break
+                }
+                p++
+            }
+            catCount = allCards.size
+            if (allCards.isNotEmpty()) {
+                items = allCards
                 fromCategory = true
             }
-        } catch (e: Exception) {
-            catCount = -1
         }
+        // v9: section type from the URL slug, not the label, so
+        // Ramadan-year sections fall back to series queries.
+        val isSeries = request.data.contains("-series")
+        val q = if (isSeries) "2026" else "love"
+        val mode = if (isSeries) "series" else "movies"
         if (items.isEmpty()) {
-            val q = if (request.name.contains("مسلسلات")) "2026" else "love"
-            val mode = if (request.name.contains("مسلسلات")) "series" else "movies"
             outcome = try { runSearchDetailed(q, mode) } catch (e: Exception) {
                 SearchOutcome(emptyList(), "none", 0, 0, "network")
             }
@@ -329,10 +373,10 @@ class WeCima2Provider : MainAPI() {
         }
         if (items.isEmpty()) {
             val o = outcome
-            val debugTitle = "DEBUG v8 home ${request.name} cat=$catCount q=${if (request.name.contains("مسلسلات")) "2026" else "love"} a=${o?.attempt ?: "-"} code=${o?.code ?: 0} len=${o?.bodyLen ?: 0} r=${o?.reason ?: "nocat"} fb=$feedCount"
+            val debugTitle = "DEBUG v9 home ${request.name} cat=$catCount pages=$pagesFetched q=$q a=${o?.attempt ?: "-"} code=${o?.code ?: 0} len=${o?.bodyLen ?: 0} r=${o?.reason ?: "nocat"} fb=$feedCount"
             items = listOf(newMovieSearchResponse(debugTitle, request.data, TvType.Movie) {})
         }
-        val hasNext = fromCategory && catCount >= 28
+        val hasNext = fromCategory && moreMayExist
         return newHomePageResponse(sectionName, items, hasNext = hasNext)
     }
 

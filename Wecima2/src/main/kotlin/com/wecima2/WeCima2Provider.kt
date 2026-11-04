@@ -310,7 +310,7 @@ class WeCima2Provider : MainAPI() {
      * link and poster. Verified live 2026-11-04. Used only as a
      * fallback when a category page yields no cards on the phone.
      */
-    private fun fetchFeedItems(): List<SearchResponse> {
+    private suspend fun fetchFeedItems(): List<SearchResponse> {
         val text = try {
             app.get("$mainUrl/feed/", headers = headers).text
         } catch (e: Exception) {

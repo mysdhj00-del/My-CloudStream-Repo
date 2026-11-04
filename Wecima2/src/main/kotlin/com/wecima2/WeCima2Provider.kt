@@ -65,6 +65,10 @@ import org.jsoup.nodes.Element
  * - DEBUG markers in v1 (standing rule): loadLinks always emits one
  *   DEBUG source over the Mux test stream carrying page/btn/dec/ok
  *   counts, so an empty on-phone list means loadLinks never ran.
+ *   v3 extends this to home: a section that parses 0 cards emits a
+ *   DEBUG card carrying page length, card-marker, challenge-marker,
+ *   status and page title, so an empty section on the phone is
+ *   diagnosable from a screenshot instead of silent.
  * - No coroutine imports anywhere (CI classpath law): plain code,
  *   Thread-free, suspend functions only where the API requires them.
  */
@@ -103,12 +107,16 @@ class WeCima2Provider : MainAPI() {
         val ownStyle = anchor.selectFirst("span[data-lazy-style]")?.attr("data-lazy-style") ?: ""
         val fromOwn = Regex("""--image:\s*url\(([^)]+)\)""").find(ownStyle)?.groupValues?.get(1)
         if (!fromOwn.isNullOrEmpty()) return fromOwn
+        val ownSrc = anchor.selectFirst("span[data-src]")?.attr("data-src")?.ifEmpty { null }
+        if (ownSrc != null) return ownSrc
         val ownImg = anchor.selectFirst("img[data-lazy-src], img[src]")?.let {
             val v = it.attr("data-lazy-src").ifEmpty { it.attr("src") }
             v.ifEmpty { null }
         }
         if (ownImg != null) return ownImg
         if (card != null) {
+            val cardSrc = card.selectFirst("span[data-src]")?.attr("data-src")?.ifEmpty { null }
+            if (cardSrc != null) return cardSrc
             val style = card.selectFirst("span[data-lazy-style]")?.attr("data-lazy-style") ?: ""
             val fromStyle = Regex("""--image:\s*url\(([^)]+)\)""").find(style)?.groupValues?.get(1)
             if (!fromStyle.isNullOrEmpty()) return fromStyle
@@ -124,9 +132,11 @@ class WeCima2Provider : MainAPI() {
             val href = fixUrl(a.attr("href"))
             if (href.isEmpty() || !seen.add(href)) return@forEach
             val card = a.parents().firstOrNull { it.hasClass("Wecima-Card") }
-            val title = card?.selectFirst("strong.Wecima-Card__title")?.text()?.trim()
+            // Title element differs by page: <strong> on the homepage,
+            // <h2> on category pages; the anchor title attr covers both.
+            val title = card?.selectFirst("strong.Wecima-Card__title, h2.Wecima-Card__title")?.text()?.trim()
                 ?.ifEmpty { null }
-                ?: a.selectFirst("strong.Wecima-Card__title")?.text()?.trim()?.ifEmpty { null }
+                ?: a.selectFirst("strong.Wecima-Card__title, h2.Wecima-Card__title")?.text()?.trim()?.ifEmpty { null }
                 ?: a.attr("title").trim().ifEmpty { null }
                 ?: return@forEach
             val poster = cardPoster(a, card)
@@ -145,15 +155,59 @@ class WeCima2Provider : MainAPI() {
 
     // ---------- home ----------
 
+    private val mobileHeaders = mapOf(
+        "User-Agent" to "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36",
+        "Accept-Language" to "ar,en;q=0.9",
+    )
+
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = if (page > 1) request.data.trimEnd('/') + "/page/$page" else request.data
-        val doc = try {
-            app.get(url, headers = headers).document
+        var items: List<SearchResponse> = emptyList()
+        var doc: Document? = null
+        var pageLen = 0
+        var pageTitle = ""
+        var hasCardMarker = false
+        var challenge = false
+        var code = 0
+        try {
+            val res = app.get(url, headers = headers)
+            val text = res.text
+            pageLen = text.length
+            doc = res.document
+            code = 200
+            hasCardMarker = text.contains("Wecima-Card__link")
+            challenge = text.contains("Just a moment") ||
+                text.contains("cf-challenge") ||
+                text.contains("Attention Required")
+            pageTitle = doc.selectFirst("title")?.text()?.take(50) ?: ""
+            items = parseCards(doc)
+            if (items.isEmpty()) {
+                // One retry with a mobile UA: some edge rules treat
+                // it differently, and it costs nothing when cards load.
+                try {
+                    val res2 = app.get(url, headers = mobileHeaders)
+                    val doc2 = res2.document
+                    val items2 = parseCards(doc2)
+                    if (items2.isNotEmpty()) {
+                        items = items2
+                        doc = doc2
+                        pageLen = res2.text.length
+                        hasCardMarker = true
+                        challenge = false
+                    }
+                } catch (e: Exception) {
+                }
+            }
         } catch (e: Exception) {
-            return newHomePageResponse(request.name, emptyList(), hasNext = false)
+            // Fall through to the DEBUG card below: an empty section
+            // must never be silent about what the fetch returned.
         }
-        val items = parseCards(doc)
-        val hasNext = doc.selectFirst("a[href$=\"/page/${page + 1}\"]") != null
+        if (items.isEmpty()) {
+            val debugTitle = "DEBUG home ${request.name} cards=0 len=$pageLen " +
+                "card=$hasCardMarker chal=$challenge code=$code t=$pageTitle"
+            items = listOf(newMovieSearchResponse(debugTitle, url, TvType.Movie) {})
+        }
+        val hasNext = doc?.selectFirst("a[href$=\"/page/${page + 1}\"]") != null
         return newHomePageResponse(request.name, items, hasNext = hasNext)
     }
 

@@ -378,10 +378,26 @@ object MiruroSite : AnimeSite {
     }
 
     /** Repairs double-encoded UTF-8 Arabic + strips SRT tags (see subtitles.ts). */
+    private val win1252Special = mapOf(
+        '€' to 0x80, '‚' to 0x82, 'ƒ' to 0x83, '„' to 0x84, '…' to 0x85, '†' to 0x86, '‡' to 0x87,
+        'ˆ' to 0x88, '‰' to 0x89, 'Š' to 0x8A, '‹' to 0x8B, 'Œ' to 0x8C, 'Ž' to 0x8E,
+        '‘' to 0x91, '’' to 0x92, '“' to 0x93, '”' to 0x94, '•' to 0x95, '–' to 0x96, '—' to 0x97,
+        '˜' to 0x98, '™' to 0x99, 'š' to 0x9A, '›' to 0x9B, 'œ' to 0x9C, 'ž' to 0x9E, 'Ÿ' to 0x9F
+    )
+
     private fun fixSubEncoding(str: String): String {
         if (str.any { it in '\u0600'..'\u06FF' }) return str
         return try {
-            val bytes = ByteArray(str.length) { (str[it].code and 0xFF).toByte() }
+            val bytes = ByteArray(str.length)
+            for ((i, c) in str.withIndex()) {
+                val code = c.code
+                bytes[i] = when {
+                    code < 0x80 -> code.toByte()
+                    code in 0xA0..0xFF -> code.toByte()
+                    win1252Special.containsKey(c) -> win1252Special.getValue(c).toByte()
+                    else -> return str
+                }
+            }
             val fixed = String(bytes, Charsets.UTF_8)
             if (fixed.contains('\uFFFD')) str
             else if (fixed.any { it in '\u0600'..'\u06FF' }) fixed
@@ -585,7 +601,7 @@ object MiruroSite : AnimeSite {
         callback(
             newExtractorLink(
                 "Miruro",
-                "DEBUG v5 | tracks=$trackCount prov=$providerCount streams=$streamCount subs=$subCount len=$pageLen | Mux test",
+                "DEBUG v6 | tracks=$trackCount prov=$providerCount streams=$streamCount subs=$subCount len=$pageLen | Mux test",
                 "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8",
                 ExtractorLinkType.M3U8
             ) {

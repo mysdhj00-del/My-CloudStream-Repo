@@ -59,6 +59,7 @@ object MiruroSite : AnimeSite {
 
     private const val mainUrl = "https://miruro.tv"
     private val cloudflareKiller by lazy { CloudflareKiller() }
+    private val relayBase = "https://anime-subs-relay.mysdhj00-del.deno.net"
 
     private val headers = mapOf(
         "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
@@ -281,28 +282,18 @@ object MiruroSite : AnimeSite {
     // ---------- subtitle content: merge + translate, in-addon (v4) ----------
 
     /**
-     * v4 (panel verdict 2026-11-05, 6/6 models: merging needs NO
-     * server — do it in Kotlin inside the addon; translation best
-     * on a server, but the phone's own IP may dodge the datacenter
-     * 302 that blocks gtx from servers, so v4 tries it fail-soft):
-     * - Merge: the site's EN VTT + the Arabic VTT (v3 search) are
-     *   downloaded, merged cue-by-cue by time overlap (Arabic line
-     *   + English line in one cue, timed by the English cue;
-     *   Arabic-only cues appended), and emitted as a data: URI
-     *   subtitle entry ("عربي + English"). If the player cannot
-     *   load data: URIs, that entry simply fails to load — every
-     *   other subtitle entry is untouched (fail-soft by design).
-     * - Translate: when no ready Arabic sub exists, the EN cues
-     *   are translated via the public gtx endpoint FROM THE PHONE
-     *   (residential IP, not a datacenter IP) in char-budgeted
-     *   batches, timestamps preserved; success emits both
-     *   "العربية (تلقائية)" and the merged entry.
-     * - Base64 is pure Kotlin (no android.util / java.util
-     *   dependency — same rule as Wecima2's decoder).
-     * If data: URIs prove unplayable on-device, the fallback is
-     * the panel's top server route: a NEW Deno Deploy project
-     * linked to GitHub (phone-browser steps) serving the already
-     * written deno-relay/subtitles.ts endpoints.
+     * v5 (2026-11-05): subtitle layer, final shape.
+     * - Merge + translate run ON THE PHONE (only it can fetch the
+     *   site's own subs — the relay gets eng: 403 from Deno).
+     * - The finished VTT is POSTed to the relay /relay/store
+     *   (Deno KV, 24h) and the returned https /s/<id> URL is the
+     *   subtitle entry. data: URIs are GONE: the player drops them
+     *   from the track list (v4 on-device report 07:46).
+     * - Arabic files are often double-encoded UTF-8 (mojibake) and
+     *   carry SRT <font> tags: both are repaired/stripped at parse
+     *   time, here and in the relay's subtitles.ts.
+     * - Relay GET /relay/mergesubs + /relay/translate stay for
+     *   public files only; Miruro subs must go through /relay/store.
      */
     private class SubCue(
         val startMs: Long,
@@ -344,7 +335,7 @@ object MiruroSite : AnimeSite {
             val tsIdx = lines.indexOfFirst { tsRe.containsMatchIn(it) }
             if (tsIdx < 0) continue
             val m = tsRe.find(lines[tsIdx]) ?: continue
-            val body = lines.drop(tsIdx + 1).joinToString("\n").trim()
+            val body = cleanSubText(lines.drop(tsIdx + 1).joinToString("\n"))
             if (body.isEmpty()) continue
             val sMs = subTsToMs(m.groupValues[1])
             val eMs = subTsToMs(m.groupValues[2])
@@ -386,25 +377,46 @@ object MiruroSite : AnimeSite {
         return buildSubVTT(merged)
     }
 
-    private fun b64encode(bytes: ByteArray): String {
-        val alpha = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
-        val sb = StringBuilder()
-        var i = 0
-        while (i < bytes.size) {
-            val b0 = bytes[i].toInt() and 0xFF
-            val b1 = if (i + 1 < bytes.size) bytes[i + 1].toInt() and 0xFF else 0
-            val b2 = if (i + 2 < bytes.size) bytes[i + 2].toInt() and 0xFF else 0
-            sb.append(alpha[b0 shr 2])
-            sb.append(alpha[((b0 and 0x03) shl 4) or (b1 shr 4)])
-            sb.append(if (i + 1 < bytes.size) alpha[((b1 and 0x0F) shl 2) or (b2 shr 6)] else '=')
-            sb.append(if (i + 2 < bytes.size) alpha[b2 and 0x3F] else '=')
-            i += 3
+    /** Repairs double-encoded UTF-8 Arabic + strips SRT tags (see subtitles.ts). */
+    private fun fixSubEncoding(str: String): String {
+        if (str.any { it in '\u0600'..'\u06FF' }) return str
+        return try {
+            val bytes = ByteArray(str.length) { (str[it].code and 0xFF).toByte() }
+            val fixed = String(bytes, Charsets.UTF_8)
+            if (fixed.contains('\uFFFD')) str
+            else if (fixed.any { it in '\u0600'..'\u06FF' }) fixed
+            else str
+        } catch (e: Exception) {
+            str
         }
-        return sb.toString()
     }
 
-    private fun dataVtt(vtt: String): String {
-        return "data:text/vtt;base64," + b64encode(vtt.toByteArray(Charsets.UTF_8))
+    private fun cleanSubText(t: String): String {
+        return fixSubEncoding(
+            t.replace(Regex("<[^>]+>"), "")
+                .replace("&amp;", "&")
+                .replace("&lt;", "<")
+                .replace("&gt;", ">")
+                .replace("&quot;", "\"")
+                .replace("&#39;", "'")
+                .replace("&apos;", "'")
+        ).trim()
+    }
+
+    /**
+     * Hosts a finished VTT on the relay and returns its https URL.
+     * The player only lists https subtitle entries, so the merged /
+     * translated VTT must live at a URL — the relay stores it in
+     * Deno KV (24h) and returns a short /s/<id> link.
+     */
+    private suspend fun storeSub(vtt: String): String? {
+        return try {
+            val res = app.post("$relayBase/relay/store", data = mapOf("vtt" to vtt))
+            val url = org.json.JSONObject(res.text).optString("url")
+            url.ifEmpty { null }
+        } catch (e: Exception) {
+            null
+        }
     }
 
     /** Translates cue texts via public gtx, char-budgeted batches. Null on total failure. */
@@ -552,7 +564,9 @@ object MiruroSite : AnimeSite {
                 val engText = fetchHtml(engUrl)
                 val araText = fetchHtml(araUrl)
                 if (engText.isNotEmpty() && araText.isNotEmpty()) {
-                    subtitleCallback(SubtitleFile("عربي + English", dataVtt(mergeSubVTT(engText, araText))))
+                    storeSub(mergeSubVTT(engText, araText))?.let {
+                    subtitleCallback(SubtitleFile("عربي + English", it))
+                }
                 }
             } else if (engUrl != null) {
                 val engText = fetchHtml(engUrl)
@@ -561,8 +575,8 @@ object MiruroSite : AnimeSite {
                     val tr = translateSubCues(cues)
                     if (tr != null && cues.isNotEmpty()) {
                         val arVtt = buildSubVTT(cues, tr)
-                        subtitleCallback(SubtitleFile("العربية (تلقائية)", dataVtt(arVtt)))
-                        subtitleCallback(SubtitleFile("عربي + English", dataVtt(mergeSubVTT(engText, arVtt))))
+                        storeSub(arVtt)?.let { subtitleCallback(SubtitleFile("العربية (تلقائية)", it)) }
+                        storeSub(mergeSubVTT(engText, arVtt))?.let { subtitleCallback(SubtitleFile("عربي + English", it)) }
                     }
                 }
             }
@@ -571,7 +585,7 @@ object MiruroSite : AnimeSite {
         callback(
             newExtractorLink(
                 "Miruro",
-                "DEBUG v1 | tracks=$trackCount prov=$providerCount streams=$streamCount subs=$subCount len=$pageLen | Mux test",
+                "DEBUG v5 | tracks=$trackCount prov=$providerCount streams=$streamCount subs=$subCount len=$pageLen | Mux test",
                 "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8",
                 ExtractorLinkType.M3U8
             ) {

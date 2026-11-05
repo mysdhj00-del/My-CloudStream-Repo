@@ -379,10 +379,16 @@ object AnimoHubSite : AnimeSite {
             }
             if (page.isEmpty()) return VidaraResult(null, emptyList(), "vid:page-empty", "")
             val embedTitle = Regex("""<title>([^<]*)</title>""").find(page)?.groupValues?.get(1) ?: ""
+            val lowerTitle = embedTitle.lowercase()
+            // v15: multi-audio FIRST — files like "[Hindi-Eng-Jap]"
+            // or "(Hin-Eng)" carry English+Japanese too; labelling
+            // them "هندي" alone (v14) hid that. Only a bare Hindi
+            // file (no eng/jap in the name) is labelled "هندي".
             val audioHint = when {
-                embedTitle.contains("hindi", ignoreCase = true) -> "هندي"
-                embedTitle.contains("multi audio", ignoreCase = true) -> "متعدد الصوت"
-                embedTitle.contains("fandub", ignoreCase = true) -> "مدبلج"
+                lowerTitle.contains("multi audio") || lowerTitle.contains("dual audio") -> "متعدد الصوت"
+                lowerTitle.contains("hindi") && (lowerTitle.contains("eng") || lowerTitle.contains("jap")) -> "متعدد الصوت"
+                lowerTitle.contains("hindi") -> "هندي"
+                lowerTitle.contains("fandub") -> "مدبلج"
                 else -> ""
             }
             val iframe = Regex("""src="(https://[^"]+/e/([A-Za-z0-9]+))"""").find(page)
@@ -597,8 +603,8 @@ object AnimoHubSite : AnimeSite {
         // DEBUG source, always: an empty on-phone source list
         // means loadLinks never ran; the counts say why.
         try {
-            val name = if (noLinks) "DEBUG v14 no-play-links"
-            else "DEBUG v14 ah:$linkCount $vidDiag $engDiag $araDiag $storeDiag"
+            val name = if (noLinks) "DEBUG v15 no-play-links"
+            else "DEBUG v15 ah:$linkCount $vidDiag $engDiag $araDiag $storeDiag"
             callback(
                 newExtractorLink(
                     "AnimoHub",

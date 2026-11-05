@@ -251,7 +251,7 @@ object MiruroSite : AnimeSite {
                     RegexOption.DOT_MATCHES_ALL
                 )
                 val refererRegex = Regex("""Referer:"([^"]*)"""")
-                fun emit(pos: Int, server: String, referer: String, streamUrl: String) {
+                suspend fun emit(pos: Int, server: String, referer: String, streamUrl: String) {
                     if (!seenStreams.add(streamUrl)) return
                     streamCount++
                     val track = trackMarkers.lastOrNull { it.first < pos }?.second ?: "sub"

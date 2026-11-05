@@ -14,10 +14,13 @@ import com.lagradost.cloudstream3.utils.ExtractorLink
 /**
  * AnimeVerse — multi-site anime addon for CloudStream.
  *
- * v19: Miruro.tv (5 sections) + GogoAnime (gogoanime.fi, 4
+ * v20: Miruro.tv (5 sections) + GogoAnime (gogoanime.fi, 4
  * sections) + Aniwatch (hianime.at, 5 sections, ZokoAnime +
- * MegaPlay, sub+dur). AnimoHub was REMOVED in v16 at the user's
- * order ("مصدر ضعيف"). Anilab2 joins as a new site file once
+ * MegaPlay, sub+dur) — all DEBUG markers now carry the
+ * addon version + step-level subtitle diagnostics
+ * (engcues/tr), so a screenshot names the failing step.
+ * AnimoHub was REMOVED in v16 at the user's order
+ * ("مصدر ضعيف"). Anilab2 joins as a new site file once
  * its playback chain verifies; see the site registry in
  * AnimeVerseProvider.kt.
  *

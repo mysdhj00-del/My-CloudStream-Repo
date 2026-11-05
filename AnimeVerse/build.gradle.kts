@@ -1,18 +1,16 @@
 // AnimeVerse CloudStream plugin module — multi-site anime addon.
-// v15: Miruro.tv + AnimoHub (Dooo panel, chain traced live
-// 2026-11-05; v15 fixes the audio-language hint: multi-audio
-// files labelled "[Hindi-Eng-Jap]"/"(Hin-Eng)" now read
-// «متعدد الصوت» instead of «هندي»). Anilab2 joins as a new
-// site file once its playback chain verifies; see the site
-// registry in AnimeVerseProvider.kt.
-version = 15
+// v16: Miruro.tv only — AnimoHub removed at the user's order
+// 2026-11-05 ("مصدر ضعيف"). Anilab2 joins as a new site file
+// once its playback chain verifies; see the site registry in
+// AnimeVerseProvider.kt.
+version = 16
 
 android {
     namespace = "com.animeverse"
 }
 
 cloudstream {
-    description = "AnimeVerse - إضافة أنمي متعددة المواقع: Miruro.tv + AnimoHub"
+    description = "AnimeVerse - إضافة أنمي متعددة المواقع: Miruro.tv (مواقع أخرى قريباً)"
     authors = listOf("Saher")
 
     /**

@@ -198,6 +198,86 @@ object MiruroSite : AnimeSite {
         }
     }
 
+    // ---------- Arabic subtitles (v3) ----------
+
+    /**
+     * v3: Arabic subtitle search, no relay and no API key — the
+     * same free route Merged uses, adapted to anime episodes:
+     * IMDb suggest (v2.sg.media-imdb.com, no key) resolves the
+     * series title to a tt id, then the OpenSubtitles v3 Strem
+     * endpoint serves the episode's subtitles:
+     * /subtitles/series/<tt>:<season>:<episode>.json (episodes)
+     * or /subtitles/movie/<tt>.json (films). Arabic = first ara
+     * file, UTF-8 preferred. Verified live 2026-11-05: Naruto
+     * S1E1 -> 42 subtitles incl. 5 Arabic (UTF-8).
+     * Fail-soft by design: any failure just skips the العربية
+     * entry — playback and the site's own subtitles are untouched.
+     * NOT in v3 yet: auto-translation of the EN VTT and the
+     * AR+EN merged file — both need a relay endpoint that does
+     * not exist yet (the old /relay/mergesubs answers 404 on the
+     * deployed relay) plus a way to redeploy the Deno relay.
+     */
+    private fun slugTitle(data: String): Triple<String, Int, Int?> {
+        val slug = data.substringAfter("/watch/").substringBefore("?").substringAfterLast("/")
+        val season = Regex("""(?i)-season-(\d+)$""").find(slug)?.groupValues?.get(1)?.toIntOrNull() ?: 1
+        val episode = Regex("""[?&]ep=(\d+)""").find(data)?.groupValues?.get(1)?.toIntOrNull()
+        val full = slug.replace('-', ' ').trim()
+        val base = full.replace(Regex("""(?i)\s+season\s+\d+$"""), "").trim()
+        return Triple(base, season, episode)
+    }
+
+    private suspend fun suggestImdbId(query: String, wantSeries: Boolean): String? {
+        return try {
+            val bucket = query.firstOrNull()?.lowercaseChar() ?: return null
+            val q = URLEncoder.encode(query, "UTF-8")
+            val text = app.get("https://v2.sg.media-imdb.com/suggestion/$bucket/$q.json").text
+            val arr = org.json.JSONObject(text).optJSONArray("d") ?: return null
+            var fallback: String? = null
+            for (i in 0 until arr.length()) {
+                val o = arr.optJSONObject(i) ?: continue
+                val id = o.optString("id")
+                if (!id.startsWith("tt")) continue
+                if (fallback == null) fallback = id
+                val kind = o.optString("q")
+                if (wantSeries && kind == "TV series") return id
+                if (!wantSeries && kind == "feature") return id
+            }
+            fallback
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    private suspend fun arabicSubFor(data: String): String? {
+        return try {
+            val (base, season, episode) = slugTitle(data)
+            if (base.isEmpty()) return null
+            val candidates = listOf(base).distinct()
+            for (title in candidates) {
+                val tt = suggestImdbId(title, episode != null) ?: continue
+                val url = if (episode != null)
+                    "https://opensubtitles-v3.strem.io/subtitles/series/$tt:$season:$episode.json"
+                else
+                    "https://opensubtitles-v3.strem.io/subtitles/movie/$tt.json"
+                val text = app.get(url).text
+                val arr = org.json.JSONObject(text).optJSONArray("subtitles") ?: continue
+                var firstAra: String? = null
+                for (i in 0 until arr.length()) {
+                    val o = arr.optJSONObject(i) ?: continue
+                    if (o.optString("lang") != "ara") continue
+                    val u = o.optString("url")
+                    if (u.isBlank()) continue
+                    if (firstAra == null) firstAra = u
+                    if (o.optString("SubEncoding") == "UTF-8") return u
+                }
+                if (firstAra != null) return firstAra
+            }
+            null
+        } catch (e: Exception) {
+            null
+        }
+    }
+
     // ---------- playback ----------
 
     /**
@@ -289,6 +369,11 @@ object MiruroSite : AnimeSite {
             }
         } catch (e: Exception) {
             // Fall through to the DEBUG marker below.
+        }
+        // v3: Arabic subtitle from OpenSubtitles (fail-soft).
+        try {
+            arabicSubFor(data)?.let { subtitleCallback(SubtitleFile("العربية", it)) }
+        } catch (e: Exception) {
         }
         callback(
             newExtractorLink(

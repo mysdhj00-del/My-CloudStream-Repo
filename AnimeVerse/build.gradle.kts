@@ -9,7 +9,7 @@ android {
 }
 
 cloudstream {
-    description = "AnimeVerse - multi-site anime: Miruro.tv (more sites coming)"
+    description = "AnimeVerse - إضافة أنمي متعددة المواقع: Miruro.tv (مواقع أخرى قريباً)"
     authors = listOf("Saher")
 
     /**

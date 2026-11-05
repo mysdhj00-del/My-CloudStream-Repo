@@ -98,21 +98,56 @@ object MiruroSite : AnimeSite {
      * appeared on-device because fetchHtml (killer-only) returned ""
      * for the CF-walled English VTT.
      */
-    private suspend fun fetchSub(url: String): String {
+    /**
+     * v10: subtitle-file fetch returning (usableText, rawLen).
+     * usableText is "" unless the body parses into real cues; rawLen
+     * is the byte length the last attempt returned (0 = nothing
+     * fetched — distinguishes "fetch failed" from "fetched but
+     * unparseable" in the DEBUG line).
+     */
+    private suspend fun fetchSubText(url: String): Pair<String, Int> {
         val plainHeaders = mapOf(
             "User-Agent" to (headers["User-Agent"] ?: "Mozilla/5.0"),
             "Referer" to "$mainUrl/",
             "Accept" to "*/*"
         )
+        var rawLen = 0
         for (useKiller in listOf(false, true)) {
             try {
                 val text = if (useKiller) fetchHtml(url)
                 else app.get(url, headers = plainHeaders).text
-                if (text.isNotEmpty() && parseSubCues(text).isNotEmpty()) return text
+                rawLen = text.length
+                if (text.isNotEmpty() && parseSubCues(text).isNotEmpty()) return text to rawLen
             } catch (e: Exception) {
             }
         }
-        return ""
+        return "" to rawLen
+    }
+
+    private suspend fun fetchSub(url: String): String = fetchSubText(url).first
+
+    /**
+     * v10: English subtitle text for merging/translating. The site's
+     * own EN VTT is un-fetchable on the phone (eng:0cue on-device:
+     * both plain and CloudflareKiller fetches return nothing
+     * parseable from the CF-walled host), so fall back to the
+     * OpenSubtitles English track for the same title — public and
+     * fetchable. Returns (text, source, siteLen): source is
+     * "site" / "os" / "fail".
+     */
+    private suspend fun getEngText(engUrl: String?, data: String): Triple<String, String, Int> {
+        var siteLen = 0
+        if (engUrl != null) {
+            val (t, rawLen) = fetchSubText(engUrl)
+            siteLen = rawLen
+            if (t.isNotEmpty()) return Triple(t, "site", siteLen)
+        }
+        val osUrl = osSubFor(data, "eng")
+        if (osUrl != null) {
+            val t = fetchSub(osUrl)
+            if (t.isNotEmpty()) return Triple(t, "os", siteLen)
+        }
+        return Triple("", "fail", siteLen)
     }
 
     // ---------- cards ----------
@@ -276,7 +311,14 @@ object MiruroSite : AnimeSite {
         }
     }
 
-    private suspend fun arabicSubFor(data: String): String? {
+    private suspend fun arabicSubFor(data: String): String? = osSubFor(data, "ara")
+
+    /**
+     * v10: OpenSubtitles track for the title in any language
+     * ("ara" / "eng"), via IMDb suggest -> strem endpoint. Prefers a
+     * UTF-8-encoded file, else the first track in that language.
+     */
+    private suspend fun osSubFor(data: String, lang: String): String? {
         return try {
             val (base, season, episode) = slugTitle(data)
             if (base.isEmpty()) return null
@@ -289,16 +331,16 @@ object MiruroSite : AnimeSite {
                     "https://opensubtitles-v3.strem.io/subtitles/movie/$tt.json"
                 val text = app.get(url).text
                 val arr = org.json.JSONObject(text).optJSONArray("subtitles") ?: continue
-                var firstAra: String? = null
+                var firstLang: String? = null
                 for (i in 0 until arr.length()) {
                     val o = arr.optJSONObject(i) ?: continue
-                    if (o.optString("lang") != "ara") continue
+                    if (o.optString("lang") != lang) continue
                     val u = o.optString("url")
                     if (u.isBlank()) continue
-                    if (firstAra == null) firstAra = u
+                    if (firstLang == null) firstLang = u
                     if (o.optString("SubEncoding") == "UTF-8") return u
                 }
-                if (firstAra != null) return firstAra
+                if (firstLang != null) return firstLang
             }
             null
         } catch (e: Exception) {
@@ -623,32 +665,30 @@ object MiruroSite : AnimeSite {
         } catch (e: Exception) {
         }
         try {
-            if (engUrl != null && araUrl != null) {
-                val engText = fetchSub(engUrl)
-                val araText = fetchSub(araUrl)
-                engDiag = "eng:${parseSubCues(engText).size}cue"
-                araDiag = "ara:${parseSubCues(araText).size}cue"
-                if (engText.isNotEmpty() && araText.isNotEmpty()) {
-                    val stored = storeSub(mergeSubVTT(engText, araText))
-                    storeDiag = if (stored != null) "store:ok" else "store:fail"
-                    stored?.let {
-                        subtitleCallback(SubtitleFile("عربي + English", it))
-                    }
+            val (engText, engSrc, siteLen) = getEngText(engUrl, data)
+            val araText = araUrl?.let { fetchSub(it) } ?: ""
+            engDiag = when {
+                engText.isNotEmpty() -> "eng:${parseSubCues(engText).size}cue($engSrc)"
+                siteLen > 0 -> "eng:0cue/${siteLen}B"
+                else -> "eng:0cue"
+            }
+            araDiag = if (araUrl == null) "ara:-" else "ara:${parseSubCues(araText).size}cue"
+            if (engText.isNotEmpty() && araText.isNotEmpty()) {
+                val stored = storeSub(mergeSubVTT(engText, araText))
+                storeDiag = if (stored != null) "store:ok" else "store:fail"
+                stored?.let {
+                    subtitleCallback(SubtitleFile("عربي + English", it))
                 }
-            } else if (engUrl != null) {
-                val engText = fetchSub(engUrl)
-                engDiag = "eng:${parseSubCues(engText).size}cue"
-                if (engText.isNotEmpty()) {
-                    val cues = parseSubCues(engText)
-                    val tr = translateSubCues(cues)
-                    if (tr != null && cues.isNotEmpty()) {
-                        val arVtt = buildSubVTT(cues, tr)
-                        val storedAr = storeSub(arVtt)
-                        storedAr?.let { subtitleCallback(SubtitleFile("العربية (تلقائية)", it)) }
-                        val storedMerged = storeSub(mergeSubVTT(engText, arVtt))
-                        storedMerged?.let { subtitleCallback(SubtitleFile("عربي + English", it)) }
-                        storeDiag = if (storedAr != null || storedMerged != null) "store:ok" else "store:fail"
-                    }
+            } else if (engText.isNotEmpty()) {
+                val cues = parseSubCues(engText)
+                val tr = translateSubCues(cues)
+                if (tr != null && cues.isNotEmpty()) {
+                    val arVtt = buildSubVTT(cues, tr)
+                    val storedAr = storeSub(arVtt)
+                    storedAr?.let { subtitleCallback(SubtitleFile("العربية (تلقائية)", it)) }
+                    val storedMerged = storeSub(mergeSubVTT(engText, arVtt))
+                    storedMerged?.let { subtitleCallback(SubtitleFile("عربي + English", it)) }
+                    storeDiag = if (storedAr != null || storedMerged != null) "store:ok" else "store:fail"
                 }
             }
         } catch (e: Exception) {
@@ -660,7 +700,7 @@ object MiruroSite : AnimeSite {
             callback(
                 newExtractorLink(
                     "Miruro",
-                    "DEBUG v9 $engDiag $araDiag $storeDiag",
+                    "DEBUG v10 $engDiag $araDiag $storeDiag",
                     "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8",
                     ExtractorLinkType.M3U8
                 ) {

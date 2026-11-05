@@ -1,9 +1,11 @@
 // AnimeVerse CloudStream plugin module — multi-site anime addon.
-// v16: Miruro.tv only — AnimoHub removed at the user's order
-// 2026-11-05 ("مصدر ضعيف"). Anilab2 joins as a new site file
-// once its playback chain verifies; see the site registry in
+// v17: Miruro.tv only — ALL 5 sections (trending, latest
+// episodes, top airing, upcoming, schedule), each titled
+// "<section> — Miruro" with full sideways contents (standing
+// rule 2026-11-05). Anilab2 joins as a new site file once
+// its playback chain verifies; see the site registry in
 // AnimeVerseProvider.kt.
-version = 16
+version = 17
 
 android {
     namespace = "com.animeverse"

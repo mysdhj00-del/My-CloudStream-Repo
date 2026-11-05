@@ -14,14 +14,18 @@ import com.lagradost.cloudstream3.utils.ExtractorLink
 /**
  * AnimeVerse — multi-site anime addon for CloudStream.
  *
- * v13: Miruro.tv + AnimoHub. New sites/apps join via [AnimeSite]:
- * add the site file, append it to [sites], done — search aggregates
- * across members, load/loadLinks route by URL host, and each
- * member's home rows appear under its own section names.
+ * v16: Miruro.tv only. AnimoHub was REMOVED 2026-11-05 at the
+ * user's order ("مصدر ضعيف" — weak source: Hindi-heavy files,
+ * series metadata-only, no episode streams) — unregistered
+ * here and its file deleted from the repo. New sites/apps join
+ * via [AnimeSite]: add the site file, append it to [sites],
+ * done — search aggregates across members, load/loadLinks
+ * route by URL host, and each member's home rows appear under
+ * its own section names.
  *
  * Standing rule: a member ships only after its full playback chain
  * is traced live (home/search/detail/streams on a real title).
- * Anilab2 is therefore NOT in v13 (see AnimeSite.kt).
+ * Anilab2 is therefore NOT in v16 (see AnimeSite.kt).
  */
 class AnimeVerseProvider : MainAPI() {
     override var mainUrl = "https://miruro.tv"
@@ -31,7 +35,7 @@ class AnimeVerseProvider : MainAPI() {
     override val supportedTypes = setOf(TvType.Anime, TvType.AnimeMovie)
 
     // Site registry — append new members here as they verify.
-    private val sites: List<AnimeSite> = listOf(MiruroSite, AnimoHubSite)
+    private val sites: List<AnimeSite> = listOf(MiruroSite)
 
     override val mainPage = mainPageOf(
         *sites.flatMap { site -> site.sections }.toTypedArray()

@@ -72,7 +72,11 @@ import okhttp3.RequestBody.Companion.toRequestBody
  *   episode path already uses the same Vidara flow.
  * - Movie audio varies per title (embed page titles seen:
  *   "Multi Audio ESub", "Hindi Fandub") — the source name
- *   carries quality + size so the user sees what it is.
+ *   carries quality + size so the user sees what it is. v14:
+ *   the source name also carries the audio language («هندي» /
+ *   «متعدد الصوت» / «مدبلج», from the embed page title) so a
+ *   Hindi-only file is visible BEFORE playing — the player can
+ *   only list the audio tracks the file itself contains.
  * - Subtitles: movies use the shared AnimeSubs layer
  *   (العربية + عربي + English via relay merge, phone-IP
  *   auto-translate fallback). Episodes: moot (no video).
@@ -348,8 +352,20 @@ object AnimoHubSite : AnimeSite {
      * The POST is Cloudflare-gated from datacenter IPs (sandbox:
      * 20s timeout on both vidara.so and its mirror gobsao8u.com)
      * — on the phone it runs through CloudflareKiller.
+     * v14: also returns the embed page title's audio hint
+     * ("هندي" / "متعدد الصوت") so the source name tells the user
+     * the audio language BEFORE playing — AnimoHub files are
+     * often Hindi fandubs with a single audio track, and the
+     * player can only list what the file contains.
      */
-    private suspend fun resolveVidara(embedUrl: String): Triple<String?, List<Pair<String, String>>, String> {
+    private class VidaraResult(
+        val url: String?,
+        val subs: List<Pair<String, String>>,
+        val diag: String,
+        val audioHint: String
+    )
+
+    private suspend fun resolveVidara(embedUrl: String): VidaraResult {
         var diag = "vid:-"
         return try {
             val page = try {
@@ -361,9 +377,16 @@ object AnimoHubSite : AnimeSite {
                     ""
                 }
             }
-            if (page.isEmpty()) return Triple(null, emptyList(), "vid:page-empty")
+            if (page.isEmpty()) return VidaraResult(null, emptyList(), "vid:page-empty", "")
+            val embedTitle = Regex("""<title>([^<]*)</title>""").find(page)?.groupValues?.get(1) ?: ""
+            val audioHint = when {
+                embedTitle.contains("hindi", ignoreCase = true) -> "هندي"
+                embedTitle.contains("multi audio", ignoreCase = true) -> "متعدد الصوت"
+                embedTitle.contains("fandub", ignoreCase = true) -> "مدبلج"
+                else -> ""
+            }
             val iframe = Regex("""src="(https://[^"]+/e/([A-Za-z0-9]+))"""").find(page)
-                ?: return Triple(null, emptyList(), "vid:no-iframe")
+                ?: return VidaraResult(null, emptyList(), "vid:no-iframe", audioHint)
             val iframeUrl = iframe.groupValues[1]
             val filecode = iframe.groupValues[2]
             val origin = iframeUrl.substringBefore("/e/")
@@ -403,16 +426,16 @@ object AnimoHubSite : AnimeSite {
                             subs.add((so.optString("language").ifEmpty { "Subtitle" }) to file)
                         }
                     }
-                    if (streamUrl != null) return Triple(streamUrl, subs, "vid:ok")
+                    if (streamUrl != null) return VidaraResult(streamUrl, subs, "vid:ok", audioHint)
                     diag = "vid:$host-nourl"
                 } catch (e: Exception) {
                     diag = "vid:$host-err"
                     continue
                 }
             }
-            Triple(null, emptyList(), diag)
+            VidaraResult(null, emptyList(), diag, audioHint)
         } catch (e: Exception) {
-            Triple(null, emptyList(), "vid:err")
+            VidaraResult(null, emptyList(), "vid:err", "")
         }
     }
 
@@ -424,7 +447,10 @@ object AnimoHubSite : AnimeSite {
         callback: (ExtractorLink) -> Unit,
         subtitleCallback: (SubtitleFile) -> Unit
     ): String {
-        val (streamUrl, subs, diag) = resolveVidara(embedUrl)
+        val result = resolveVidara(embedUrl)
+        val streamUrl = result.url
+        val subs = result.subs
+        val diag = result.diag
         for ((label, file) in subs) {
             try {
                 subtitleCallback(SubtitleFile(label, file))
@@ -434,7 +460,8 @@ object AnimoHubSite : AnimeSite {
         if (streamUrl != null) {
             val label = "AnimoHub" +
                 (if (!quality.isNullOrBlank()) " $quality" else "") +
-                (if (!size.isNullOrBlank()) " $size" else "")
+                (if (!size.isNullOrBlank()) " $size" else "") +
+                (if (result.audioHint.isNotBlank()) " - ${result.audioHint}" else "")
             val type = if (streamUrl.contains(".mp4")) ExtractorLinkType.VIDEO else ExtractorLinkType.M3U8
             try {
                 callback(
@@ -570,8 +597,8 @@ object AnimoHubSite : AnimeSite {
         // DEBUG source, always: an empty on-phone source list
         // means loadLinks never ran; the counts say why.
         try {
-            val name = if (noLinks) "DEBUG v13 no-play-links"
-            else "DEBUG v13 ah:$linkCount $vidDiag $engDiag $araDiag $storeDiag"
+            val name = if (noLinks) "DEBUG v14 no-play-links"
+            else "DEBUG v14 ah:$linkCount $vidDiag $engDiag $araDiag $storeDiag"
             callback(
                 newExtractorLink(
                     "AnimoHub",

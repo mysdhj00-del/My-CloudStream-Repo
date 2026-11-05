@@ -200,6 +200,22 @@ object MiruroSite : AnimeSite {
 
     // ---------- playback ----------
 
+    /**
+     * v2: the FIRST parser (v1) matched only one server shape and
+     * missed every other title. Verified 2026-11-05 on 4 live watch
+     * pages: server objects vary — extra fields between provider
+     * and servers (skipTimes), headers with Origin BEFORE Referer,
+     * and embed:null before streams. A per-provider-block regex
+     * cannot survive that, so v2 parses GLOBALLY and positionally:
+     * every server:"..." + headers + streams url in the page,
+     * each attributed to the nearest preceding track:"..." and
+     * provider:"..." markers. Result on the same 4 pages: 13-16
+     * streams each (v1 found 8 on one title, 0 on the other three).
+     * Subtitles are collected globally and deduped by file URL.
+     * The DEBUG link now carries its counts in its NAME (not only
+     * in the source field), so the on-phone source list itself
+     * shows them.
+     */
     override suspend fun loadLinks(
         api: MainAPI,
         data: String,
@@ -218,46 +234,57 @@ object MiruroSite : AnimeSite {
                 val trackMarkers = Regex("""track:"(sub|dub|ssub)"""")
                     .findAll(html).map { it.range.first to it.groupValues[1] }.toList()
                 trackCount = trackMarkers.map { it.second }.toSet().size
+                val providerMarkers = Regex("""provider:"([^"]+)"""")
+                    .findAll(html).map { it.range.first to it.groupValues[1] }.toList()
+                providerCount = providerMarkers.map { it.second }.toSet().size
                 val seenStreams = HashSet<String>()
-                val providerRegex = Regex(
-                    """provider:"([^"]+)",servers:\[(.*?)\],subtitles:""",
+                // Servers WITH headers: headers are flat (no nested
+                // braces), Referer is extracted from them (Origin
+                // may come first). The tempered span between headers
+                // and streams never crosses into the next server.
+                val serverRegex = Regex(
+                    """server:"([^"]+)",headers:\{([^}]*)\},(?:(?!server:").)*?streams:\[\{url:"([^"]+)"""",
                     RegexOption.DOT_MATCHES_ALL
                 )
-                val serverRegex = Regex(
-                    """server:"([^"]+)",(?:headers:\{Referer:"([^"]*)"\},)?streams:\[\{url:"([^"]+)""""
+                val noHeadRegex = Regex(
+                    """server:"([^"]+)",(?:(?!server:").)*?streams:\[\{url:"([^"]+)"""",
+                    RegexOption.DOT_MATCHES_ALL
                 )
-                for (block in providerRegex.findAll(html)) {
-                    providerCount++
-                    val provider = block.groupValues[1]
-                    val track = trackMarkers.lastOrNull { it.first < block.range.first }?.second ?: "sub"
+                val refererRegex = Regex("""Referer:"([^"]*)"""")
+                fun emit(pos: Int, server: String, referer: String, streamUrl: String) {
+                    if (!seenStreams.add(streamUrl)) return
+                    streamCount++
+                    val track = trackMarkers.lastOrNull { it.first < pos }?.second ?: "sub"
+                    val provider = providerMarkers.lastOrNull { it.first < pos }?.second ?: "Miruro"
                     val trackLabel = if (track == "dub") "مدبلج" else "مترجم"
-                    for (s in serverRegex.findAll(block.groupValues[2])) {
-                        val streamUrl = s.groupValues[3]
-                        if (!seenStreams.add(streamUrl)) continue
-                        streamCount++
-                        val referer = s.groupValues[2].ifEmpty { "$mainUrl/" }
-                        callback(
-                            newExtractorLink(
-                                "Miruro",
-                                "$provider ${s.groupValues[1]} [$trackLabel]",
-                                streamUrl,
-                                ExtractorLinkType.M3U8
-                            ) {
-                                this.referer = referer
-                                this.quality = Qualities.Unknown.value
-                            }
-                        )
-                    }
+                    callback(
+                        newExtractorLink(
+                            "Miruro",
+                            "$provider $server [$trackLabel]",
+                            streamUrl,
+                            ExtractorLinkType.M3U8
+                        ) {
+                            this.referer = referer.ifEmpty { "$mainUrl/" }
+                            this.quality = Qualities.Unknown.value
+                        }
+                    )
+                }
+                for (m in serverRegex.findAll(html)) {
+                    val referer = refererRegex.find(m.groupValues[2])?.groupValues?.get(1) ?: ""
+                    emit(m.range.first, m.groupValues[1], referer, m.groupValues[3])
+                }
+                for (m in noHeadRegex.findAll(html)) {
+                    emit(m.range.first, m.groupValues[1], "", m.groupValues[2])
                 }
                 val seenSubs = HashSet<String>()
                 val subRegex = Regex(
                     """language:"(\w+)",label:"([^"]+)",file:"([^"]+\.vtt)""""
                 )
-                for (s in subRegex.findAll(html)) {
-                    val file = s.groupValues[3]
+                for (sub in subRegex.findAll(html)) {
+                    val file = sub.groupValues[3]
                     if (!seenSubs.add(file)) continue
                     subCount++
-                    subtitleCallback(SubtitleFile(s.groupValues[2], file))
+                    subtitleCallback(SubtitleFile(sub.groupValues[2], file))
                 }
             }
         } catch (e: Exception) {
@@ -265,8 +292,8 @@ object MiruroSite : AnimeSite {
         }
         callback(
             newExtractorLink(
-                "DEBUG v1 | Miruro | tracks=$trackCount prov=$providerCount streams=$streamCount subs=$subCount len=$pageLen",
-                "Mux",
+                "Miruro",
+                "DEBUG v1 | tracks=$trackCount prov=$providerCount streams=$streamCount subs=$subCount len=$pageLen | Mux test",
                 "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8",
                 ExtractorLinkType.M3U8
             ) {

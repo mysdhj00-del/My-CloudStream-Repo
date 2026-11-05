@@ -2,7 +2,7 @@
 // v1: Miruro.tv only (full chain traced live 2026-11-05). Anilab2 and
 // AnimoHub join as new site files once their playback chains verify;
 // see the site registry in AnimeVerseProvider.kt.
-version = 6
+version = 7
 
 android {
     namespace = "com.animeverse"

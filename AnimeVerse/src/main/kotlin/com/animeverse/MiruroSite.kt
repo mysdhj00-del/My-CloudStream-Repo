@@ -17,6 +17,8 @@ import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import java.net.URLEncoder
+import org.json.JSONArray
+import org.json.JSONObject
 
 /**
  * Miruro.tv — SvelteKit anime site, first AnimeVerse member.
@@ -24,9 +26,26 @@ import java.net.URLEncoder
  * Chain traced live 2026-11-05 (no /api calls: the site's own
  * /api routes answer Cloudflare "Attention Required!" from
  * datacenter IPs, while the plain HTML pages answer 200):
- * - Home row: GET https://miruro.tv/trending — SSR cards inside
- *   <article> blocks: <a href="/info/<id>/<slug>"
- *   aria-label="Title"> + sibling <img src="poster">.
+ * - Home (v17): ALL of the site's sections, each named
+ *   "<section> — Miruro" (standing rule: every member shows
+ *   all its sections with its site name beside each, full
+ *   sideways-scrolling content — no truncated rows):
+ *   1. «الرائج» — GET /trending, SSR <article data-cover-card>
+ *      cards (18, one season: Fall 2026).
+ *   2. «أحدث الحلقات» — GET /__data.json (SvelteKit stream):
+ *      rails.raw.latest (54) + rails.dub.latest (44), deduped
+ *      by anime (max episode), cards named "Title — الحلقة N".
+ *   3. «الأعلى مشاهدة» — same __data.json, sideLists.airing (10).
+ *   4. «القادم» — same __data.json, sideLists.upcoming (10).
+ *   5. «جدول العرض» — GET /schedule, SSR schedule-card anchors
+ *      (whole week, 52 entries / 15 unique titles, posters).
+ *   __data.json is devalue-serialised: the main object carries
+ *   nodes (layout + home) whose data arrays are value tables
+ *   (structural ints are indices; an int stored IN the table
+ *   is a literal number), and rails/sideLists arrive as
+ *   ["Promise", k] resolved by streamed {"type":"chunk"} objects.
+ *   NOT shipped: Discover — its data comes from /api/search/browse
+ *   (CF-403 from the sandbox, unverifiable here).
  * - Search: GET https://miruro.tv/search?q=<query> — SSR cards in
  *   .browse-grid: <a href="/info/..."><img src alt="Title">.
  *   (The client-side route /api/search/browse?q=&limit=8&type=ANIME
@@ -35,6 +54,10 @@ import java.net.URLEncoder
  *   (@type TVSeries vs Movie, name, description, genre) + an
  *   embedded "episodes:<N>" count. Episodes are watch links
  *   /watch/<id>/<slug>?ep=N (verified ?ep=1 pattern).
+ *   The server 301-redirects /info/<id> (no slug) and any wrong
+ *   slug to the canonical URL, so __data.json items (which carry
+ *   no slug) use /info/<id> and load() reads the canonical slug
+ *   from <link rel="canonical"> for the watch URL.
  * - Playback: GET https://miruro.tv/watch/<id>/<slug>?ep=N —
  *   server-rendered JS data: tracks:[{track:"sub"|"dub"|"ssub",
  *   providers:[{provider, servers:[{server, headers:{Referer},
@@ -53,8 +76,16 @@ import java.net.URLEncoder
  */
 object MiruroSite : AnimeSite {
     override val host = "miruro.tv"
+    // Standing rule (user, 2026-11-05): every member publishes ALL
+    // its sections, each titled "<section> — <Site>", with the
+    // section's FULL contents sideways-scrolling — never a
+    // truncated row, never a bare section name.
     override val sections = listOf(
-        "miruro:trending" to "الرائج"
+        "miruro:trending" to "الرائج — Miruro",
+        "miruro:latest" to "أحدث الحلقات — Miruro",
+        "miruro:airing" to "الأعلى مشاهدة — Miruro",
+        "miruro:upcoming" to "القادم — Miruro",
+        "miruro:schedule" to "جدول العرض — Miruro"
     )
 
     private const val mainUrl = "https://miruro.tv"
@@ -132,6 +163,10 @@ object MiruroSite : AnimeSite {
         """<article[^>]*>(.*?)</article>""",
         RegexOption.DOT_MATCHES_ALL
     )
+    private val scheduleCardRegex = Regex(
+        """<a href="(/info/[^"]+)"[^>]*class="schedule-card[^>]*>(?:(?!</a>).)*?<img[^>]+src="([^"]+)"[^>]*>(?:(?!</a>).)*?<p class="truncate[^"]*">([^<]+)</p>(?:(?!</a>).)*?<p class="schedule-meta[^"]*">(.*?)</p>""",
+        RegexOption.DOT_MATCHES_ALL
+    )
     private val anchorCardRegex = Regex(
         """<a href="/info/([^"]+)"[^>]*>(?:(?!</a>).)*?<img[^>]+src="([^"]+)"[^>]*alt="([^"]*)"""",
         RegexOption.DOT_MATCHES_ALL
@@ -162,6 +197,23 @@ object MiruroSite : AnimeSite {
                 this.posterHeaders = ph
             })
         }
+        // Pass 3: schedule cards (/schedule): <a class="schedule-card"
+        // href="/info/<id>/<slug>"> with <img poster> and a
+        // <p class="truncate ...">Title</p> + "Ep N" meta. Runs
+        // before Pass 2 so the real title wins over the slug fallback.
+        for (m in scheduleCardRegex.findAll(html)) {
+            val url = api.fixUrl(m.groupValues[1])
+            if (!seen.add(url)) continue
+            val title = cleanTitle(m.groupValues[3]).ifEmpty {
+                m.groupValues[1].substringAfterLast('/').replace('-', ' ')
+            }
+            val ep = Regex("""Ep\s+(\d+)""").find(m.groupValues[4])?.groupValues?.get(1)
+            val name = if (ep != null) "$title — الحلقة $ep" else title
+            out.add(api.newTvSeriesSearchResponse(name, url, TvType.Anime) {
+                this.posterUrl = m.groupValues[2].let { api.fixUrl(it) }
+                this.posterHeaders = ph
+            })
+        }
         // Pass 2: anchor cards (search page): img inside the anchor.
         for (m in anchorCardRegex.findAll(html)) {
             val url = api.fixUrl("/info/" + m.groupValues[1])
@@ -179,9 +231,170 @@ object MiruroSite : AnimeSite {
 
     // ---------- home / search ----------
 
+    /**
+     * v17: Miruro's home data lives in GET /__data.json (SvelteKit
+     * stream, devalue-serialised — see [devalueResolve]).
+     * The stream is fetched once per refresh and cached 5 minutes,
+     * so the three __data.json sections share one fetch.
+     */
+    private class HomeData(
+        val latest: List<SearchResponse>,
+        val airing: List<SearchResponse>,
+        val upcoming: List<SearchResponse>
+    )
+
+    private var homeCache: HomeData? = null
+    private var homeCacheAt: Long = 0
+
+    private fun devalueRef(table: JSONArray, i: Int): Any? {
+        if (i < 0 || i >= table.length()) return null
+        val v = table.opt(i)
+        // An int stored IN the table is a literal number, not a ref.
+        if (v is Number) return v
+        return devalueValue(table, v)
+    }
+
+    private fun devalueValue(table: JSONArray, v: Any?): Any? {
+        return when (v) {
+            is JSONArray -> {
+                val out = ArrayList<Any?>()
+                for (i in 0 until v.length()) {
+                    val e = v.opt(i)
+                    out.add(if (e is Number) devalueRef(table, e.toInt()) else devalueValue(table, e))
+                }
+                out
+            }
+            is JSONObject -> {
+                val out = LinkedHashMap<String, Any?>()
+                val keys = v.keys()
+                while (keys.hasNext()) {
+                    val k = keys.next()
+                    val e = v.opt(k)
+                    out[k] = if (e is Number) devalueRef(table, e.toInt()) else devalueValue(table, e)
+                }
+                out
+            }
+            else -> v
+        }
+    }
+
+    private fun jsonObj(v: Any?): Map<String, Any?>? {
+        @Suppress("UNCHECKED_CAST")
+        return v as? Map<String, Any?>
+    }
+
+    private fun jsonList(v: Any?): List<Any?>? {
+        @Suppress("UNCHECKED_CAST")
+        return v as? List<Any?>
+    }
+
+    private fun titleOf(item: Map<String, Any?>): String? {
+        val t = jsonObj(item["title"]) ?: return null
+        val en = (t["english"] as? String)?.trim()?.ifEmpty { null }
+        val romaji = (t["romaji"] as? String)?.trim()?.ifEmpty { null }
+        val native = (t["native"] as? String)?.trim()?.ifEmpty { null }
+        return en ?: romaji ?: native
+    }
+
+    private fun dataCard(api: MainAPI, item: Map<String, Any?>, nameSuffix: String = ""): SearchResponse? {
+        val id = (item["animeId"] as? String) ?: (item["id"] as? String) ?: return null
+        val title = titleOf(item) ?: return null
+        val poster = (item["coverUrl"] as? String)?.takeIf { it.isNotBlank() }
+        val url = "$mainUrl/info/$id"
+        return api.newTvSeriesSearchResponse(cleanTitle(title) + nameSuffix, url, TvType.Anime) {
+            this.posterUrl = poster?.let { api.fixUrl(it) }
+            this.posterHeaders = posterHeaders()
+        }
+    }
+
+    private suspend fun homeData(api: MainAPI): HomeData? {
+        val nowMs = System.currentTimeMillis()
+        homeCache?.let { if (nowMs - homeCacheAt < 5 * 60 * 1000) return it }
+        return try {
+            val text = fetchHtml("$mainUrl/__data.json")
+            if (text.isBlank()) return null
+            val chunks = HashMap<Int, JSONArray>()
+            var mainTable: JSONArray? = null
+            for (line in text.lines()) {
+                val t = line.trim()
+                if (t.isEmpty() || !t.startsWith("{")) continue
+                val obj = JSONObject(t)
+                when (obj.optString("type")) {
+                    "data" -> {
+                        val nodes = obj.optJSONArray("nodes") ?: continue
+                        for (i in 0 until nodes.length()) {
+                            val node = nodes.optJSONObject(i) ?: continue
+                            if (node.optString("type") != "data") continue
+                            val data = node.optJSONArray("data") ?: continue
+                            val head = data.optJSONObject(0) ?: continue
+                            if (head.has("rails")) mainTable = data
+                        }
+                    }
+                    "chunk" -> {
+                        val id = obj.optInt("id", -1)
+                        if (id >= 0) obj.optJSONArray("data")?.let { chunks[id] = it }
+                    }
+                }
+            }
+            val table = mainTable ?: return null
+            val root = jsonObj(devalueValue(table, table.optJSONObject(0))) ?: return null
+            fun unpromise(v: Any?): Any? {
+                val list = jsonList(v) ?: return v
+                if (list.size == 2 && list[0] == "Promise") {
+                    val cid = (list[1] as? Number)?.toInt() ?: return null
+                    val chunk = chunks[cid] ?: return null
+                    return devalueValue(chunk, chunk.optJSONObject(0))
+                }
+                return v
+            }
+            val rails = jsonObj(unpromise(root["rails"]))
+            val side = jsonObj(unpromise(root["sideLists"]))
+            // Latest Episodes: rails.raw.latest (54) + rails.dub.latest
+            // (44), deduped by anime keeping the highest episode.
+            val latestById = LinkedHashMap<String, Pair<Map<String, Any?>, Int>>()
+            for (track in listOf("raw", "dub")) {
+                val items = jsonList(jsonObj(rails?.get(track))?.get("latest")) ?: continue
+                for (rawItem in items) {
+                    val item = jsonObj(rawItem) ?: continue
+                    val id = (item["animeId"] as? String) ?: continue
+                    val ep = (item["episode"] as? Number)?.toInt() ?: 0
+                    val prev = latestById[id]
+                    if (prev == null || ep > prev.second ||
+                        (ep == prev.second && (item["track"] as? String) == "dub")
+                    ) latestById[id] = item to ep
+                }
+            }
+            val latest = ArrayList<SearchResponse>()
+            for ((item, ep) in latestById.values) {
+                val suffix = " — الحلقة $ep" + if ((item["track"] as? String) == "dub") " (مدبلج)" else ""
+                dataCard(api, item, suffix)?.let { latest.add(it) }
+            }
+            fun sideCards(key: String): List<SearchResponse> {
+                val out = ArrayList<SearchResponse>()
+                for (rawItem in jsonList(side?.get(key)) ?: emptyList()) {
+                    val item = jsonObj(rawItem) ?: continue
+                    dataCard(api, item)?.let { out.add(it) }
+                }
+                return out
+            }
+            val built = HomeData(latest, sideCards("airing"), sideCards("upcoming"))
+            homeCache = built
+            homeCacheAt = nowMs
+            built
+        } catch (e: Exception) {
+            null
+        }
+    }
+
     override suspend fun homeSection(api: MainAPI, data: String): List<SearchResponse> {
-        if (data != "miruro:trending") return emptyList()
-        return parseCards(api, fetchHtml("$mainUrl/trending"))
+        return when (data) {
+            "miruro:trending" -> parseCards(api, fetchHtml("$mainUrl/trending"))
+            "miruro:schedule" -> parseCards(api, fetchHtml("$mainUrl/schedule"))
+            "miruro:latest" -> homeData(api)?.latest ?: emptyList()
+            "miruro:airing" -> homeData(api)?.airing ?: emptyList()
+            "miruro:upcoming" -> homeData(api)?.upcoming ?: emptyList()
+            else -> emptyList()
+        }
     }
 
     override suspend fun search(api: MainAPI, query: String): List<SearchResponse> {
@@ -206,10 +419,16 @@ object MiruroSite : AnimeSite {
 
     override suspend fun load(api: MainAPI, url: String): LoadResponse {
         val html = fetchHtml(url)
+        // The server 301-redirects /info/<id> (no slug) and any wrong
+        // slug to the canonical URL — __data.json items carry no slug,
+        // so read it back from <link rel="canonical"> and use it for
+        // the watch URL (loadLinks builds /watch/<id>/<slug>?ep=N).
+        val canonical = Regex("""rel="canonical" href="([^"]+)"""").find(html)?.groupValues?.get(1)
+            ?.takeIf { it.contains("/info/") } ?: url
         val title = Regex("""<title>([^<]+)</title>""").find(html)?.groupValues?.get(1)
             ?.substringBefore(" - Miruro")?.trim()?.ifEmpty { null }
             ?: jsonString(html, "name")
-            ?: url.substringAfterLast('/').replace('-', ' ')
+            ?: canonical.substringAfterLast('/').replace('-', ' ')
         val cover = Regex(
             """https://s4\.anilist\.co/file/anilistcdn/media/anime/cover/large/[^"\\]+"""
         ).find(html)?.value
@@ -217,9 +436,9 @@ object MiruroSite : AnimeSite {
             ?: cover
         val plot = jsonString(html, "description")
         val isMovie = html.contains("\"@type\":\"Movie\"")
-        val watchUrl = url.replace("/info/", "/watch/")
+        val watchUrl = canonical.replace("/info/", "/watch/")
         if (isMovie) {
-            return api.newMovieLoadResponse(cleanTitle(title), url, TvType.AnimeMovie, watchUrl) {
+            return api.newMovieLoadResponse(cleanTitle(title), canonical, TvType.AnimeMovie, watchUrl) {
                 this.posterUrl = poster
                 this.plot = plot
             }
@@ -231,7 +450,7 @@ object MiruroSite : AnimeSite {
                 this.episode = n
             }
         }
-        return api.newTvSeriesLoadResponse(cleanTitle(title), url, TvType.Anime, episodes) {
+        return api.newTvSeriesLoadResponse(cleanTitle(title), canonical, TvType.Anime, episodes) {
             this.posterUrl = poster
             this.plot = plot
         }
@@ -725,7 +944,7 @@ object MiruroSite : AnimeSite {
             callback(
                 newExtractorLink(
                     "Miruro",
-                    "DEBUG v16 $engDiag $araDiag $storeDiag",
+                    "DEBUG v17 $engDiag $araDiag $storeDiag",
                     "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8",
                     ExtractorLinkType.M3U8
                 ) {

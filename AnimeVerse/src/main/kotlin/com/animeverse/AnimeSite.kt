@@ -11,7 +11,15 @@ import com.lagradost.cloudstream3.utils.ExtractorLink
  * adding a file that implements this interface and one entry in
  * [AnimeVerseProvider.sites] — no changes to the provider itself.
  *
- * v16 members: Miruro only. AnimoHub was a member in v13–v15
+ * STANDING RULE (user, 2026-11-05 — applies to EVERY member,
+ * present and future, no need to repeat it): a member publishes
+ * ALL of its site's sections, each titled "<section> — <Site>"
+ * (the site name beside the section name), and every section
+ * shows its FULL contents sideways-scrolling — never a
+ * truncated row, never a bare section name. Miruro (v17) is the
+ * reference implementation: 5 sections, full lists.
+ *
+ * v17 members: Miruro only. AnimoHub was a member in v13–v15
  * and was REMOVED 2026-11-05 at the user's order ("مصدر ضعيف"):
  * Hindi-heavy movie files, series metadata-only with no
  * episode play links — its file is deleted from the repo.

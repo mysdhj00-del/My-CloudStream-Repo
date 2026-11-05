@@ -14,18 +14,16 @@ import com.lagradost.cloudstream3.utils.ExtractorLink
 /**
  * AnimeVerse — multi-site anime addon for CloudStream.
  *
- * v16: Miruro.tv only. AnimoHub was REMOVED 2026-11-05 at the
- * user's order ("مصدر ضعيف" — weak source: Hindi-heavy files,
- * series metadata-only, no episode streams) — unregistered
- * here and its file deleted from the repo. New sites/apps join
- * via [AnimeSite]: add the site file, append it to [sites],
- * done — search aggregates across members, load/loadLinks
- * route by URL host, and each member's home rows appear under
- * its own section names.
+ * v17: Miruro.tv only — all 5 of Miruro's sections, each
+ * "<section> — Miruro", full sideways-scrolling contents
+ * (standing rule, see AnimeSite.kt). AnimoHub was REMOVED
+ * in v16 at the user's order ("مصدر ضعيف"). Anilab2 joins
+ * as a new site file once its playback chain verifies; see
+ * the site registry in AnimeVerseProvider.kt.
  *
  * Standing rule: a member ships only after its full playback chain
  * is traced live (home/search/detail/streams on a real title).
- * Anilab2 is therefore NOT in v16 (see AnimeSite.kt).
+ * Anilab2 is therefore NOT in v17 (see AnimeSite.kt).
  */
 class AnimeVerseProvider : MainAPI() {
     override var mainUrl = "https://miruro.tv"

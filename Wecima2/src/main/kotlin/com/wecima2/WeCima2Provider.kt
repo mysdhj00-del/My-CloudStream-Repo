@@ -99,6 +99,20 @@ import org.jsoup.nodes.Element
  *   gzip-compressed (panel gzip check). DEBUG cards are now
  *   version-tagged ("DEBUG v6 home ...") so any screenshot proves
  *   which code is actually installed.
+ * - v12 (user 2026-11-05 17:22: "ترس الترجمة ... مثل إضافة
+ *   أفلام الرعب"): the subtitle gear, ported from
+ *   HorrorMovies — a settings switch (default ON, persisted
+ *   in SharedPreferences, code-built dialog via openSettings)
+ *   that auto-attaches the best English subtitle to every
+ *   film/episode: title (+year) -> IMDb suggest (key-free) ->
+ *   OpenSubtitles v3 Stremio endpoint (key-free) -> sync-first
+ *   ranking (23.976fps BluRay/WEB UTF-8 preferred). The
+ *   title/season/episode ride in the loadLinks data string
+ *   after "|||" (HorrorMovies packing); the cx slugs are a
+ *   second candidate source (e.g. bahar-2024-series ->
+ *   "bahar") for fully-Arabic titles, whose og:title carries
+ *   no Latin. Fail-soft, 8 s caps — playback never waits on
+ *   subtitles. The DEBUG line carries sub:<diag>.
  * - No coroutine imports anywhere (CI classpath law): plain code,
  *   Thread-free, suspend functions only where the API requires them.
  * - v7 (on-device v6 verdict 2026-11-04 20:19: the visible cards
@@ -381,7 +395,7 @@ class WeCima2Provider : MainAPI() {
         }
         if (items.isEmpty()) {
             val o = outcome
-            val debugTitle = "DEBUG v11 home ${request.name} cat=$catCount pages=$pagesFetched q=$q a=${o?.attempt ?: "-"} code=${o?.code ?: 0} len=${o?.bodyLen ?: 0} r=${o?.reason ?: "nocat"} fb=$feedCount"
+            val debugTitle = "DEBUG v12 home ${request.name} cat=$catCount pages=$pagesFetched q=$q a=${o?.attempt ?: "-"} code=${o?.code ?: 0} len=${o?.bodyLen ?: 0} r=${o?.reason ?: "nocat"} fb=$feedCount"
             items = listOf(newMovieSearchResponse(debugTitle, request.data, TvType.Movie) {})
         }
         if (items.isNotEmpty()) {
@@ -692,7 +706,7 @@ class WeCima2Provider : MainAPI() {
                 val epName = a.selectFirst("episodetitle")?.text()?.trim()?.ifEmpty { null }
                     ?: ep?.let { "الحلقة $it" }
                     ?: "حلقة"
-                newEpisode(href) {
+                newEpisode(subData(href, title, season, ep)) {
                     this.name = epName
                     this.season = season
                     this.episode = ep
@@ -722,7 +736,7 @@ class WeCima2Provider : MainAPI() {
                 }
             if (seriesHref != null) return load(seriesHref)
             val m = episodeUrlRegex.find(url)
-            val single = newEpisode(url) {
+            val single = newEpisode(subData(url, title, m?.groupValues?.get(1)?.toIntOrNull(), m?.groupValues?.get(2)?.toIntOrNull())) {
                 this.name = title
                 this.season = m?.groupValues?.get(1)?.toIntOrNull()
                 this.episode = m?.groupValues?.get(2)?.toIntOrNull()
@@ -741,7 +755,7 @@ class WeCima2Provider : MainAPI() {
         return newMovieLoadResponse(
             title, url,
             if (anime) TvType.Anime else TvType.Movie,
-            url
+            subData(url, title, null, null)
         ) {
             this.posterUrl = poster
             this.plot = plot
@@ -796,12 +810,22 @@ class WeCima2Provider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
+        // v12: subtitle gear (ported from HorrorMovies) — the
+        // title/season/episode ride in the data string after
+        // "|||"; strip them before any fetch.
+        val (realData, subTitle, subSeason, subEp) = parseSubData(data)
+        var subDiag = "sub:-"
+        if (Wecima2Subs.autoEnglish && subTitle.isNotBlank()) {
+            subDiag = if (emitEnglishSub(subTitle, subSeason, subEp, realData, subtitleCallback)) "sub:en" else "sub:no-match"
+        } else if (!Wecima2Subs.autoEnglish) {
+            subDiag = "sub:off"
+        }
         var pageCode = 0
         var btnCount = 0
         var decodedCount = 0
         var okCount = 0
         try {
-            val doc = app.get(data, headers = headers, interceptor = cloudflareKiller).document
+            val doc = app.get(realData, headers = headers, interceptor = cloudflareKiller).document
             pageCode = 200
             val btns = doc.select("btn[data-url]")
             btnCount = btns.size
@@ -809,7 +833,7 @@ class WeCima2Provider : MainAPI() {
                 val embed = decodeCxUrl(b.attr("data-url")) ?: continue
                 decodedCount++
                 try {
-                    if (loadExtractor(embed, data, subtitleCallback, callback)) okCount++
+                    if (loadExtractor(embed, realData, subtitleCallback, callback)) okCount++
                 } catch (e: Exception) {
                     // One dead host must not kill the rest.
                 }
@@ -822,9 +846,9 @@ class WeCima2Provider : MainAPI() {
         // Bahar: only an "Update Server" placeholder btn),
         // say so in the source list instead of a bare Mux.
         val debugName = if (okCount == 0)
-            "DEBUG v11 | no-servers-on-site | page=$pageCode | btn=$btnCount | dec=$decodedCount | ok=0"
+            "DEBUG v12 | no-servers-on-site | page=$pageCode | btn=$btnCount | dec=$decodedCount | ok=0 | $subDiag"
         else
-            "DEBUG v11 | play | page=$pageCode | btn=$btnCount | dec=$decodedCount | ok=$okCount"
+            "DEBUG v12 | play | page=$pageCode | btn=$btnCount | dec=$decodedCount | ok=$okCount | $subDiag"
         callback(
             newExtractorLink(
                 debugName,
@@ -832,10 +856,167 @@ class WeCima2Provider : MainAPI() {
                 "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8",
                 ExtractorLinkType.M3U8
             ) {
-                this.referer = data
+                this.referer = realData
                 this.quality = Qualities.Unknown.value
             }
         )
         return true
+    }
+
+    // ---------- auto English subtitles (v12, HorrorMovies port) ----------
+
+    /**
+     * AUTO ENGLISH SUBTITLES: CloudStream has no standalone
+     * subtitle-plugin type that auto-attaches to other
+     * providers' playback, so the tool lives here — inside
+     * loadLinks, before any video link is emitted:
+     *   Latin title (+ year) -> IMDb suggest (key-free) -> IMDb
+     *   id -> OpenSubtitles v3 Stremio endpoint (key-free) ->
+     *   best lang=eng file by sync-first ranking ->
+     *   subtitleCallback(SubtitleFile("English", url)).
+     * Everything is fail-soft and fail-fast (8 s caps): if any
+     * step misses, playback continues with zero subtitles —
+     * never blocked. Titles with no Latin part and no usable
+     * slug get no subtitle (same limit as HorrorMovies v4).
+     */
+    private fun httpGetText(url: String, timeoutMs: Int): String? {
+        return runCatching {
+            val conn = java.net.URL(url).openConnection()
+                as java.net.HttpURLConnection
+            conn.requestMethod = "GET"
+            conn.connectTimeout = timeoutMs
+            conn.readTimeout = timeoutMs
+            conn.setRequestProperty("User-Agent", headers["User-Agent"] ?: "Mozilla/5.0")
+            conn.setRequestProperty("Accept", "application/json, text/plain, */*")
+            val stream = if (conn.responseCode in 200..299) {
+                conn.inputStream
+            } else {
+                return@runCatching null
+            }
+            stream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+        }.getOrNull()
+    }
+
+    private fun latinTitleCandidates(title: String): List<String> {
+        var t = title.replace(Regex("""[\u0600-\u06FF]+"""), " ")
+        t = t.replace(Regex("""(?i)\b(mtarjm|mudblj|online|web-dl|bluray|hd|hdts|hdcam|webdl)\b"""), " ")
+        t = t.replace(Regex("""[^A-Za-z0-9 :'\-!.,]+"""), " ")
+        t = t.replace(Regex("""\s+"""), " ").trim()
+        t = t.replace(Regex("""\s+(19|20)\d\d\s*$"""), "").trim()
+        if (t.isBlank()) return emptyList()
+        val out = mutableListOf(t)
+        Regex("""\s+\d{1,2}$""").find(t)?.let {
+            val stripped = t.substring(0, it.range.first).trim()
+            if (stripped.isNotBlank()) out += stripped
+        }
+        return out
+    }
+
+    /** Slug words as a second candidate source (cx slugs are
+     * Latin: avengers-endgame-2019-movie -> "avengers endgame",
+     * bahar-2024-series -> "bahar"). */
+    private fun slugCandidates(url: String): List<String> {
+        var slug = url.substringAfter("/watch/").substringAfter("/series/").trimEnd('/')
+        slug = Regex("""-s\d+-e\d+$""").replace(slug, "")
+        slug = slug.removeSuffix("-movie").removeSuffix("-series")
+        slug = Regex("""-\d{4}$""").replace(slug, "")
+        slug = slug.replace('-', ' ').replace(Regex("""\s+"""), " ").trim()
+        if (slug.isBlank()) return emptyList()
+        return listOf(slug)
+    }
+
+    private fun resolveImdbId(latinTitle: String, year: Int?, wantSeries: Boolean): String? {
+        val bucket = latinTitle.firstOrNull()?.lowercaseChar() ?: return null
+        val q = java.net.URLEncoder.encode(latinTitle, "UTF-8")
+        val json = httpGetText(
+            "https://v2.sg.media-imdb.com/suggestion/$bucket/$q.json", 8000
+        ) ?: return null
+        val arr = runCatching {
+            JSONObject(json).optJSONArray("d")
+        }.getOrNull() ?: return null
+        val want = if (wantSeries) "TV series" else "feature"
+        val other = if (wantSeries) "feature" else "TV series"
+        var fallback: String? = null
+        for (i in 0 until arr.length()) {
+            val o = arr.optJSONObject(i) ?: continue
+            val id = o.optString("id")
+            if (id.isBlank()) continue
+            val kind = o.optString("q")
+            if (fallback == null && kind == other) fallback = id
+            if (kind != want) continue
+            if (year != null && o.has("y") && o.optInt("y") != year) continue
+            return id
+        }
+        return fallback
+    }
+
+    private fun emitEnglishSub(
+        title: String,
+        season: Int?,
+        ep: Int?,
+        url: String,
+        subtitleCallback: (SubtitleFile) -> Unit
+    ): Boolean {
+        val year = Regex("""(19|20)\d\d""").find(title)?.value?.toIntOrNull()
+        val candidates = latinTitleCandidates(title) + slugCandidates(url)
+        val wantSeries = season != null && ep != null
+        for (candidate in candidates) {
+            val tt = resolveImdbId(candidate, year, wantSeries) ?: continue
+            val osUrl = if (wantSeries)
+                "https://opensubtitles-v3.strem.io/subtitles/series/$tt:$season:$ep.json"
+            else
+                "https://opensubtitles-v3.strem.io/subtitles/movie/$tt.json"
+            val json = httpGetText(osUrl, 8000) ?: continue
+            val arr = runCatching {
+                JSONObject(json).optJSONArray("subtitles")
+            }.getOrNull() ?: continue
+            // Sync-first ranking (HorrorMovies v7): don't take
+            // the first eng file. A subtitle timed for 25fps on
+            // a 23.976fps stream drifts more and more as the
+            // film plays — the classic desync. Prefer
+            // 23.976fps BluRay/WEB UTF-8 files, which match
+            // the standard movie streams best.
+            var bestUrl = ""
+            var bestScore = -1
+            for (i in 0 until arr.length()) {
+                val o = arr.optJSONObject(i) ?: continue
+                if (o.optString("lang") != "eng") continue
+                val u = o.optString("url")
+                if (u.isBlank()) continue
+                var score = 0
+                if (o.optInt("fpsMilli", 0) == 23976) score += 3
+                val fmt = o.optString("releaseFormat")
+                if (fmt == "BluRay" || fmt == "WEB") score += 2
+                if (o.optString("SubEncoding") == "UTF-8") score += 1
+                if (score > bestScore) {
+                    bestScore = score
+                    bestUrl = u
+                }
+            }
+            if (bestUrl.isNotBlank()) {
+                subtitleCallback(SubtitleFile("English", bestUrl))
+                return true
+            }
+        }
+        return false
+    }
+
+    /** Packs title (+season/episode) into a loadLinks data string. */
+    private fun subData(url: String, title: String, season: Int?, ep: Int?): String {
+        val enc = java.net.URLEncoder.encode(title, "UTF-8")
+        return url + "|||" + enc + "|||" + (season?.toString() ?: "") + "|||" + (ep?.toString() ?: "")
+    }
+
+    private data class SubPack(val url: String, val title: String, val season: Int?, val ep: Int?)
+
+    private fun parseSubData(data: String): SubPack {
+        val parts = data.split("|||")
+        val real = parts.getOrNull(0) ?: data
+        val title = parts.getOrNull(1)?.let {
+            runCatching { java.net.URLDecoder.decode(it, "UTF-8") }.getOrDefault("")
+        }.orEmpty()
+        val season = parts.getOrNull(2)?.toIntOrNull()
+        val ep = parts.getOrNull(3)?.toIntOrNull()
+        return SubPack(real, title, season, ep)
     }
 }

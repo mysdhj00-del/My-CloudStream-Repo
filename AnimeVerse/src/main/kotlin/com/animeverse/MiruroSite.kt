@@ -88,6 +88,33 @@ object MiruroSite : AnimeSite {
         }
     }
 
+    /**
+     * v8: subtitle-file fetch. Plain request FIRST, exactly like the
+     * player fetches the site's own subs (no interceptor, Referer
+     * miruro.tv), CloudflareKiller as fallback. A fetch only counts
+     * when the body parses into real cues — a challenge/error page
+     * is non-empty but cue-less, and the old isNotEmpty guard let
+     * it through (or hid the failure). The v5-v7 merged entry never
+     * appeared on-device because fetchHtml (killer-only) returned ""
+     * for the CF-walled English VTT.
+     */
+    private suspend fun fetchSub(url: String): String {
+        val plainHeaders = mapOf(
+            "User-Agent" to (headers["User-Agent"] ?: "Mozilla/5.0"),
+            "Referer" to "$mainUrl/",
+            "Accept" to "*/*"
+        )
+        for (useKiller in listOf(false, true)) {
+            try {
+                val text = if (useKiller) fetchHtml(url)
+                else app.get(url, headers = plainHeaders).text
+                if (text.isNotEmpty() && parseSubCues(text).isNotEmpty()) return text
+            } catch (e: Exception) {
+            }
+        }
+        return ""
+    }
+
     // ---------- cards ----------
 
     private val articleRegex = Regex(
@@ -520,6 +547,9 @@ object MiruroSite : AnimeSite {
         var subCount = 0
         var pageLen = 0
         var engUrl: String? = null
+        var engDiag = "eng:-"
+        var araDiag = "ara:-"
+        var storeDiag = "store:-"
         try {
             val html = fetchHtml(data)
             pageLen = html.length
@@ -594,22 +624,30 @@ object MiruroSite : AnimeSite {
         }
         try {
             if (engUrl != null && araUrl != null) {
-                val engText = fetchHtml(engUrl)
-                val araText = fetchHtml(araUrl)
+                val engText = fetchSub(engUrl)
+                val araText = fetchSub(araUrl)
+                engDiag = "eng:${parseSubCues(engText).size}cue"
+                araDiag = "ara:${parseSubCues(araText).size}cue"
                 if (engText.isNotEmpty() && araText.isNotEmpty()) {
-                    storeSub(mergeSubVTT(engText, araText))?.let {
-                    subtitleCallback(SubtitleFile("عربي + English", it))
-                }
+                    val stored = storeSub(mergeSubVTT(engText, araText))
+                    storeDiag = if (stored != null) "store:ok" else "store:fail"
+                    stored?.let {
+                        subtitleCallback(SubtitleFile("عربي + English", it))
+                    }
                 }
             } else if (engUrl != null) {
-                val engText = fetchHtml(engUrl)
+                val engText = fetchSub(engUrl)
+                engDiag = "eng:${parseSubCues(engText).size}cue"
                 if (engText.isNotEmpty()) {
                     val cues = parseSubCues(engText)
                     val tr = translateSubCues(cues)
                     if (tr != null && cues.isNotEmpty()) {
                         val arVtt = buildSubVTT(cues, tr)
-                        storeSub(arVtt)?.let { subtitleCallback(SubtitleFile("العربية (تلقائية)", it)) }
-                        storeSub(mergeSubVTT(engText, arVtt))?.let { subtitleCallback(SubtitleFile("عربي + English", it)) }
+                        val storedAr = storeSub(arVtt)
+                        storedAr?.let { subtitleCallback(SubtitleFile("العربية (تلقائية)", it)) }
+                        val storedMerged = storeSub(mergeSubVTT(engText, arVtt))
+                        storedMerged?.let { subtitleCallback(SubtitleFile("عربي + English", it)) }
+                        storeDiag = if (storedAr != null || storedMerged != null) "store:ok" else "store:fail"
                     }
                 }
             }
@@ -618,7 +656,7 @@ object MiruroSite : AnimeSite {
         callback(
             newExtractorLink(
                 "Miruro",
-                "DEBUG v7 | tracks=$trackCount prov=$providerCount streams=$streamCount subs=$subCount len=$pageLen | Mux test",
+                "DEBUG v8 $engDiag $araDiag $storeDiag | tracks=$trackCount prov=$providerCount streams=$streamCount subs=$subCount len=$pageLen | Mux test",
                 "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8",
                 ExtractorLinkType.M3U8
             ) {

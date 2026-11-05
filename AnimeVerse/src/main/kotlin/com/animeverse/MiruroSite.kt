@@ -290,6 +290,43 @@ object MiruroSite : AnimeSite {
     private suspend fun arabicSubFor(data: String): String? = osSubFor(data, "ara")
 
     /**
+     * v12: ALL OpenSubtitles URLs for the title in a language (cap 5).
+     * The relay scores each Arabic candidate against the English file
+     * by timing coverage and merges the best-aligned one — the first
+     * Arabic file is often the wrong-timed one (Naruto S1E1: first
+     * 74% coverage starting at 108s, second 95% starting at 4s).
+     */
+    private suspend fun osSubsFor(data: String, lang: String): List<String> {
+        return try {
+            val (base, season, episode) = slugTitle(data)
+            if (base.isEmpty()) return emptyList()
+            val candidates = listOf(base).distinct()
+            for (title in candidates) {
+                val tt = suggestImdbId(title, episode != null) ?: continue
+                val url = if (episode != null)
+                    "https://opensubtitles-v3.strem.io/subtitles/series/$tt:$season:$episode.json"
+                else
+                    "https://opensubtitles-v3.strem.io/subtitles/movie/$tt.json"
+                val text = app.get(url).text
+                val arr = org.json.JSONObject(text).optJSONArray("subtitles") ?: continue
+                val out = mutableListOf<String>()
+                for (i in 0 until arr.length()) {
+                    val o = arr.optJSONObject(i) ?: continue
+                    if (o.optString("lang") != lang) continue
+                    val u = o.optString("url")
+                    if (u.isBlank() || out.contains(u)) continue
+                    out.add(u)
+                    if (out.size >= 5) break
+                }
+                if (out.isNotEmpty()) return out
+            }
+            emptyList()
+        } catch (e: Exception) {
+            emptyList()
+        }
+    }
+
+    /**
      * v10: OpenSubtitles track for the title in any language
      * ("ara" / "eng"), via IMDb suggest -> strem endpoint. Prefers a
      * UTF-8-encoded file, else the first track in that language.
@@ -643,19 +680,22 @@ object MiruroSite : AnimeSite {
         try {
             // v11 (panel verdict 2026-11-05, 6/6): merge on the SERVER.
             // The phone never fetches subtitle files for the merge: it
-            // only resolves the two OpenSubtitles URLs (public, proven
+            // only resolves the OpenSubtitles URLs (public, proven
             // — the direct "العربية" entry already works) and emits the
             // relay's GET merge URL, which returns the merged VTT
             // directly. This removes the three phone-side failure
             // points (site EN fetch, in-addon merge, store POST).
+            // v12: send ALL Arabic candidates — the relay scores each
+            // against the English file and merges the best-aligned one.
             val engOsUrl = osSubFor(data, "eng")
+            val araUrls = osSubsFor(data, "ara")
             engDiag = if (engOsUrl != null) "eng:os" else "eng:-"
-            araDiag = if (araUrl == null) "ara:-" else "ara:yes"
-            if (engOsUrl != null && araUrl != null) {
-                val mergeUrl = "$relayBase/relay/mergesubs?eng=" +
-                    URLEncoder.encode(engOsUrl, "UTF-8") +
-                    "&ara=" + URLEncoder.encode(araUrl, "UTF-8")
-                subtitleCallback(SubtitleFile("عربي + English", mergeUrl))
+            araDiag = "ara:${araUrls.size}"
+            if (engOsUrl != null && araUrls.isNotEmpty()) {
+                val mergeUrl = StringBuilder("$relayBase/relay/mergesubs?eng=")
+                    .append(URLEncoder.encode(engOsUrl, "UTF-8"))
+                for (u in araUrls) mergeUrl.append("&ara=").append(URLEncoder.encode(u, "UTF-8"))
+                subtitleCallback(SubtitleFile("عربي + English", mergeUrl.toString()))
                 storeDiag = "merge:ok"
             } else if (engOsUrl != null) {
                 // No ready Arabic: phone-IP auto-translate stays
@@ -685,7 +725,7 @@ object MiruroSite : AnimeSite {
             callback(
                 newExtractorLink(
                     "Miruro",
-                    "DEBUG v11 $engDiag $araDiag $storeDiag",
+                    "DEBUG v12 $engDiag $araDiag $storeDiag",
                     "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8",
                     ExtractorLinkType.M3U8
                 ) {

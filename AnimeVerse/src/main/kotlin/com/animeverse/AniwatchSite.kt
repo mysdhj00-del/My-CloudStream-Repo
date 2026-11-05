@@ -685,7 +685,7 @@ object AniwatchSite : AnimeSite {
             callback(
                 newExtractorLink(
                     "Aniwatch",
-                    "DEBUG v19 $zokoDiag $megaDiag $otherDiag $engDiag $araDiag $storeDiag $trDiag $engCuesDiag",
+                    "DEBUG v20 $zokoDiag $megaDiag $otherDiag $engDiag $araDiag $storeDiag $trDiag $engCuesDiag",
                     "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8",
                     ExtractorLinkType.M3U8
                 ) {

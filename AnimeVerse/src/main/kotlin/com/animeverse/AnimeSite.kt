@@ -19,8 +19,10 @@ import com.lagradost.cloudstream3.utils.ExtractorLink
  * truncated row, never a bare section name. Miruro (v17) is the
  * reference implementation: 5 sections, full lists.
  *
- * v17 members: Miruro only. AnimoHub was a member in v13–v15
- * and was REMOVED 2026-11-05 at the user's order ("مصدر ضعيف"):
+ * v18 members: Miruro + GogoAnime (gogoanime.fi: Blogger mp4
+ * + MegaPlay AES-decrypted HLS, both traced live 2026-11-05).
+ * AnimoHub was a member in v13–v15 and was REMOVED 2026-11-05
+ * at the user's order ("مصدر ضعيف"):
  * Hindi-heavy movie files, series metadata-only with no
  * episode play links — its file is deleted from the repo.
  * Anilab2 is NOT a member yet: its catalog API is verified but

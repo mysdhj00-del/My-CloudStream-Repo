@@ -11,11 +11,13 @@ import com.lagradost.cloudstream3.utils.ExtractorLink
  * adding a file that implements this interface and one entry in
  * [AnimeVerseProvider.sites] — no changes to the provider itself.
  *
- * v1 members: Miruro only. Anilab2 and AnimoHub are NOT members yet:
- * Anilab2's catalog API is verified but its streams live behind the
- * KYOTO Player API (Cloudflare-challenged, episode path uncracked),
- * and AnimoHub's Dooo API routes are still hidden inside its packed
- * APK. Each joins only after its full playback chain is traced live.
+ * v13 members: Miruro + AnimoHub (Dooo panel, chain traced live
+ * 2026-11-05; movies play via Vidara embeds, series are
+ * metadata-only — the panel stores no episode play links).
+ * Anilab2 is NOT a member yet: its catalog API is verified but
+ * its streams live behind the KYOTO Player API
+ * (Cloudflare-challenged, episode path uncracked). It joins only
+ * after its full playback chain is traced live.
  */
 interface AnimeSite {
     /** Host substring used to route load()/loadLinks() URLs, e.g. "miruro.tv". */

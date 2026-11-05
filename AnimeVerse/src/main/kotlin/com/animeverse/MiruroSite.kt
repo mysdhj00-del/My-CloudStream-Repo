@@ -653,17 +653,23 @@ object MiruroSite : AnimeSite {
             }
         } catch (e: Exception) {
         }
-        callback(
-            newExtractorLink(
-                "Miruro",
-                "DEBUG v8 $engDiag $araDiag $storeDiag | tracks=$trackCount prov=$providerCount streams=$streamCount subs=$subCount len=$pageLen | Mux test",
-                "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8",
-                ExtractorLinkType.M3U8
-            ) {
-                this.referer = data
-                this.quality = Qualities.Unknown.value
-            }
-        )
+        // v9: short DEBUG name (the v8 name was ~100 chars and may
+        // have been truncated/hidden) and wrapped so nothing can
+        // kill it — if loadLinks runs at all, this MUST appear.
+        try {
+            callback(
+                newExtractorLink(
+                    "Miruro",
+                    "DEBUG v9 $engDiag $araDiag $storeDiag",
+                    "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8",
+                    ExtractorLinkType.M3U8
+                ) {
+                    this.referer = data
+                    this.quality = Qualities.Unknown.value
+                }
+            )
+        } catch (e: Exception) {
+        }
         return true
     }
 }

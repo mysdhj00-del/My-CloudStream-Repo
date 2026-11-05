@@ -95,7 +95,12 @@ import org.json.JSONObject
  * - DEBUG markers in v18 (standing rule): loadLinks always
  *   emits one DEBUG Mux source carrying host + per-host
  *   outcome + subtitle diagnostics, so an empty on-phone
- *   source list means loadLinks never ran.
+ *   source list means loadLinks never ran. v20 adds the
+ *   step-level diagnostics first built for Aniwatch v19
+ *   (eng fetch cue count + translate result), after the
+ *   Overgeared and Kurumi-chan reports both showed a silent
+ *   "store:-" with a healthy English file — the next
+ *   screenshot now names the failing step.
  * - No coroutine imports anywhere (CI classpath law).
  */
 object GogoAnimeSite : AnimeSite {
@@ -410,6 +415,8 @@ object GogoAnimeSite : AnimeSite {
         var engDiag = "eng:-"
         var araDiag = "ara:-"
         var storeDiag = "store:-"
+        var trDiag = "tr:-"
+        var engCuesDiag = "engcues:-"
         var epTitle = ""
         var epNum: Int? = null
         try {
@@ -595,16 +602,21 @@ object GogoAnimeSite : AnimeSite {
                     storeDiag = "merge:ok"
                 } else if (engOsUrl != null) {
                     val engText = AnimeSubs.fetchSubText(engOsUrl, "", cloudflareKiller).first
-                    if (engText.isNotEmpty()) {
-                        val cues = AnimeSubs.parseSubCues(engText)
+                    val cues = if (engText.isNotEmpty()) AnimeSubs.parseSubCues(engText) else emptyList()
+                    engCuesDiag = "engcues:${cues.size}"
+                    if (cues.isNotEmpty()) {
                         val tr = AnimeSubs.translateSubCues(cues)
-                        if (tr != null && cues.isNotEmpty()) {
+                        if (tr != null) {
+                            trDiag = "tr:ok"
                             val arVtt = AnimeSubs.buildSubVTT(cues, tr)
                             val storedAr = AnimeSubs.storeSub(arVtt)
                             storedAr?.let { subtitleCallback(SubtitleFile("العربية (تلقائية)", it)) }
                             val storedMerged = AnimeSubs.storeSub(AnimeSubs.mergeSubVTT(engText, arVtt))
                             storedMerged?.let { subtitleCallback(SubtitleFile("عربي + English", it)) }
                             storeDiag = if (storedAr != null || storedMerged != null) "store:ok" else "store:fail"
+                        } else {
+                            trDiag = "tr:fail"
+                            storeDiag = "store:tr-fail"
                         }
                     }
                 }
@@ -619,7 +631,7 @@ object GogoAnimeSite : AnimeSite {
             callback(
                 newExtractorLink(
                     "GogoAnime",
-                    "DEBUG v18 $hostDiag $bloggerDiag $megaDiag $otherDiag $engDiag $araDiag $storeDiag",
+                    "DEBUG v20 $hostDiag $bloggerDiag $megaDiag $otherDiag $engDiag $araDiag $storeDiag $trDiag $engCuesDiag",
                     "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8",
                     ExtractorLinkType.M3U8
                 ) {

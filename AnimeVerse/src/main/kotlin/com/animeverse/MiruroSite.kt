@@ -386,25 +386,42 @@ object MiruroSite : AnimeSite {
     )
 
     private fun fixSubEncoding(str: String): String {
-        if (str.any { it in '\u0600'..'\u06FF' }) return str
-        return try {
-            val bytes = ByteArray(str.length)
-            for ((i, c) in str.withIndex()) {
-                val code = c.code
-                bytes[i] = when {
-                    code < 0x80 -> code.toByte()
-                    code in 0xA0..0xFF -> code.toByte()
-                    win1252Special.containsKey(c) -> win1252Special.getValue(c).toByte()
-                    else -> return str
+        // Per-run repair (same as subtitles.ts): remap each run of
+        // Latin-1/Win1252 chars back to bytes and UTF-8-decode it,
+        // keeping genuine Arabic/CJK runs untouched. One cue mixes
+        // proper Arabic with mojibake, and 0x80-0x9F bytes arrive as
+        // Latin-1 control chars (e.g. U+0081) — a whole-string remap
+        // bails on those.
+        val out = StringBuilder()
+        var run = StringBuilder()
+        fun flush() {
+            if (run.isEmpty()) return
+            val text = run.toString()
+            run = StringBuilder()
+            try {
+                val bytes = ByteArray(text.length)
+                for ((i, c) in text.withIndex()) {
+                    val code = c.code
+                    bytes[i] = when {
+                        code < 0x100 -> code.toByte()
+                        win1252Special.containsKey(c) -> win1252Special.getValue(c).toByte()
+                        else -> { out.append(text); return }
+                    }
                 }
+                val fixed = String(bytes, Charsets.UTF_8)
+                if (fixed.contains('\uFFFD')) out.append(text)
+                else if (fixed.any { it in '\u0600'..'\u06FF' }) out.append(fixed)
+                else out.append(text)
+            } catch (e: Exception) {
+                out.append(text)
             }
-            val fixed = String(bytes, Charsets.UTF_8)
-            if (fixed.contains('\uFFFD')) str
-            else if (fixed.any { it in '\u0600'..'\u06FF' }) fixed
-            else str
-        } catch (e: Exception) {
-            str
         }
+        for (c in str) {
+            if (c.code < 0x100 || win1252Special.containsKey(c)) run.append(c)
+            else { flush(); out.append(c) }
+        }
+        flush()
+        return out.toString()
     }
 
     private fun cleanSubText(t: String): String {
@@ -601,7 +618,7 @@ object MiruroSite : AnimeSite {
         callback(
             newExtractorLink(
                 "Miruro",
-                "DEBUG v6 | tracks=$trackCount prov=$providerCount streams=$streamCount subs=$subCount len=$pageLen | Mux test",
+                "DEBUG v7 | tracks=$trackCount prov=$providerCount streams=$streamCount subs=$subCount len=$pageLen | Mux test",
                 "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8",
                 ExtractorLinkType.M3U8
             ) {

@@ -725,7 +725,7 @@ object MiruroSite : AnimeSite {
             callback(
                 newExtractorLink(
                     "Miruro",
-                    "DEBUG v12 $engDiag $araDiag $storeDiag",
+                    "DEBUG v16 $engDiag $araDiag $storeDiag",
                     "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8",
                     ExtractorLinkType.M3U8
                 ) {

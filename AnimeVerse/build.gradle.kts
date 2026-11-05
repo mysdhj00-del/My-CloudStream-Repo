@@ -1,8 +1,10 @@
 // AnimeVerse CloudStream plugin module — multi-site anime addon.
-// v13: Miruro.tv + AnimoHub (Dooo panel, chain traced live
-// 2026-11-05). Anilab2 joins as a new site file once its playback
-// chain verifies; see the site registry in AnimeVerseProvider.kt.
-version = 13
+// v14: Miruro.tv + AnimoHub (Dooo panel, chain traced live
+// 2026-11-05; v14 adds the audio-language hint to AnimoHub
+// movie source names). Anilab2 joins as a new site file once
+// its playback chain verifies; see the site registry in
+// AnimeVerseProvider.kt.
+version = 14
 
 android {
     namespace = "com.animeverse"

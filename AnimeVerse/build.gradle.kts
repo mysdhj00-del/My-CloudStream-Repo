@@ -1,18 +1,18 @@
 // AnimeVerse CloudStream plugin module — multi-site anime addon.
-// v17: Miruro.tv only — ALL 5 sections (trending, latest
-// episodes, top airing, upcoming, schedule), each titled
-// "<section> — Miruro" with full sideways contents (standing
-// rule 2026-11-05). Anilab2 joins as a new site file once
-// its playback chain verifies; see the site registry in
+// v18: Miruro.tv (ALL 5 sections) + GogoAnime gogoanime.fi (ALL 4
+// sections: latest episodes, recommendations, top, full catalog),
+// each titled "<section> — <Site>" with full sideways contents
+// (standing rule 2026-11-05). Anilab2 joins as a new site file
+// once its playback chain verifies; see the site registry in
 // AnimeVerseProvider.kt.
-version = 17
+version = 18
 
 android {
     namespace = "com.animeverse"
 }
 
 cloudstream {
-    description = "AnimeVerse - إضافة أنمي متعددة المواقع: Miruro.tv (مواقع أخرى قريباً)"
+    description = "AnimeVerse - إضافة أنمي متعددة المواقع: Miruro.tv + GogoAnime (مواقع أخرى قريباً)"
     authors = listOf("Saher")
 
     /**

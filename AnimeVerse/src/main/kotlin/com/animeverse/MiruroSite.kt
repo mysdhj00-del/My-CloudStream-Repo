@@ -54,7 +54,7 @@ import java.net.URLEncoder
 object MiruroSite : AnimeSite {
     override val host = "miruro.tv"
     override val sections = listOf(
-        "miruro:trending" to "Trending"
+        "miruro:trending" to "الرائج"
     )
 
     private const val mainUrl = "https://miruro.tv"
@@ -188,7 +188,7 @@ object MiruroSite : AnimeSite {
         val epCount = Regex("""episodes:(\d+)""").find(html)?.groupValues?.get(1)?.toIntOrNull() ?: 1
         val episodes = (1..epCount).map { n ->
             api.newEpisode("$watchUrl?ep=$n") {
-                this.name = "Episode $n"
+                this.name = "الحلقة $n"
                 this.episode = n
             }
         }
@@ -230,6 +230,7 @@ object MiruroSite : AnimeSite {
                     providerCount++
                     val provider = block.groupValues[1]
                     val track = trackMarkers.lastOrNull { it.first < block.range.first }?.second ?: "sub"
+                    val trackLabel = if (track == "dub") "مدبلج" else "مترجم"
                     for (s in serverRegex.findAll(block.groupValues[2])) {
                         val streamUrl = s.groupValues[3]
                         if (!seenStreams.add(streamUrl)) continue
@@ -238,7 +239,7 @@ object MiruroSite : AnimeSite {
                         callback(
                             newExtractorLink(
                                 "Miruro",
-                                "$provider ${s.groupValues[1]} [$track]",
+                                "$provider ${s.groupValues[1]} [$trackLabel]",
                                 streamUrl,
                                 ExtractorLinkType.M3U8
                             ) {

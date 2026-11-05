@@ -278,6 +278,173 @@ object MiruroSite : AnimeSite {
         }
     }
 
+    // ---------- subtitle content: merge + translate, in-addon (v4) ----------
+
+    /**
+     * v4 (panel verdict 2026-11-05, 6/6 models: merging needs NO
+     * server — do it in Kotlin inside the addon; translation best
+     * on a server, but the phone's own IP may dodge the datacenter
+     * 302 that blocks gtx from servers, so v4 tries it fail-soft):
+     * - Merge: the site's EN VTT + the Arabic VTT (v3 search) are
+     *   downloaded, merged cue-by-cue by time overlap (Arabic line
+     *   + English line in one cue, timed by the English cue;
+     *   Arabic-only cues appended), and emitted as a data: URI
+     *   subtitle entry ("عربي + English"). If the player cannot
+     *   load data: URIs, that entry simply fails to load — every
+     *   other subtitle entry is untouched (fail-soft by design).
+     * - Translate: when no ready Arabic sub exists, the EN cues
+     *   are translated via the public gtx endpoint FROM THE PHONE
+     *   (residential IP, not a datacenter IP) in char-budgeted
+     *   batches, timestamps preserved; success emits both
+     *   "العربية (تلقائية)" and the merged entry.
+     * - Base64 is pure Kotlin (no android.util / java.util
+     *   dependency — same rule as Wecima2's decoder).
+     * If data: URIs prove unplayable on-device, the fallback is
+     * the panel's top server route: a NEW Deno Deploy project
+     * linked to GitHub (phone-browser steps) serving the already
+     * written deno-relay/subtitles.ts endpoints.
+     */
+    private class SubCue(
+        val startMs: Long,
+        val endMs: Long,
+        val start: String,
+        val end: String,
+        val text: String
+    )
+
+    private fun subTsToMs(t: String): Long {
+        val clean = t.trim().replace(',', '.')
+        val parts = clean.split(":")
+        val secParts = parts.last().split(".")
+        val secs = secParts[0].toLongOrNull() ?: 0L
+        val ms = (secParts.getOrNull(1) ?: "0").padEnd(3, '0').take(3).toLongOrNull() ?: 0L
+        var total = secs * 1000 + ms
+        if (parts.size == 3) total += parts[0].toLongOrNull()?.times(3600000) ?: 0L
+        if (parts.size >= 2) total += parts[parts.size - 2].toLongOrNull()?.times(60000) ?: 0L
+        return total
+    }
+
+    private fun subFmtMs(ms: Long): String {
+        val h = ms / 3600000
+        val m = (ms % 3600000) / 60000
+        val s = (ms % 60000) / 1000
+        val r = ms % 1000
+        return "%02d:%02d:%02d.%03d".format(h, m, s, r)
+    }
+
+    private fun parseSubCues(text: String): List<SubCue> {
+        val norm = text.replace("\r\n", "\n").replace('\r', '\n')
+        val tsRe = Regex("""(\d{1,2}:\d{2}(?::\d{2})?[.,]\d{3})\s*-->\s*(\d{1,2}:\d{2}(?::\d{2})?[.,]\d{3})""")
+        val out = ArrayList<SubCue>()
+        for (block in norm.split(Regex("""\n\s*\n"""))) {
+            val lines = block.lines().filter { it.isNotBlank() }
+            if (lines.isEmpty()) continue
+            if (lines[0].startsWith("WEBVTT", ignoreCase = true)) continue
+            if (lines[0].startsWith("NOTE") || lines[0].startsWith("STYLE") || lines[0].startsWith("REGION")) continue
+            val tsIdx = lines.indexOfFirst { tsRe.containsMatchIn(it) }
+            if (tsIdx < 0) continue
+            val m = tsRe.find(lines[tsIdx]) ?: continue
+            val body = lines.drop(tsIdx + 1).joinToString("\n").trim()
+            if (body.isEmpty()) continue
+            val sMs = subTsToMs(m.groupValues[1])
+            val eMs = subTsToMs(m.groupValues[2])
+            out.add(SubCue(sMs, eMs, subFmtMs(sMs), subFmtMs(eMs), body))
+        }
+        return out
+    }
+
+    private fun buildSubVTT(cues: List<SubCue>, texts: List<String>? = null): String {
+        val sb = StringBuilder("WEBVTT\n\n")
+        for ((i, c) in cues.withIndex()) {
+            sb.append(c.start).append(" --> ").append(c.end).append("\n")
+            sb.append(texts?.getOrNull(i) ?: c.text).append("\n\n")
+        }
+        return sb.toString()
+    }
+
+    private fun mergeSubVTT(engText: String, araText: String): String {
+        val eng = parseSubCues(engText)
+        val ara = parseSubCues(araText)
+        val used = HashSet<Int>()
+        val merged = ArrayList<SubCue>()
+        for (e in eng) {
+            val parts = ArrayList<String>()
+            for ((i, a) in ara.withIndex()) {
+                if (i in used) continue
+                if (a.startMs < e.endMs && a.endMs > e.startMs) {
+                    used.add(i)
+                    parts.add(a.text)
+                }
+            }
+            val text = if (parts.isEmpty()) e.text else parts.joinToString(" ") + "\n" + e.text
+            merged.add(SubCue(e.startMs, e.endMs, e.start, e.end, text))
+        }
+        for ((i, a) in ara.withIndex()) {
+            if (i !in used) merged.add(a)
+        }
+        merged.sortBy { it.startMs }
+        return buildSubVTT(merged)
+    }
+
+    private fun b64encode(bytes: ByteArray): String {
+        val alpha = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+        val sb = StringBuilder()
+        var i = 0
+        while (i < bytes.size) {
+            val b0 = bytes[i].toInt() and 0xFF
+            val b1 = if (i + 1 < bytes.size) bytes[i + 1].toInt() and 0xFF else 0
+            val b2 = if (i + 2 < bytes.size) bytes[i + 2].toInt() and 0xFF else 0
+            sb.append(alpha[b0 shr 2])
+            sb.append(alpha[((b0 and 0x03) shl 4) or (b1 shr 4)])
+            sb.append(if (i + 1 < bytes.size) alpha[((b1 and 0x0F) shl 2) or (b2 shr 6)] else '=')
+            sb.append(if (i + 2 < bytes.size) alpha[b2 and 0x3F] else '=')
+            i += 3
+        }
+        return sb.toString()
+    }
+
+    private fun dataVtt(vtt: String): String {
+        return "data:text/vtt;base64," + b64encode(vtt.toByteArray(Charsets.UTF_8))
+    }
+
+    /** Translates cue texts via public gtx, char-budgeted batches. Null on total failure. */
+    private suspend fun translateSubCues(cues: List<SubCue>): List<String>? {
+        val out = ArrayList<String>()
+        var batch = ArrayList<String>()
+        var batchChars = 0
+        suspend fun flush(): Boolean {
+            if (batch.isEmpty()) return true
+            return try {
+                val params = StringBuilder("client=gtx&sl=en&tl=ar&dt=t")
+                for (t in batch) params.append("&q=").append(URLEncoder.encode(t, "UTF-8"))
+                val text = app.get("https://translate.googleapis.com/translate_a/single?$params").text
+                val arr = org.json.JSONArray(text).optJSONArray(0) ?: return false
+                if (arr.length() != batch.size) return false
+                for (i in 0 until arr.length()) {
+                    val entry = arr.optJSONArray(i)
+                    val tr = entry?.optString(0)?.ifEmpty { null }
+                    out.add(tr ?: batch[i])
+                }
+                true
+            } catch (e: Exception) {
+                false
+            } finally {
+                batch = ArrayList()
+                batchChars = 0
+            }
+        }
+        for (c in cues) {
+            val t = c.text.replace("\n", " ")
+            if (batch.isNotEmpty() && (batchChars + t.length > 4000 || batch.size >= 50)) {
+                if (!flush()) return null
+            }
+            batch.add(t)
+            batchChars += t.length
+        }
+        if (!flush()) return null
+        return out
+    }
+
     // ---------- playback ----------
 
     /**
@@ -307,6 +474,7 @@ object MiruroSite : AnimeSite {
         var streamCount = 0
         var subCount = 0
         var pageLen = 0
+        var engUrl: String? = null
         try {
             val html = fetchHtml(data)
             pageLen = html.length
@@ -364,15 +532,40 @@ object MiruroSite : AnimeSite {
                     val file = sub.groupValues[3]
                     if (!seenSubs.add(file)) continue
                     subCount++
+                    if (engUrl == null && sub.groupValues[1].lowercase() in setOf("en", "eng")) engUrl = file
                     subtitleCallback(SubtitleFile(sub.groupValues[2], file))
                 }
             }
         } catch (e: Exception) {
             // Fall through to the DEBUG marker below.
         }
-        // v3: Arabic subtitle from OpenSubtitles (fail-soft).
+        // v3+v4: Arabic subtitle from OpenSubtitles, then in-addon
+        // merge / phone-IP translation (fail-soft, streams untouched).
+        var araUrl: String? = null
         try {
-            arabicSubFor(data)?.let { subtitleCallback(SubtitleFile("العربية", it)) }
+            araUrl = arabicSubFor(data)
+            araUrl?.let { subtitleCallback(SubtitleFile("العربية", it)) }
+        } catch (e: Exception) {
+        }
+        try {
+            if (engUrl != null && araUrl != null) {
+                val engText = fetchHtml(engUrl)
+                val araText = fetchHtml(araUrl)
+                if (engText.isNotEmpty() && araText.isNotEmpty()) {
+                    subtitleCallback(SubtitleFile("عربي + English", dataVtt(mergeSubVTT(engText, araText))))
+                }
+            } else if (engUrl != null) {
+                val engText = fetchHtml(engUrl)
+                if (engText.isNotEmpty()) {
+                    val cues = parseSubCues(engText)
+                    val tr = translateSubCues(cues)
+                    if (tr != null && cues.isNotEmpty()) {
+                        val arVtt = buildSubVTT(cues, tr)
+                        subtitleCallback(SubtitleFile("العربية (تلقائية)", dataVtt(arVtt)))
+                        subtitleCallback(SubtitleFile("عربي + English", dataVtt(mergeSubVTT(engText, arVtt))))
+                    }
+                }
+            }
         } catch (e: Exception) {
         }
         callback(

@@ -126,30 +126,6 @@ object MiruroSite : AnimeSite {
 
     private suspend fun fetchSub(url: String): String = fetchSubText(url).first
 
-    /**
-     * v10: English subtitle text for merging/translating. The site's
-     * own EN VTT is un-fetchable on the phone (eng:0cue on-device:
-     * both plain and CloudflareKiller fetches return nothing
-     * parseable from the CF-walled host), so fall back to the
-     * OpenSubtitles English track for the same title — public and
-     * fetchable. Returns (text, source, siteLen): source is
-     * "site" / "os" / "fail".
-     */
-    private suspend fun getEngText(engUrl: String?, data: String): Triple<String, String, Int> {
-        var siteLen = 0
-        if (engUrl != null) {
-            val (t, rawLen) = fetchSubText(engUrl)
-            siteLen = rawLen
-            if (t.isNotEmpty()) return Triple(t, "site", siteLen)
-        }
-        val osUrl = osSubFor(data, "eng")
-        if (osUrl != null) {
-            val t = fetchSub(osUrl)
-            if (t.isNotEmpty()) return Triple(t, "os", siteLen)
-        }
-        return Triple("", "fail", siteLen)
-    }
-
     // ---------- cards ----------
 
     private val articleRegex = Regex(
@@ -665,30 +641,39 @@ object MiruroSite : AnimeSite {
         } catch (e: Exception) {
         }
         try {
-            val (engText, engSrc, siteLen) = getEngText(engUrl, data)
-            val araText = araUrl?.let { fetchSub(it) } ?: ""
-            engDiag = when {
-                engText.isNotEmpty() -> "eng:${parseSubCues(engText).size}cue($engSrc)"
-                siteLen > 0 -> "eng:0cue/${siteLen}B"
-                else -> "eng:0cue"
-            }
-            araDiag = if (araUrl == null) "ara:-" else "ara:${parseSubCues(araText).size}cue"
-            if (engText.isNotEmpty() && araText.isNotEmpty()) {
-                val stored = storeSub(mergeSubVTT(engText, araText))
-                storeDiag = if (stored != null) "store:ok" else "store:fail"
-                stored?.let {
-                    subtitleCallback(SubtitleFile("عربي + English", it))
-                }
-            } else if (engText.isNotEmpty()) {
-                val cues = parseSubCues(engText)
-                val tr = translateSubCues(cues)
-                if (tr != null && cues.isNotEmpty()) {
-                    val arVtt = buildSubVTT(cues, tr)
-                    val storedAr = storeSub(arVtt)
-                    storedAr?.let { subtitleCallback(SubtitleFile("العربية (تلقائية)", it)) }
-                    val storedMerged = storeSub(mergeSubVTT(engText, arVtt))
-                    storedMerged?.let { subtitleCallback(SubtitleFile("عربي + English", it)) }
-                    storeDiag = if (storedAr != null || storedMerged != null) "store:ok" else "store:fail"
+            // v11 (panel verdict 2026-11-05, 6/6): merge on the SERVER.
+            // The phone never fetches subtitle files for the merge: it
+            // only resolves the two OpenSubtitles URLs (public, proven
+            // — the direct "العربية" entry already works) and emits the
+            // relay's GET merge URL, which returns the merged VTT
+            // directly. This removes the three phone-side failure
+            // points (site EN fetch, in-addon merge, store POST).
+            val engOsUrl = osSubFor(data, "eng")
+            engDiag = if (engOsUrl != null) "eng:os" else "eng:-"
+            araDiag = if (araUrl == null) "ara:-" else "ara:yes"
+            if (engOsUrl != null && araUrl != null) {
+                val mergeUrl = "$relayBase/relay/mergesubs?eng=" +
+                    URLEncoder.encode(engOsUrl, "UTF-8") +
+                    "&ara=" + URLEncoder.encode(araUrl, "UTF-8")
+                subtitleCallback(SubtitleFile("عربي + English", mergeUrl))
+                storeDiag = "merge:ok"
+            } else if (engOsUrl != null) {
+                // No ready Arabic: phone-IP auto-translate stays
+                // phone-side (the relay cannot reach gtx); the
+                // merged file is still hosted via the store.
+                val engText = fetchSub(engOsUrl)
+                engDiag = "eng:${parseSubCues(engText).size}cue(os)"
+                if (engText.isNotEmpty()) {
+                    val cues = parseSubCues(engText)
+                    val tr = translateSubCues(cues)
+                    if (tr != null && cues.isNotEmpty()) {
+                        val arVtt = buildSubVTT(cues, tr)
+                        val storedAr = storeSub(arVtt)
+                        storedAr?.let { subtitleCallback(SubtitleFile("العربية (تلقائية)", it)) }
+                        val storedMerged = storeSub(mergeSubVTT(engText, arVtt))
+                        storedMerged?.let { subtitleCallback(SubtitleFile("عربي + English", it)) }
+                        storeDiag = if (storedAr != null || storedMerged != null) "store:ok" else "store:fail"
+                    }
                 }
             }
         } catch (e: Exception) {
@@ -700,7 +685,7 @@ object MiruroSite : AnimeSite {
             callback(
                 newExtractorLink(
                     "Miruro",
-                    "DEBUG v10 $engDiag $araDiag $storeDiag",
+                    "DEBUG v11 $engDiag $araDiag $storeDiag",
                     "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8",
                     ExtractorLinkType.M3U8
                 ) {

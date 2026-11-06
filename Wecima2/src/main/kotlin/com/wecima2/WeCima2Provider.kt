@@ -395,7 +395,7 @@ class WeCima2Provider : MainAPI() {
         }
         if (items.isEmpty()) {
             val o = outcome
-            val debugTitle = "DEBUG v12 home ${request.name} cat=$catCount pages=$pagesFetched q=$q a=${o?.attempt ?: "-"} code=${o?.code ?: 0} len=${o?.bodyLen ?: 0} r=${o?.reason ?: "nocat"} fb=$feedCount"
+            val debugTitle = "DEBUG v13 home ${request.name} cat=$catCount pages=$pagesFetched q=$q a=${o?.attempt ?: "-"} code=${o?.code ?: 0} len=${o?.bodyLen ?: 0} r=${o?.reason ?: "nocat"} fb=$feedCount"
             items = listOf(newMovieSearchResponse(debugTitle, request.data, TvType.Movie) {})
         }
         if (items.isNotEmpty()) {
@@ -846,13 +846,20 @@ class WeCima2Provider : MainAPI() {
         // Bahar: only an "Update Server" placeholder btn),
         // say so in the source list instead of a bare Mux.
         val debugName = if (okCount == 0)
-            "DEBUG v12 | no-servers-on-site | page=$pageCode | btn=$btnCount | dec=$decodedCount | ok=0 | $subDiag"
+            "DEBUG v13 | no-servers-on-site | page=$pageCode | btn=$btnCount | dec=$decodedCount | ok=0 | $subDiag"
         else
-            "DEBUG v12 | play | page=$pageCode | btn=$btnCount | dec=$decodedCount | ok=$okCount | $subDiag"
+            "DEBUG v13 | play | page=$pageCode | btn=$btnCount | dec=$decodedCount | ok=$okCount | $subDiag"
+        // v13 (panel #4, 6/6 unanimous 2026-11-06): the two
+        // string args were SWAPPED — debugName sat in the
+        // source slot and "Mux" in the name slot, so the UI
+        // (which displays the name) showed only "Mux" and the
+        // diagnostic text was invisible in every screenshot.
+        // Sibling AnimeVerse passes (site, DEBUG-text, url)
+        // and its DEBUG line shows; Wecima2 now matches it.
         callback(
             newExtractorLink(
-                debugName,
                 "Mux",
+                debugName,
                 "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8",
                 ExtractorLinkType.M3U8
             ) {

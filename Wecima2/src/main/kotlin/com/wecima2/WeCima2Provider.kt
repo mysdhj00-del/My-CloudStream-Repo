@@ -395,7 +395,7 @@ class WeCima2Provider : MainAPI() {
         }
         if (items.isEmpty()) {
             val o = outcome
-            val debugTitle = "DEBUG v13 home ${request.name} cat=$catCount pages=$pagesFetched q=$q a=${o?.attempt ?: "-"} code=${o?.code ?: 0} len=${o?.bodyLen ?: 0} r=${o?.reason ?: "nocat"} fb=$feedCount"
+            val debugTitle = "DEBUG v14 home ${request.name} cat=$catCount pages=$pagesFetched q=$q a=${o?.attempt ?: "-"} code=${o?.code ?: 0} len=${o?.bodyLen ?: 0} r=${o?.reason ?: "nocat"} fb=$feedCount"
             items = listOf(newMovieSearchResponse(debugTitle, request.data, TvType.Movie) {})
         }
         if (items.isNotEmpty()) {
@@ -823,7 +823,14 @@ class WeCima2Provider : MainAPI() {
         var pageCode = 0
         var btnCount = 0
         var decodedCount = 0
-        var okCount = 0
+        // v14: ok now counts REAL links emitted (loadExtractor's
+        // boolean counts extractor runs, not links — it returns
+        // true even when the extractor emits nothing).
+        var emittedLinks = 0
+        val countingCallback: (ExtractorLink) -> Unit = { link ->
+            emittedLinks++
+            callback(link)
+        }
         try {
             val doc = app.get(realData, headers = headers, interceptor = cloudflareKiller).document
             pageCode = 200
@@ -833,7 +840,12 @@ class WeCima2Provider : MainAPI() {
                 val embed = decodeCxUrl(b.attr("data-url")) ?: continue
                 decodedCount++
                 try {
-                    if (loadExtractor(embed, realData, subtitleCallback, callback)) okCount++
+                    // v14: direct packed-JS extraction first —
+                    // 1vid/vidspeed/uqload hide a real .m3u8 in
+                    // packed JS and have no (working) stock
+                    // extractor; unpack it here and emit it.
+                    if (tryDirectExtract(embed, realData, countingCallback)) continue
+                    loadExtractor(embed, realData, subtitleCallback, countingCallback)
                 } catch (e: Exception) {
                     // One dead host must not kill the rest.
                 }
@@ -845,10 +857,11 @@ class WeCima2Provider : MainAPI() {
         // v11: when the site attached no real servers (e.g.
         // Bahar: only an "Update Server" placeholder btn),
         // say so in the source list instead of a bare Mux.
+        val okCount = emittedLinks
         val debugName = if (okCount == 0)
-            "DEBUG v13 | no-servers-on-site | page=$pageCode | btn=$btnCount | dec=$decodedCount | ok=0 | $subDiag"
+            "DEBUG v14 | no-servers-on-site | page=$pageCode | btn=$btnCount | dec=$decodedCount | ok=0 | $subDiag"
         else
-            "DEBUG v13 | play | page=$pageCode | btn=$btnCount | dec=$decodedCount | ok=$okCount | $subDiag"
+            "DEBUG v14 | play | page=$pageCode | btn=$btnCount | dec=$decodedCount | ok=$okCount | $subDiag"
         // v13 (panel #4, 6/6 unanimous 2026-11-06): the two
         // string args were SWAPPED — debugName sat in the
         // source slot and "Mux" in the name slot, so the UI
@@ -868,6 +881,44 @@ class WeCima2Provider : MainAPI() {
             }
         )
         return true
+    }
+
+    /**
+     * Direct packed-JS extraction (v14): fetch an embed page,
+     * unpack a P.A.C.K.E.R. block if present, and emit the video
+     * URL it hides. Returns true when a link was emitted (the
+     * caller then skips loadExtractor for this embed).
+     * Fail-soft: any miss returns false and the caller falls
+     * back to the stock extractor.
+     */
+    private suspend fun tryDirectExtract(
+        embed: String,
+        referer: String,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        return try {
+            val html = app.get(embed, headers = headers, interceptor = cloudflareKiller).text
+            if (!html.contains("eval(function(p,a,c,k,e")) return false
+            val unpacked = CxUnpack.unpackPackedJs(html) ?: return false
+            val videoUrl = CxUnpack.extractVideoUrl(unpacked) ?: return false
+            val host = embed.substringAfter("://").substringBefore("/")
+                .removePrefix("www.").substringBefore(".")
+            val type = if (videoUrl.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+            callback(
+                newExtractorLink(
+                    host,
+                    host,
+                    videoUrl,
+                    type
+                ) {
+                    this.referer = embed
+                    this.quality = Qualities.Unknown.value
+                }
+            )
+            true
+        } catch (e: Exception) {
+            false
+        }
     }
 
     // ---------- auto English subtitles (v12, HorrorMovies port) ----------

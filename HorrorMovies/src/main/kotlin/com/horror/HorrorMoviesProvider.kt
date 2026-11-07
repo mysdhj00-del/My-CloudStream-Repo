@@ -49,6 +49,63 @@ import org.jsoup.nodes.Document
  *   (movie-badged cards only); movie posts open the servers page
  *   /watch/{slug}/servers with [data-server-url] buttons (19 per
  *   title on the confirmed v2 chain: MixDrop-first + early stop).
+ * - TOPCINEMA (topcinema.film → topcinemaa.vip): /genre/رعب/ renders
+ *   a.recent--block cards. Watch page /watch/ lists li.server--item
+ *   (data-id, data-server) → POST Single/Server.php → iframe.
+ *   v8 FIX: the POST must go to the SAME host as the watch page
+ *   (topcinemaa.vip) — posting to topcinema.film returns an EMPTY
+ *   iframe src (verified live 2026-11-07). Only host served is
+ *   down.vidtube.one, unreachable from datacenter IPs (sandbox:
+ *   ChunkedEncodingError / 403) — lane is extractor-dependent,
+ *   unproven in the sandbox.
+ * - AFLAMSTREAM (aflamstream.com): /category/أفلام-رعب-… renders
+ *   div.ht_grid_1_4 cards; post id → /watch/?id={id} →
+ *   .server-btn[data-url] (luluvido + nuvorel direct m3u8s verified
+ *   live 2026-11-07, 3/3 films).
+ * - CIMA4Y (cima4y.net): HELD OUT of v8 (2026-11-07 12:06).
+ *   The horror source itself is real — /category/افلام-اجنبي?genre=رعب
+ *   serves 50 FILM cards/page (all /film/, 0 episodes), &page=N
+ *   paginates with zero overlap (p1-p3 verified, 150 unique films)
+ *   — but the watch-page playback chain is NOT cracked for a
+ *   static fetcher: Cima4y v1 AND v2 both failed on-device with
+ *   emb=0 (v2: page=200, len=55133, real page, NOT a CF block —
+ *   cf=1 was a false alarm from the CF jsd script). The embed URLs
+ *   genuinely are NOT in the static HTML; they resolve by JS/AJAX
+ *   after a server click. Shipping a lane that regex-extracts the
+ *   static watch page would repeat the exact failure twice proven
+ *   on the phone. The lane goes in ONLY when Cima4y v3's
+ *   exfiltration DEBUG (iframe srcs, servers-section snippet,
+ *   in-session /m/ fetch) proves a working mechanism. Do NOT add
+ *   it from sandbox fetches alone — the sandbox cannot even fetch
+ *   the watch page (connection reset, CF Turnstile).
+ * - MYCIMA (vid.mycima.cc): DEAD from non-browser clients —
+ *   HTTP 403 Cloudflare "Just a moment..." challenge on the
+ *   category AND the homepage (verified 2026-11-07). Lane kept
+ *   (a real phone may clear the challenge) but yields 0 cards
+ *   from the sandbox.
+ *
+ * PAGINATION (v8, verified live 2026-11-07): hasNext is the
+ * next-page link AND page < last page parsed from the pagination
+ * bar — the old link-only check lied on the last page (TopCinema
+ * p74 still linked /page/75/, which is an empty page). Per-lane
+ * totals: moviz 45p (30/p, 17 on p45), eg 6p (36/p, 12 on p6),
+ * lar 5p (20/p, 3 on p5), top 74p (54/p, 32 on p74), af 5p
+ * (20/p, 14 on p5), cima4y 50/p (hasNext = cards >= 50).
+ * MOVIES-ONLY (v8): moviz/eg/af lanes are now filtered with
+ * isMovieTitle — the moviz tag is mostly series episodes
+ * (p1: 11 films of 30; p2-p5: 0 films; p10+: films again), so
+ * unfiltered cards showed episode posts as "films".
+ *
+ * CENSUS (v8, live 2026-11-07, REAL direct links only):
+ * moviz 3/3 alive (vidspeed packed-unpack m3u8; +uqload once),
+ * eg 3/3 alive (1vid packed-unpack m3u8), af 3/3 alive
+ * (nuvorel direct m3u8 + luluvido packed-unpack m3u8),
+ * lar 0/3 direct-in-sandbox (13-19 embeds: mixdrop/doodstream/
+ * share4max — MixDrop URL lives in MDCore.wurl, only the
+ * CloudStream extractor resolves it; doodstream 403s from the
+ * sandbox), top 0/3 direct-in-sandbox (1 vidtube embed each,
+ * unreachable), myc 0 cards (403 CF), cima4y watch pages
+ * connection-reset from the sandbox (CF Turnstile).
  *
  * SPEED (his standing order): every loadLinks runs on a wall-clock
  * budget — extractors fastest-first, capped links, digs capped,
@@ -139,7 +196,10 @@ class HorrorMoviesProvider : MainAPI() {
             "moviz", "eg", "myc", "lar", "top", "af" -> parseLaneCards(lane, doc)
             else -> emptyList()
         }
-        val hasNext = when (lane) {
+        // v8: a next-page link alone lies on the last page (TopCinema
+        // p74 still links /page/75/, which is empty) — hasNext also
+        // requires page < last page parsed from the pagination bar.
+        val nextLink = when (lane) {
             "moviz", "eg", "top", "af" -> doc.select("a[href*=/page/${page + 1}/]").isNotEmpty()
             "myc" -> doc.select("a[href*=page=${page + 1}]").isNotEmpty()
             "lar" -> doc.select("a[href]").any {
@@ -147,6 +207,30 @@ class HorrorMoviesProvider : MainAPI() {
             }
             else -> false
         }
+        val lastPage: Int? = when (lane) {
+            "moviz", "eg", "top", "af" -> doc.select("a[href*=/page/]")
+                .mapNotNull { a ->
+                    // Numbered links only: the » next-arrow also
+                    // carries a /page/N+1/ href and would fake a
+                    // further last page (TopCinema p74 links » to
+                    // an empty p75 while the numbers stop at 74).
+                    if (a.text().trim().toIntOrNull() == null) {
+                        return@mapNotNull null
+                    }
+                    Regex("""/page/(\d+)/""").find(a.attr("href"))
+                        ?.groupValues?.get(1)?.toIntOrNull()
+                }.maxOrNull()
+            "myc", "lar" -> doc.select("a[href]")
+                .mapNotNull { a ->
+                    if (a.text().trim().toIntOrNull() == null) {
+                        return@mapNotNull null
+                    }
+                    Regex("""[?&]page=(\d+)""").find(a.attr("href"))
+                        ?.groupValues?.get(1)?.toIntOrNull()
+                }.maxOrNull()
+            else -> null
+        }
+        val hasNext = nextLink && (lastPage == null || page < lastPage)
         return newHomePageResponse(
             listOf(HomePageList(request.name, cards, isHorizontalImages = true)),
             hasNext
@@ -157,8 +241,12 @@ class HorrorMoviesProvider : MainAPI() {
         val out = mutableListOf<SearchResponse>()
         when (lane) {
             "moviz" -> for (el in doc.select(".archive-card")) {
+                // v8 movies-only: the tag mixes series episodes in
+                // (p1: 11 films of 30; p2-p5: 0 films).
+                val rawTitle = el.attr("data-title")
+                if (!isMovieTitle(rawTitle)) continue
                 movieCard(
-                    el.attr("data-title"),
+                    rawTitle,
                     el.attr("data-url"),
                     el.attr("data-image").ifBlank { null }
                 )?.let { out += it }
@@ -173,6 +261,8 @@ class HorrorMoviesProvider : MainAPI() {
                 val title = a.attr("title").ifBlank {
                     a.selectFirst("h3.title")?.text().orEmpty()
                 }
+                // v8 movies-only: genre pages mix series episodes in.
+                if (!isMovieTitle(title)) continue
                 movieCard(title, href, poster)?.let { out += it }
             }
             "myc" -> for (li in doc.select("ul#pm-grid li")) {
@@ -220,6 +310,8 @@ class HorrorMoviesProvider : MainAPI() {
                 val img = div.selectFirst("img")
                 val poster = img?.attr("src")?.ifBlank { null }
                 val title = div.selectFirst("h2.entry-title a")?.text().orEmpty()
+                // v8 movies-only (af is films-only today, guard anyway).
+                if (!isMovieTitle(title)) continue
                 movieCard(title, href, poster)?.let { out += it }
             }
         }
@@ -1102,6 +1194,7 @@ class HorrorMoviesProvider : MainAPI() {
      * data-server) → POST Single/Server.php (Referer = watch page,
      * XHR) → iframe embed → shared chain. The active server's
      * iframe is also on the watch page itself (server 0).
+     * v8: the POST goes to the watch page's own host (see above).
      */
     private suspend fun loadLinksTop(
         data: String,
@@ -1134,11 +1227,16 @@ class HorrorMoviesProvider : MainAPI() {
                 items += id to idx
             }
         }
+        // v8: POST to the SAME host as the watch page — posting to
+        // topcinema.film returns an empty iframe src, while the
+        // watch-page host (topcinemaa.vip) returns the real embed
+        // (verified live 2026-11-07).
+        val postBase = watchUrl.substringBefore("/watch/").trimEnd('/')
         if (postId != null) {
             for ((id, idx) in items) {
                 if (elapsed() > 12000) break
                 val html = httpPostForm(
-                    "https://topcinema.film/wp-content/themes/movies2023/Ajaxat/Single/Server.php",
+                    "$postBase/wp-content/themes/movies2023/Ajaxat/Single/Server.php",
                     mapOf("id" to id, "i" to idx),
                     watchUrl
                 ) ?: continue

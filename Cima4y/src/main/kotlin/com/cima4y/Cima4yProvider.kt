@@ -114,6 +114,34 @@ class Cima4yProvider : MainAPI() {
         return out
     }
 
+    /** v8 (panel #6): the v7 AJAX probes ALL threw
+     * IllegalArgumentException. Root-cause candidate: the
+     * Referer is the watch URL, whose slug carries Arabic
+     * characters — OkHttp rejects non-ASCII header values.
+     * Percent-encode every non-ASCII char so the header is
+     * pure ASCII. */
+    private fun asciiUrl(url: String): String {
+        val sb = StringBuilder()
+        for (ch in url) {
+            if (ch.code in 0x20..0x7E) sb.append(ch)
+            else {
+                for (b in ch.toString().toByteArray(Charsets.UTF_8)) {
+                    sb.append(String.format("%%%02X", b))
+                }
+            }
+        }
+        return sb.toString()
+    }
+
+    /** v8 (panel #6): session cookies saved by the
+     * CloudflareKiller when the watch page was fetched —
+     * the v7 probes sent NO cookies at all, and the panel
+     * (GPT-5.4 mini, Mistral, gpt-oss) all flagged that. */
+    private fun sessionCookieHeader(): String {
+        val cookies = cloudflareKiller.savedCookies["cima4y.net"] ?: return ""
+        return cookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
+    }
+
     // The site's FULL nav (16 categories, verified live from the
     // homepage 2026-11-07) + the home feed, every section titled
     // "<section> — Cima4y" with its full contents.
@@ -224,7 +252,7 @@ class Cima4yProvider : MainAPI() {
             val items = mergeShowCards(cards)
             if (items.isEmpty()) {
                 val debugTitle =
-                    "DEBUG v7 home ${request.name} page=$page len=${doc.html().length} cards=0"
+                    "DEBUG v8 home ${request.name} page=$page len=${doc.html().length} cards=0"
                 return newHomePageResponse(
                     request.name,
                     listOf(newMovieSearchResponse(debugTitle, request.data, TvType.Movie) {}),
@@ -234,7 +262,7 @@ class Cima4yProvider : MainAPI() {
             newHomePageResponse(request.name, items, hasNext = cards.size >= 50)
         } catch (e: Exception) {
             val debugTitle =
-                "DEBUG v7 home ${request.name} page=$page err=${e.javaClass.simpleName}"
+                "DEBUG v8 home ${request.name} page=$page err=${e.javaClass.simpleName}"
             newHomePageResponse(
                 request.name,
                 listOf(newMovieSearchResponse(debugTitle, request.data, TvType.Movie) {}),
@@ -423,6 +451,13 @@ class Cima4yProvider : MainAPI() {
         var b64Verdict = "NONE"
         var mNowCode = "-"
         var scriptVerdict = "-"
+        // v8 (panel #6): the token VALUE (gpt-oss probe), the
+        // /ajax/v2/player code, the /ajax/servers code, and the
+        // script-handler endpoint candidate (Luna).
+        var hpv3Token = ""
+        var v2pCode = "-"
+        var svrCode = "-"
+        var handlerVerdict = "-"
         val debugExtras = ArrayList<String>()
         val countingCallback: (ExtractorLink) -> Unit = { link ->
             emittedLinks++
@@ -456,7 +491,7 @@ class Cima4yProvider : MainAPI() {
             // v3 exfiltration 1: every iframe src on the watch page.
             val iframeSrcs = Regex("""<iframe[^>]+(?:src|data-src)=["']([^"']+)["']""")
                 .findAll(htmlRaw).map { it.groupValues[1] }.toList()
-            debugExtras.add("DEBUG v7 iframes=" + iframeSrcs.joinToString(",").take(180).ifEmpty { "-" })
+            debugExtras.add("DEBUG v8 iframes=" + iframeSrcs.joinToString(",").take(180).ifEmpty { "-" })
             // v6: the player iframe (not the CF 1x1) is the one
             // whose /m/ link matters — keep it for the title line.
             playerIfr = iframeSrcs.firstOrNull {
@@ -468,9 +503,9 @@ class Cima4yProvider : MainAPI() {
             if (srvIdx != null) {
                 val snip = htmlRaw.substring(maxOf(0, srvIdx - 60), minOf(htmlRaw.length, srvIdx + 140))
                     .replace(Regex("""\s+"""), " ").trim()
-                debugExtras.add("DEBUG v7 srv=" + snip.take(200))
+                debugExtras.add("DEBUG v8 srv=" + snip.take(200))
             } else {
-                debugExtras.add("DEBUG v7 srv=NONE")
+                debugExtras.add("DEBUG v8 srv=NONE")
             }
             // v5 (panel #5): the panel's top diagnostics — which
             // script keywords are in the page, every <script src>,
@@ -481,21 +516,30 @@ class Cima4yProvider : MainAPI() {
                 "embed_url", "atob", "decode", "fromCharCode", "__hpv3"
             ).filter { htmlRaw.contains(it, ignoreCase = true) }
             kwHitsStr = kwHits.joinToString(",").take(40).ifEmpty { "-" }
-            debugExtras.add("DEBUG v7 kw=" + kwHits.joinToString(",").take(180).ifEmpty { "-" })
+            debugExtras.add("DEBUG v8 kw=" + kwHits.joinToString(",").take(180).ifEmpty { "-" })
             val scriptSrcs = Regex("""<script[^>]+src=["']([^"']+)["']""")
                 .findAll(htmlRaw).map { it.groupValues[1] }.toList()
             scriptCount = scriptSrcs.size
-            debugExtras.add("DEBUG v7 scripts=" + scriptSrcs.joinToString(",").take(180).ifEmpty { "-" })
+            debugExtras.add("DEBUG v8 scripts=" + scriptSrcs.joinToString(",").take(180).ifEmpty { "-" })
             val hiddenInputs = Regex("""<input[^>]+type=["']hidden["'][^>]*>""", RegexOption.IGNORE_CASE)
                 .findAll(htmlRaw).map { it.value.take(120) }.toList()
-            debugExtras.add("DEBUG v7 hidden=" + hiddenInputs.joinToString(" | ").take(200).ifEmpty { "-" })
+            debugExtras.add("DEBUG v8 hidden=" + hiddenInputs.joinToString(" | ").take(200).ifEmpty { "-" })
             val hpv3Idx = htmlRaw.indexOf("__hpv3")
             hpv3Present = if (hpv3Idx >= 0) 1 else 0
             if (hpv3Idx >= 0) {
-                debugExtras.add("DEBUG v7 hpv3=" + htmlRaw.substring(hpv3Idx, minOf(htmlRaw.length, hpv3Idx + 220))
+                debugExtras.add("DEBUG v8 hpv3=" + htmlRaw.substring(hpv3Idx, minOf(htmlRaw.length, hpv3Idx + 220))
                     .replace(Regex("""\s+"""), " ").take(220))
+                // v8 (panel #6, gpt-oss): the token VALUE itself —
+                // v7 only recorded presence. The /ajax/v2/player
+                // probe sends it in the body AND as x-hpv-token.
+                val seg = htmlRaw.substring(hpv3Idx, minOf(htmlRaw.length, hpv3Idx + 400))
+                hpv3Token = Regex("""__hpv3["']?\s*[:=]\s*["']([^"'\s,;}]+)["']""").find(seg)?.groupValues?.get(1).orEmpty()
+                if (hpv3Token.isEmpty()) {
+                    hpv3Token = Regex("""["']__hpv3["']\s*:\s*["']([^"']+)["']""").find(seg)?.groupValues?.get(1).orEmpty()
+                }
+                debugExtras.add("DEBUG v8 hpv3tok=" + hpv3Token.take(24).ifEmpty { "-" })
             } else {
-                debugExtras.add("DEBUG v7 hpv3=NONE")
+                debugExtras.add("DEBUG v8 hpv3=NONE")
             }
             // v7: the endpoint path is NOT in the HTML (kw has
             // fetch( + XMLHttpRequest + __hpv3 but no /ajax/ or
@@ -512,6 +556,7 @@ class Cima4yProvider : MainAPI() {
                 "luluvido", "m1xdrop", "byse"
             )
             val scriptHits = ArrayList<String>()
+            val handlerCandidates = ArrayList<String>()
             for ((si, src) in scriptSrcs.withIndex()) {
                 try {
                     val sUrl = when {
@@ -521,12 +566,24 @@ class Cima4yProvider : MainAPI() {
                         else -> "$mainUrl/$src"
                     }
                     val sText = app.get(
-                        sUrl, headers = headers, referer = realData,
+                        sUrl, headers = headers, referer = asciiUrl(realData),
                         interceptor = cloudflareKiller
                     ).text
                     val hits = scriptKw.filter { sText.contains(it, ignoreCase = true) } +
                         scriptHosts.filter { sText.contains(it, ignoreCase = true) }
                     scriptHits.add("s${si + 1}:${hits.joinToString(",").take(60).ifEmpty { "-" }}")
+                    // v8 (panel #6, Luna): stop guessing endpoints —
+                    // pull the actual resolver path OUT of the
+                    // script: any quoted /ajax/... or /player/...
+                    // or url:"..." near a fetch/XHR call.
+                    Regex("""["'](/[a-zA-Z0-9/_-]{3,})["']""").findAll(sText)
+                        .map { it.groupValues[1] }
+                        .filter {
+                            it.contains("ajax") || it.contains("player") ||
+                                it.contains("server") || it.contains("embed") ||
+                                it.contains("video") || it.contains("get")
+                        }
+                        .distinct().take(4).forEach { handlerCandidates.add(it) }
                     for (re in embedRegexes) re.findAll(sText.replace("\\/", "/")).forEach { embeds.add(it.value) }
                     for (m in Regex("""[A-Za-z0-9+/=]{40,}""").findAll(sText)) {
                         val s = m.value
@@ -545,7 +602,9 @@ class Cima4yProvider : MainAPI() {
                 }
             }
             scriptVerdict = scriptHits.joinToString(";").take(120).ifEmpty { "-" }
-            debugExtras.add("DEBUG v7 scripts-grep=" + scriptVerdict)
+            handlerVerdict = handlerCandidates.distinct().joinToString(",").take(80).ifEmpty { "-" }
+            debugExtras.add("DEBUG v8 scripts-grep=" + scriptVerdict)
+            debugExtras.add("DEBUG v8 handler=" + handlerVerdict)
             for (re in embedRegexes) re.findAll(html).forEach { embeds.add(it.value) }
             genericEmbedRegex.findAll(html).forEach {
                 val u = it.value
@@ -608,12 +667,12 @@ class Cima4yProvider : MainAPI() {
                 .filter { htmlRaw.contains(it, ignoreCase = true) }
             if (b64Hit.isNotEmpty()) {
                 b64Verdict = "HIT"
-                debugExtras.add("DEBUG v7 b64=" + b64Hit.replace(Regex("""\s+"""), " ").take(200))
+                debugExtras.add("DEBUG v8 b64=" + b64Hit.replace(Regex("""\s+"""), " ").take(200))
                 for (re in embedRegexes) re.findAll(b64Hit).forEach { embeds.add(it.value) }
             } else if (revHit.isNotEmpty()) {
-                debugExtras.add("DEBUG v7 rev=" + revHit.joinToString(","))
+                debugExtras.add("DEBUG v8 rev=" + revHit.joinToString(","))
             } else {
-                debugExtras.add("DEBUG v7 b64=NONE")
+                debugExtras.add("DEBUG v8 b64=NONE")
             }
             // v6 (panel #5, H3): fetch the PLAYER iframe's /m/
             // link first — v5 fetched the first /m/ in document
@@ -628,34 +687,44 @@ class Cima4yProvider : MainAPI() {
                 ?: Regex("""https://cima4y\.net/m/[A-Za-z0-9]+""").find(htmlRaw)?.value
             if (firstM != null) {
                 try {
+                    // v8: ASCII referer (the IllegalArg fix) +
+                    // session cookies — v7 sent neither, and the
+                    // panel flagged both.
+                    val mHeaders = headers + mapOf(
+                        "Sec-Fetch-Dest" to "iframe",
+                        "Sec-Fetch-Mode" to "navigate",
+                        "Sec-Fetch-Site" to "same-origin"
+                    ) + (sessionCookieHeader().takeIf { it.isNotEmpty() }?.let { mapOf("Cookie" to it) } ?: emptyMap())
                     // v7: try WITHOUT the killer first — if the
                     // killer's WebView is what throws on /m/,
                     // the plain fetch returns the real code.
                     val mResp = try {
                         app.get(
                             firstM,
-                            headers = headers + mapOf(
-                                "Sec-Fetch-Dest" to "iframe",
-                                "Sec-Fetch-Mode" to "navigate",
-                                "Sec-Fetch-Site" to "same-origin"
-                            ),
-                            referer = realData
+                            headers = mHeaders,
+                            referer = asciiUrl(realData)
                         )
                     } catch (e: Exception) {
                         app.get(
                             firstM,
-                            headers = headers + mapOf(
-                                "Sec-Fetch-Dest" to "iframe",
-                                "Sec-Fetch-Mode" to "navigate",
-                                "Sec-Fetch-Site" to "same-origin"
-                            ),
-                            referer = realData,
+                            headers = mHeaders,
+                            referer = asciiUrl(realData),
                             interceptor = cloudflareKiller
                         )
                     }
-                    mNowCode = mResp.code.toString()
                     val mBody = mResp.text.replace("\\/", "/")
-                    debugExtras.add("DEBUG v7 m-now code=${mResp.code} len=${mBody.length} head=" +
+                    // v8 (panel #6, Gemma): WHAT is the /m/
+                    // response — a redirect script, an encrypted
+                    // block, or opaque HTML?
+                    val mVerdict = when {
+                        mBody.contains("location.href", ignoreCase = true) -> "JS-REDIRECT"
+                        Regex("""[0-9a-fA-F]{64,}""").containsMatchIn(mBody) -> "HEX-BLOCK"
+                        Regex("""[A-Za-z0-9+/=]{200,}""").containsMatchIn(mBody) -> "B64-BLOCK"
+                        mBody.length < 500 -> "SHORT-${mBody.length}"
+                        else -> "OPAQUE-HTML"
+                    }
+                    mNowCode = "${mResp.code}:$mVerdict"
+                    debugExtras.add("DEBUG v8 m-now code=${mResp.code} verdict=$mVerdict len=${mBody.length} head=" +
                         mBody.take(80).replace(Regex("""\s+"""), " "))
                     for (re in embedRegexes) re.findAll(mBody).forEach { embeds.add(it.value) }
                     genericEmbedRegex.findAll(mBody).forEach {
@@ -667,29 +736,36 @@ class Cima4yProvider : MainAPI() {
                     // ERR hid whether /m/ 404s, hangs, or the
                     // killer's WebView throws.
                     mNowCode = e.javaClass.simpleName.take(10)
-                    debugExtras.add("DEBUG v7 m-now ERR ${e.javaClass.simpleName}")
+                    debugExtras.add("DEBUG v8 m-now ERR ${e.javaClass.simpleName}")
                 }
             } else {
-                debugExtras.add("DEBUG v7 m-now NONE")
+                debugExtras.add("DEBUG v8 m-now NONE")
             }
-            // v5 (panel #5, H1): probe candidate AJAX resolver
-            // endpoints — POST {"id": slug, "server": "earnvids"}
-            // as JSON with X-Requested-With. A HIT (response
-            // containing an embed host) is fed straight into the
-            // embed set, so playback itself proves the endpoint.
+            // v8 (panel #6): the v5 probes are re-run with the
+            // two fixes the panel flagged — ASCII Referer (the
+            // IllegalArg root cause: Arabic slug) and the session
+            // Cookie header (v7 sent none). Plus the panel's two
+            // new endpoints: Mistral's /ajax/servers (+ /api/servers)
+            // as JSON, and gpt-oss's /ajax/v2/player as a
+            // form-urlencoded POST carrying the __hpv3 token in the
+            // body AND as x-hpv-token, with a millisecond ts.
+            // A HIT (response containing an embed host) is fed
+            // straight into the embed set, so playback itself
+            // proves the endpoint.
             val slug = realData.substringAfter("/watch/", "")
             val ajaxJson = """{"id":"$slug","server":"earnvids"}"""
             val ajaxResults = ArrayList<String>()
             val ajaxCodes = ArrayList<String>()
-            for (ep in listOf("/ajax/player", "/ajax/get-embed", "/ajax/server", "/api/embed")) {
+            val probeHeaders = headers + mapOf(
+                "X-Requested-With" to "XMLHttpRequest",
+                "Accept" to "application/json, text/javascript, */*; q=0.01"
+            ) + (sessionCookieHeader().takeIf { it.isNotEmpty() }?.let { mapOf("Cookie" to it) } ?: emptyMap())
+            for (ep in listOf("/ajax/player", "/ajax/get-embed", "/ajax/server", "/api/embed", "/ajax/servers", "/api/servers")) {
                 try {
                     val r = app.post(
                         mainUrl + ep,
-                        headers = headers + mapOf(
-                            "X-Requested-With" to "XMLHttpRequest",
-                            "Accept" to "application/json, text/javascript, */*; q=0.01"
-                        ),
-                        referer = realData,
+                        headers = probeHeaders,
+                        referer = asciiUrl(realData),
                         requestBody = ajaxJson.toRequestBody("application/json".toMediaType())
                     )
                     val rText = r.text
@@ -705,6 +781,48 @@ class Cima4yProvider : MainAPI() {
                     ajaxResults.add("$ep=ERR-${e.javaClass.simpleName.take(10)}")
                 }
             }
+            // v8 (panel #6, gpt-oss): POST /ajax/v2/player as a
+            // form-urlencoded body — id + server + token (__hpv3
+            // value from THIS page) + ts (ms timestamp) — with
+            // the token ALSO as the x-hpv-token header. gpt-oss
+            // says a missing piece is exactly what throws the
+            // IllegalArgumentException the v7 probes hit.
+            if (hpv3Token.isNotEmpty()) {
+                try {
+                    val formBody = "id=" + java.net.URLEncoder.encode(slug, "UTF-8") +
+                        "&server=earnvids&token=" + java.net.URLEncoder.encode(hpv3Token, "UTF-8") +
+                        "&ts=" + System.currentTimeMillis()
+                    val r = app.post(
+                        mainUrl + "/ajax/v2/player",
+                        headers = probeHeaders + mapOf(
+                            "Content-Type" to "application/x-www-form-urlencoded; charset=UTF-8",
+                            "x-hpv-token" to hpv3Token
+                        ),
+                        referer = asciiUrl(realData),
+                        requestBody = formBody.toRequestBody("application/x-www-form-urlencoded; charset=UTF-8".toMediaType())
+                    )
+                    val rText = r.text
+                    val hit = hostWords.any { rText.contains(it, ignoreCase = true) } ||
+                        rText.contains("embed", ignoreCase = true)
+                    v2pCode = if (hit) "HIT" else r.code.toString()
+                    ajaxResults.add("/ajax/v2/player code=${r.code} ${if (hit) "HIT" else "no"} len=${rText.length}")
+                    if (hit) {
+                        for (re in embedRegexes) re.findAll(rText.replace("\\/", "/")).forEach { embeds.add(it.value) }
+                        val embField = Regex(""""embed"\s*:\s*"([^"]+)"""").find(rText)?.groupValues?.get(1)
+                        if (embField != null && embedRegexes.any { it.containsMatchIn(embField) }) embeds.add(embField)
+                    }
+                } catch (e: Exception) {
+                    v2pCode = e.javaClass.simpleName.take(10)
+                    ajaxResults.add("/ajax/v2/player=ERR-${e.javaClass.simpleName.take(10)}")
+                }
+            } else {
+                v2pCode = "NO-TOK"
+                ajaxResults.add("/ajax/v2/player=NO-TOK")
+            }
+            // v8: the /ajax/servers verdict on its own (Mistral's
+            // headline probe) — its code sits in ajaxCodes at
+            // index 4; surface it as svr= in the title.
+            svrCode = ajaxCodes.getOrNull(4) ?: "-"
             // v6 (panel #5, Try 5): __hpv3 token exchange — parse
             // ts/n/p from the token block on THIS page and POST
             // it to /__hpv3/video. SKIP when no token is present.
@@ -720,11 +838,8 @@ class Cima4yProvider : MainAPI() {
                     val hJson = """{"v":3,"p":"$pVal","k":"video","ts":$tsVal,"n":"$nVal"}"""
                     val r = app.post(
                         mainUrl + "/__hpv3/video",
-                        headers = headers + mapOf(
-                            "X-Requested-With" to "XMLHttpRequest",
-                            "Accept" to "application/json, text/javascript, */*; q=0.01"
-                        ),
-                        referer = realData,
+                        headers = probeHeaders,
+                        referer = asciiUrl(realData),
                         requestBody = hJson.toRequestBody("application/json".toMediaType())
                     )
                     val rText = r.text
@@ -743,7 +858,7 @@ class Cima4yProvider : MainAPI() {
                 ajaxResults.add("__hpv3/video=SKIP")
             }
             ajaxCodesStr = ajaxCodes.joinToString(",")
-            debugExtras.add("DEBUG v7 ajax=" + ajaxResults.joinToString(" | ").take(200))
+            debugExtras.add("DEBUG v8 ajax=" + ajaxResults.joinToString(" | ").take(200))
             embCount = embeds.size
             for (embed in embeds) {
                 try {
@@ -765,11 +880,15 @@ class Cima4yProvider : MainAPI() {
         // (in probe order), Base64, /m/ code, script keywords,
         // script count, __hpv3 presence, player iframe src.
         // v7: adds the scripts-grep verdict (sc=).
-        val verdict = "aj=$ajaxCodesStr b64=$b64Verdict m=$mNowCode kw=$kwHitsStr js=$scriptCount h3=$hpv3Present ifr=$playerIfr sc=$scriptVerdict"
+        // v8: adds v2p= (/ajax/v2/player, gpt-oss), svr=
+        // (/ajax/servers, Mistral), tok= (__hpv3 value, first
+        // 12 chars), handler= (endpoint found in the scripts,
+        // Luna), and the /m/ verdict inside m= (Gemma).
+        val verdict = "aj=$ajaxCodesStr v2p=$v2pCode svr=$svrCode b64=$b64Verdict m=$mNowCode kw=$kwHitsStr js=$scriptCount h3=$hpv3Present tok=${hpv3Token.take(12).ifEmpty { "-" }} ifr=$playerIfr sc=$scriptVerdict handler=$handlerVerdict"
         val debugName = if (emittedLinks == 0)
-            "DEBUG v7 | no-servers-on-site | page=$pageCode | emb=$embCount | ok=0 | $subDiag | $diag | $verdict $fetchErr"
+            "DEBUG v8 | no-servers-on-site | page=$pageCode | emb=$embCount | ok=0 | $subDiag | $diag | $verdict $fetchErr"
         else
-            "DEBUG v7 | play | page=$pageCode | emb=$embCount | ok=$emittedLinks | $subDiag | $diag | $verdict $fetchErr"
+            "DEBUG v8 | play | page=$pageCode | emb=$embCount | ok=$emittedLinks | $subDiag | $diag | $verdict $fetchErr"
         callback(
             newExtractorLink(
                 "Mux",

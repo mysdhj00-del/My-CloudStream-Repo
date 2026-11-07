@@ -64,6 +64,15 @@ import org.jsoup.nodes.Document
  *   OkStream + LuluStream (both yield direct tokenized m3u8s).
  *   VidTube has NO stock extractor and is CF-403 from the sandbox;
  *   UpDown + Filelions unproven — not needed, 7 paths is plenty.
+ *   v10 (on-device v9: "Horror v9·Top | srv=7 | ext=0 | dig=0 |
+ *   relay=0 | t=12s"): the v9 sequential POST loop ate the whole
+ *   wall-clock budget on a slow phone — only 6 of 10 POSTs finished
+ *   and the extractor loop never got a second, because runChain's
+ *   caps shared loadLinks' t0. v10 POSTs in resolver-priority
+ *   order (StreamWish, Doodstream, Streamtape, Byse, Firestream,
+ *   OkStream, LuluStream, then the rest), stops at 6 embeds or
+ *   8 s, each POST capped at 6 s; runChain now measures its caps
+ *   from its own clock. DEBUG gains post=/pt=/hosts=.
  * - AFLAMSTREAM (aflamstream.com): /category/أفلام-رعب-… renders
  *   div.ht_grid_1_4 cards; post id → /watch/?id={id} →
  *   .server-btn[data-url] (luluvido + nuvorel direct m3u8s verified
@@ -818,8 +827,17 @@ class HorrorMoviesProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit,
         elapsed: () -> Long,
         lane: String,
-        allowDebug: Boolean = true
+        allowDebug: Boolean = true,
+        diagExtra: List<String> = emptyList()
     ): Boolean {
+        // v10: the resolver caps are measured from THIS chain's own
+        // clock, not from loadLinks entry. Before v10 the caps shared
+        // loadLinks' t0, so a slow earlier stage (TopCinema's 10
+        // sequential Server.php POSTs, LaRos's MixDrop loop, the
+        // subtitle fetch) could eat the whole budget before a single
+        // extractor ran — on-device v9: srv=7 ext=0 dig=0, t=12s.
+        val tChain = System.currentTimeMillis()
+        val chainMs = { System.currentTimeMillis() - tChain }
         var emitted = 0
         val counting: (ExtractorLink) -> Unit = { link ->
             emitted++
@@ -831,7 +849,7 @@ class HorrorMoviesProvider : MainAPI() {
             priorityHosts.any { e.contains(it) }
         }
         for (embed in ordered) {
-            if (emitted >= 5 || elapsed() > 11000) break
+            if (emitted >= 5 || chainMs() > 11000) break
             val before = emitted
             runCatching { loadExtractor(embed, referer, subtitleCallback, counting) }
             if (emitted > before) extOk++ else unresolved += embed
@@ -839,21 +857,22 @@ class HorrorMoviesProvider : MainAPI() {
         var digOk = 0
         if (emitted < 3) {
             for (embed in unresolved) {
-                if (elapsed() > 16000 || digOk >= 3) break
+                if (chainMs() > 16000 || digOk >= 3) break
                 if (scanEmbed(embed, referer, counting)) digOk++
             }
         }
         var relayOk = 0
         if (emitted == 0) {
             for (embed in unresolved.take(3)) {
-                if (elapsed() > 22000) break
+                if (chainMs() > 22000) break
                 relayOk += resolveViaRelay(embed, referer, counting)
             }
         }
         if (emitted == 0 && allowDebug) {
             emitDebug(
-                listOf("Horror v9·$lane", "srv=${embeds.size}", "ext=$extOk",
-                    "dig=$digOk", "relay=$relayOk", "t=${elapsed() / 1000}s"),
+                listOf("Horror v10·$lane") + diagExtra +
+                    listOf("srv=${embeds.size}", "ext=$extOk",
+                        "dig=$digOk", "relay=$relayOk", "t=${elapsed() / 1000}s"),
                 callback
             )
         }
@@ -1178,7 +1197,8 @@ class HorrorMoviesProvider : MainAPI() {
     private fun httpPostForm(
         url: String,
         fields: Map<String, String>,
-        referer: String
+        referer: String,
+        timeoutMs: Int = 15000
     ): String? {
         return runCatching {
             val body = fields.entries.joinToString("&") { (k, v) ->
@@ -1189,8 +1209,8 @@ class HorrorMoviesProvider : MainAPI() {
                 as java.net.HttpURLConnection
             conn.requestMethod = "POST"
             conn.doOutput = true
-            conn.connectTimeout = 15000
-            conn.readTimeout = 15000
+            conn.connectTimeout = timeoutMs
+            conn.readTimeout = timeoutMs
             conn.setRequestProperty("User-Agent", browserUA)
             conn.setRequestProperty("Referer", asciiSafe(referer))
             conn.setRequestProperty("X-Requested-With", "XMLHttpRequest")
@@ -1236,14 +1256,14 @@ class HorrorMoviesProvider : MainAPI() {
             }
         }
         var postId: String? = null
-        val items = ArrayList<Pair<String, String>>()
+        val items = ArrayList<Triple<String, String, String>>()
         for (li in doc.select("li.server--item")) {
             val id = li.attr("data-id")
             val idx = li.attr("data-server")
-            if (id.isNotBlank() && idx.isNotBlank()) {
-                postId = id
-                items += id to idx
-            }
+            if (id.isBlank() || idx.isBlank()) continue
+            postId = id
+            val nm = li.selectFirst("span")?.text()?.trim().orEmpty()
+            items += Triple(id, idx, nm)
         }
         // v9 FIX: POST to the watch page's ORIGIN (scheme + host).
         // v8 built postBase as watchUrl minus "/watch/" — that is the
@@ -1265,13 +1285,40 @@ class HorrorMoviesProvider : MainAPI() {
         val postBase = Regex("""^(https?://[^/]+)""").find(finalWatchUrl)
             ?.groupValues?.get(1)
             ?: "https://topcinemaa.vip"
+        // v10: POST in resolver-priority order and stop early. v9's
+        // sequential POST loop ate the whole wall-clock budget on a
+        // slow phone (on-device v9: srv=7 ext=0 dig=0, t=12s — only
+        // 6 of 10 POSTs finished and the extractor loop never got a
+        // second). Extractor-backed servers first, then packed-JS
+        // digs, then the rest; stop once 6 embeds are in hand or the
+        // POST stage hits 8 s, each POST capped at 6 s.
+        fun postRank(name: String): Int {
+            val n = name.lowercase()
+            return when {
+                n.contains("streamwish") -> 0
+                n.contains("doodstream") -> 1
+                n.contains("streamtape") -> 2
+                n.contains("byse") -> 3
+                n.contains("firestream") -> 4
+                n.contains("okstream") -> 5
+                n.contains("lulustream") -> 6
+                else -> 7
+            }
+        }
+        val ordered = items.sortedBy { postRank(it.third) }
+        val tPost = System.currentTimeMillis()
+        var postTried = 0
+        var postOk = 0
         if (postId != null) {
-            for ((id, idx) in items) {
-                if (elapsed() > 12000) break
+            for ((id, idx, _) in ordered) {
+                if (embeds.size >= 6) break
+                if (System.currentTimeMillis() - tPost > 8000) break
+                postTried++
                 val html = httpPostForm(
                     "$postBase/wp-content/themes/movies2023/Ajaxat/Single/Server.php",
                     mapOf("id" to id, "i" to idx),
-                    watchUrl
+                    watchUrl,
+                    timeoutMs = 6000
                 ) ?: continue
                 val iframe = Regex("""<iframe[^>]*src="([^"]+)"""")
                     .find(html)?.groupValues?.get(1)
@@ -1279,10 +1326,19 @@ class HorrorMoviesProvider : MainAPI() {
                     !iframe.contains("topcinema")
                 ) {
                     embeds += iframe
+                    postOk++
                 }
             }
         }
-        return runChain(embeds.toList(), watchUrl, subtitleCallback, callback, elapsed, "Top")
+        val postMs = System.currentTimeMillis() - tPost
+        val hosts = embeds.map { hostOf(it) }.joinToString(",").take(80)
+        return runChain(
+            embeds.toList(), watchUrl, subtitleCallback, callback, elapsed, "Top",
+            diagExtra = listOf(
+                "post=$postOk/$postTried", "pt=${postMs / 1000}s",
+                "hosts=$hosts"
+            )
+        )
     }
 
     /**

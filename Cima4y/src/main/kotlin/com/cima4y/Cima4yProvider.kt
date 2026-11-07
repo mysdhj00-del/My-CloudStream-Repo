@@ -221,7 +221,7 @@ class Cima4yProvider : MainAPI() {
             val items = mergeShowCards(cards)
             if (items.isEmpty()) {
                 val debugTitle =
-                    "DEBUG v2 home ${request.name} page=$page len=${doc.html().length} cards=0"
+                    "DEBUG v3 home ${request.name} page=$page len=${doc.html().length} cards=0"
                 return newHomePageResponse(
                     request.name,
                     listOf(newMovieSearchResponse(debugTitle, request.data, TvType.Movie) {}),
@@ -231,7 +231,7 @@ class Cima4yProvider : MainAPI() {
             newHomePageResponse(request.name, items, hasNext = cards.size >= 50)
         } catch (e: Exception) {
             val debugTitle =
-                "DEBUG v2 home ${request.name} page=$page err=${e.javaClass.simpleName}"
+                "DEBUG v3 home ${request.name} page=$page err=${e.javaClass.simpleName}"
             newHomePageResponse(
                 request.name,
                 listOf(newMovieSearchResponse(debugTitle, request.data, TvType.Movie) {}),
@@ -389,7 +389,18 @@ class Cima4yProvider : MainAPI() {
         // protocol-relative, or they live behind the player
         // iframe (/m/ redirector) and JS. The diagnostics below
         // make the next screenshot decisive.
+        // v3: the v2 verdict (len=55133 cf=1 ifr=2 hosts=uqload
+        // m=21) proves the phone gets a REAL 55KB page, not the
+        // 1.8KB CF challenge page — but the loose cf flag fires
+        // on real pages too (they embed the CF jsd script), and
+        // the embed URLs are still nowhere in the static HTML.
+        // So v3 exfiltrates the page structure itself through
+        // extra DEBUG sources (iframe srcs, a snippet around the
+        // servers section, and the in-session result of fetching
+        // the first /m/ link) — the next screenshot of the
+        // source list names the exact mechanism.
         var diag = ""
+        val debugExtras = ArrayList<String>()
         val countingCallback: (ExtractorLink) -> Unit = { link ->
             emittedLinks++
             callback(link)
@@ -398,9 +409,11 @@ class Cima4yProvider : MainAPI() {
             val htmlRaw = app.get(realData, headers = headers, interceptor = cloudflareKiller).text
             pageCode = 200
             val html = htmlRaw.replace("\\/", "/")
-            val isCf = htmlRaw.contains("Just a moment") ||
-                htmlRaw.contains("Turnstile") ||
-                htmlRaw.contains("challenge-platform")
+            // v3: strict CF check — the real watch page embeds the
+            // CF jsd script too, so "challenge-platform" alone is
+            // NOT proof of a challenge page.
+            val isCf = htmlRaw.contains("<title>Just a moment...</title>") ||
+                htmlRaw.contains("Attention Required")
             val ifrCount = Regex("<iframe", RegexOption.IGNORE_CASE).findAll(htmlRaw).count()
             val hostsFound = listOf(
                 "fastvid", "vinovo", "uqload", "byse", "voe", "ok.ru",
@@ -409,6 +422,37 @@ class Cima4yProvider : MainAPI() {
             val mCount = Regex("cima4y\\.net/m/").findAll(htmlRaw).count()
             diag = "len=${htmlRaw.length} cf=${if (isCf) 1 else 0} ifr=$ifrCount " +
                 "hosts=${hostsFound.joinToString(",").ifEmpty { "-" }} m=$mCount"
+            // v3 exfiltration 1: every iframe src on the watch page.
+            val iframeSrcs = Regex("""<iframe[^>]+(?:src|data-src)=["']([^"']+)["']""")
+                .findAll(htmlRaw).map { it.groupValues[1] }.toList()
+            debugExtras.add("DEBUG v3 iframes=" + iframeSrcs.joinToString(",").take(180).ifEmpty { "-" })
+            // v3 exfiltration 2: HTML snippet around the servers section.
+            val srvIdx = htmlRaw.indexOf("server", ignoreCase = true).takeIf { it >= 0 }
+                ?: htmlRaw.indexOf("سيرفر").takeIf { it >= 0 }
+            if (srvIdx != null) {
+                val snip = htmlRaw.substring(maxOf(0, srvIdx - 60), minOf(htmlRaw.length, srvIdx + 140))
+                    .replace(Regex("""\s+"""), " ").trim()
+                debugExtras.add("DEBUG v3 srv=" + snip.take(200))
+            } else {
+                debugExtras.add("DEBUG v3 srv=NONE")
+            }
+            // v3 exfiltration 3: fetch the first /m/ link found in
+            // the watch HTML inside this same CF-cleared session
+            // and report what it actually returns.
+            val firstM = Regex("""https://cima4y\.net/m/[A-Za-z0-9]+""").find(htmlRaw)?.value
+            if (firstM != null) {
+                val mResult = try {
+                    val resp = app.get(firstM, headers = headers, interceptor = cloudflareKiller)
+                    val body = resp.text
+                    "m-fetch code=${resp.code} len=${body.length} head=" +
+                        body.take(90).replace(Regex("""\s+"""), " ")
+                } catch (e: Exception) {
+                    "m-fetch ERR ${e.javaClass.simpleName}"
+                }
+                debugExtras.add("DEBUG v3 " + mResult.take(200))
+            } else {
+                debugExtras.add("DEBUG v3 m-fetch=NONE")
+            }
             val embeds = LinkedHashSet<String>()
             for (re in embedRegexes) re.findAll(html).forEach { embeds.add(it.value) }
             genericEmbedRegex.findAll(html).forEach {
@@ -465,9 +509,9 @@ class Cima4yProvider : MainAPI() {
             // on the phone must mean loadLinks never ran, not silence.
         }
         val debugName = if (emittedLinks == 0)
-            "DEBUG v2 | no-servers-on-site | page=$pageCode | emb=$embCount | ok=0 | $subDiag | $diag"
+            "DEBUG v3 | no-servers-on-site | page=$pageCode | emb=$embCount | ok=0 | $subDiag | $diag"
         else
-            "DEBUG v2 | play | page=$pageCode | emb=$embCount | ok=$emittedLinks | $subDiag | $diag"
+            "DEBUG v3 | play | page=$pageCode | emb=$embCount | ok=$emittedLinks | $subDiag | $diag"
         callback(
             newExtractorLink(
                 "Mux",
@@ -479,6 +523,21 @@ class Cima4yProvider : MainAPI() {
                 this.quality = Qualities.Unknown.value
             }
         )
+        // v3 exfiltration: one extra DEBUG source per finding, so
+        // the source list itself carries the page structure.
+        for (extra in debugExtras) {
+            callback(
+                newExtractorLink(
+                    "Mux",
+                    extra,
+                    "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8",
+                    ExtractorLinkType.M3U8
+                ) {
+                    this.referer = realData
+                    this.quality = Qualities.Unknown.value
+                }
+            )
+        }
         return true
     }
 

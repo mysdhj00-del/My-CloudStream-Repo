@@ -542,7 +542,7 @@ class Cima4yProvider : MainAPI() {
             jsPaths = scriptSrcs.joinToString(",") {
                 it.substringAfter("cima4y.net").ifEmpty { it }.take(40)
             }.take(90).ifEmpty { "-" }
-            debugExtras.add("DEBUG v9 scripts=" + scriptSrcs.joinToString(",").take(180).ifEmpty { "-" })
+            debugExtras.add("DEBUG v10 scripts=" + scriptSrcs.joinToString(",").take(180).ifEmpty { "-" })
             val hiddenInputs = Regex("""<input[^>]+type=["']hidden["'][^>]*>""", RegexOption.IGNORE_CASE)
                 .findAll(htmlRaw).map { it.value.take(120) }.toList()
             debugExtras.add("DEBUG v10 hidden=" + hiddenInputs.joinToString(" | ").take(200).ifEmpty { "-" })

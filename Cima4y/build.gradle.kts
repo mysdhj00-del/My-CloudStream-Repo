@@ -1,5 +1,5 @@
 // Cima4y CloudStream plugin module.
-version = 13
+version = 14
 
 android {
     namespace = "com.cima4y"

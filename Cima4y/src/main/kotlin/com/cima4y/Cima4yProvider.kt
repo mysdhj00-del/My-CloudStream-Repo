@@ -1,5 +1,6 @@
 package com.cima4y
 
+import android.util.Base64
 import com.lagradost.cloudstream3.HomePageResponse
 import com.lagradost.cloudstream3.LoadResponse
 import com.lagradost.cloudstream3.MainAPI
@@ -21,6 +22,8 @@ import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.loadExtractor
 import com.lagradost.cloudstream3.utils.newExtractorLink
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
@@ -221,7 +224,7 @@ class Cima4yProvider : MainAPI() {
             val items = mergeShowCards(cards)
             if (items.isEmpty()) {
                 val debugTitle =
-                    "DEBUG v4 home ${request.name} page=$page len=${doc.html().length} cards=0"
+                    "DEBUG v5 home ${request.name} page=$page len=${doc.html().length} cards=0"
                 return newHomePageResponse(
                     request.name,
                     listOf(newMovieSearchResponse(debugTitle, request.data, TvType.Movie) {}),
@@ -231,7 +234,7 @@ class Cima4yProvider : MainAPI() {
             newHomePageResponse(request.name, items, hasNext = cards.size >= 50)
         } catch (e: Exception) {
             val debugTitle =
-                "DEBUG v4 home ${request.name} page=$page err=${e.javaClass.simpleName}"
+                "DEBUG v5 home ${request.name} page=$page err=${e.javaClass.simpleName}"
             newHomePageResponse(
                 request.name,
                 listOf(newMovieSearchResponse(debugTitle, request.data, TvType.Movie) {}),
@@ -436,33 +439,38 @@ class Cima4yProvider : MainAPI() {
             // v3 exfiltration 1: every iframe src on the watch page.
             val iframeSrcs = Regex("""<iframe[^>]+(?:src|data-src)=["']([^"']+)["']""")
                 .findAll(htmlRaw).map { it.groupValues[1] }.toList()
-            debugExtras.add("DEBUG v4 iframes=" + iframeSrcs.joinToString(",").take(180).ifEmpty { "-" })
+            debugExtras.add("DEBUG v5 iframes=" + iframeSrcs.joinToString(",").take(180).ifEmpty { "-" })
             // v3 exfiltration 2: HTML snippet around the servers section.
             val srvIdx = htmlRaw.indexOf("server", ignoreCase = true).takeIf { it >= 0 }
                 ?: htmlRaw.indexOf("سيرفر").takeIf { it >= 0 }
             if (srvIdx != null) {
                 val snip = htmlRaw.substring(maxOf(0, srvIdx - 60), minOf(htmlRaw.length, srvIdx + 140))
                     .replace(Regex("""\s+"""), " ").trim()
-                debugExtras.add("DEBUG v4 srv=" + snip.take(200))
+                debugExtras.add("DEBUG v5 srv=" + snip.take(200))
             } else {
-                debugExtras.add("DEBUG v4 srv=NONE")
+                debugExtras.add("DEBUG v5 srv=NONE")
             }
-            // v3 exfiltration 3: fetch the first /m/ link found in
-            // the watch HTML inside this same CF-cleared session
-            // and report what it actually returns.
-            val firstM = Regex("""https://cima4y\.net/m/[A-Za-z0-9]+""").find(htmlRaw)?.value
-            if (firstM != null) {
-                val mResult = try {
-                    val resp = app.get(firstM, headers = headers, interceptor = cloudflareKiller)
-                    val body = resp.text
-                    "m-fetch code=${resp.code} len=${body.length} head=" +
-                        body.take(90).replace(Regex("""\s+"""), " ")
-                } catch (e: Exception) {
-                    "m-fetch ERR ${e.javaClass.simpleName}"
-                }
-                debugExtras.add("DEBUG v4 " + mResult.take(200))
+            // v5 (panel #5): the panel's top diagnostics — which
+            // script keywords are in the page, every <script src>,
+            // hidden inputs, and the __hpv3 block from THIS page.
+            val kwHits = listOf(
+                "fetch(", "\$.ajax", "XMLHttpRequest", "/ajax/", "/api/",
+                "/player", "getEmbed", "getServer", "loadServer",
+                "embed_url", "atob", "decode", "fromCharCode", "__hpv3"
+            ).filter { htmlRaw.contains(it, ignoreCase = true) }
+            debugExtras.add("DEBUG v5 kw=" + kwHits.joinToString(",").take(180).ifEmpty { "-" })
+            val scriptSrcs = Regex("""<script[^>]+src=["']([^"']+)["']""")
+                .findAll(htmlRaw).map { it.groupValues[1] }.toList()
+            debugExtras.add("DEBUG v5 scripts=" + scriptSrcs.joinToString(",").take(180).ifEmpty { "-" })
+            val hiddenInputs = Regex("""<input[^>]+type=["']hidden["'][^>]*>""", RegexOption.IGNORE_CASE)
+                .findAll(htmlRaw).map { it.value.take(120) }.toList()
+            debugExtras.add("DEBUG v5 hidden=" + hiddenInputs.joinToString(" | ").take(200).ifEmpty { "-" })
+            val hpv3Idx = htmlRaw.indexOf("__hpv3")
+            if (hpv3Idx >= 0) {
+                debugExtras.add("DEBUG v5 hpv3=" + htmlRaw.substring(hpv3Idx, minOf(htmlRaw.length, hpv3Idx + 220))
+                    .replace(Regex("""\s+"""), " ").take(220))
             } else {
-                debugExtras.add("DEBUG v4 m-fetch=NONE")
+                debugExtras.add("DEBUG v5 hpv3=NONE")
             }
             val embeds = LinkedHashSet<String>()
             for (re in embedRegexes) re.findAll(html).forEach { embeds.add(it.value) }
@@ -503,6 +511,97 @@ class Cima4yProvider : MainAPI() {
                 } catch (e: Exception) {
                 }
             }
+            // v5 (panel #5, H2): Base64-decode every long opaque
+            // string in the page and look for embed host names —
+            // the mapping may be encoded inline in <script>.
+            val hostWords = listOf(
+                "fastvid", "vinovo", "uqload", "voe", "doodstream",
+                "luluvido", "m1xdrop", "byse", "/embed/", "/e/"
+            )
+            var b64Hit = ""
+            for (m in Regex("""[A-Za-z0-9+/=]{40,}""").findAll(htmlRaw)) {
+                val s = m.value
+                if (s.contains("cima4y.net/m/")) continue
+                try {
+                    val dec = String(Base64.decode(s, Base64.DEFAULT), Charsets.UTF_8)
+                    if (hostWords.any { dec.contains(it, ignoreCase = true) }) {
+                        b64Hit = dec.take(160)
+                        break
+                    }
+                } catch (e: Exception) {
+                }
+            }
+            val revHit = listOf("divtsaf", "onivniv", "daolqu", "eov", "odivulul", "pordx1m", "esyb")
+                .filter { htmlRaw.contains(it, ignoreCase = true) }
+            if (b64Hit.isNotEmpty()) {
+                debugExtras.add("DEBUG v5 b64=" + b64Hit.replace(Regex("""\s+"""), " ").take(200))
+                for (re in embedRegexes) re.findAll(b64Hit).forEach { embeds.add(it.value) }
+            } else if (revHit.isNotEmpty()) {
+                debugExtras.add("DEBUG v5 rev=" + revHit.joinToString(","))
+            } else {
+                debugExtras.add("DEBUG v5 b64=NONE")
+            }
+            // v5 (panel #5, H3): fetch the FIRST /m/ link from
+            // this same HTML immediately (<1s after the watch
+            // GET, same session) with exact iframe headers, and
+            // scan whatever it returns for embeds.
+            val firstM = Regex("""https://cima4y\.net/m/[A-Za-z0-9]+""").find(htmlRaw)?.value
+            if (firstM != null) {
+                try {
+                    val mResp = app.get(
+                        firstM,
+                        headers = headers + mapOf(
+                            "Sec-Fetch-Dest" to "iframe",
+                            "Sec-Fetch-Mode" to "navigate",
+                            "Sec-Fetch-Site" to "same-origin"
+                        ),
+                        referer = realData,
+                        interceptor = cloudflareKiller
+                    )
+                    val mBody = mResp.text.replace("\\/", "/")
+                    debugExtras.add("DEBUG v5 m-now code=${mResp.code} len=${mBody.length} head=" +
+                        mBody.take(80).replace(Regex("""\s+"""), " "))
+                    for (re in embedRegexes) re.findAll(mBody).forEach { embeds.add(it.value) }
+                    genericEmbedRegex.findAll(mBody).forEach {
+                        val u = it.value
+                        if (!u.contains("cima4y.net")) embeds.add(u)
+                    }
+                } catch (e: Exception) {
+                    debugExtras.add("DEBUG v5 m-now ERR ${e.javaClass.simpleName}")
+                }
+            } else {
+                debugExtras.add("DEBUG v5 m-now NONE")
+            }
+            // v5 (panel #5, H1): probe candidate AJAX resolver
+            // endpoints — POST {"id": slug, "server": "earnvids"}
+            // as JSON with X-Requested-With. A HIT (response
+            // containing an embed host) is fed straight into the
+            // embed set, so playback itself proves the endpoint.
+            val slug = realData.substringAfter("/watch/", "")
+            val ajaxJson = """{"id":"$slug","server":"earnvids"}"""
+            val ajaxResults = ArrayList<String>()
+            for (ep in listOf("/ajax/player", "/ajax/get-embed", "/ajax/server", "/api/embed")) {
+                try {
+                    val r = app.post(
+                        mainUrl + ep,
+                        headers = headers + mapOf(
+                            "X-Requested-With" to "XMLHttpRequest",
+                            "Accept" to "application/json, text/javascript, */*; q=0.01"
+                        ),
+                        referer = realData,
+                        requestBody = ajaxJson.toRequestBody("application/json".toMediaType())
+                    )
+                    val rText = r.text
+                    val hit = hostWords.any { rText.contains(it, ignoreCase = true) }
+                    ajaxResults.add("$ep code=${r.code} ${if (hit) "HIT" else "no"} len=${rText.length}")
+                    if (hit) {
+                        for (re in embedRegexes) re.findAll(rText.replace("\\/", "/")).forEach { embeds.add(it.value) }
+                    }
+                } catch (e: Exception) {
+                    ajaxResults.add("$ep=ERR")
+                }
+            }
+            debugExtras.add("DEBUG v5 ajax=" + ajaxResults.joinToString(" | ").take(200))
             embCount = embeds.size
             for (embed in embeds) {
                 try {
@@ -521,9 +620,9 @@ class Cima4yProvider : MainAPI() {
             fetchErr = "err=${e.javaClass.simpleName}:${(e.message ?: "").take(60)}"
         }
         val debugName = if (emittedLinks == 0)
-            "DEBUG v4 | no-servers-on-site | page=$pageCode | emb=$embCount | ok=0 | $subDiag | $diag $fetchErr"
+            "DEBUG v5 | no-servers-on-site | page=$pageCode | emb=$embCount | ok=0 | $subDiag | $diag $fetchErr"
         else
-            "DEBUG v4 | play | page=$pageCode | emb=$embCount | ok=$emittedLinks | $subDiag | $diag $fetchErr"
+            "DEBUG v5 | play | page=$pageCode | emb=$embCount | ok=$emittedLinks | $subDiag | $diag $fetchErr"
         callback(
             newExtractorLink(
                 "Mux",

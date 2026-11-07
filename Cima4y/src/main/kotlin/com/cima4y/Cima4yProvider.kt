@@ -221,7 +221,7 @@ class Cima4yProvider : MainAPI() {
             val items = mergeShowCards(cards)
             if (items.isEmpty()) {
                 val debugTitle =
-                    "DEBUG v3 home ${request.name} page=$page len=${doc.html().length} cards=0"
+                    "DEBUG v4 home ${request.name} page=$page len=${doc.html().length} cards=0"
                 return newHomePageResponse(
                     request.name,
                     listOf(newMovieSearchResponse(debugTitle, request.data, TvType.Movie) {}),
@@ -231,7 +231,7 @@ class Cima4yProvider : MainAPI() {
             newHomePageResponse(request.name, items, hasNext = cards.size >= 50)
         } catch (e: Exception) {
             val debugTitle =
-                "DEBUG v3 home ${request.name} page=$page err=${e.javaClass.simpleName}"
+                "DEBUG v4 home ${request.name} page=$page err=${e.javaClass.simpleName}"
             newHomePageResponse(
                 request.name,
                 listOf(newMovieSearchResponse(debugTitle, request.data, TvType.Movie) {}),
@@ -399,14 +399,25 @@ class Cima4yProvider : MainAPI() {
         // servers section, and the in-session result of fetching
         // the first /m/ link) — the next screenshot of the
         // source list names the exact mechanism.
+        // v4: the v3 run came back page=0 — the watch-page GET
+        // itself THREW (the Turnstile solve is flaky and the
+        // error was swallowed silently). v4 records the exact
+        // exception in the DEBUG line and retries the fetch once
+        // after a short pause.
         var diag = ""
+        var fetchErr = ""
         val debugExtras = ArrayList<String>()
         val countingCallback: (ExtractorLink) -> Unit = { link ->
             emittedLinks++
             callback(link)
         }
         try {
-            val htmlRaw = app.get(realData, headers = headers, interceptor = cloudflareKiller).text
+            val htmlRaw = try {
+                app.get(realData, headers = headers, interceptor = cloudflareKiller).text
+            } catch (e: Exception) {
+                try { Thread.sleep(2000) } catch (ignored: Exception) { }
+                app.get(realData, headers = headers, interceptor = cloudflareKiller).text
+            }
             pageCode = 200
             val html = htmlRaw.replace("\\/", "/")
             // v3: strict CF check — the real watch page embeds the
@@ -425,16 +436,16 @@ class Cima4yProvider : MainAPI() {
             // v3 exfiltration 1: every iframe src on the watch page.
             val iframeSrcs = Regex("""<iframe[^>]+(?:src|data-src)=["']([^"']+)["']""")
                 .findAll(htmlRaw).map { it.groupValues[1] }.toList()
-            debugExtras.add("DEBUG v3 iframes=" + iframeSrcs.joinToString(",").take(180).ifEmpty { "-" })
+            debugExtras.add("DEBUG v4 iframes=" + iframeSrcs.joinToString(",").take(180).ifEmpty { "-" })
             // v3 exfiltration 2: HTML snippet around the servers section.
             val srvIdx = htmlRaw.indexOf("server", ignoreCase = true).takeIf { it >= 0 }
                 ?: htmlRaw.indexOf("سيرفر").takeIf { it >= 0 }
             if (srvIdx != null) {
                 val snip = htmlRaw.substring(maxOf(0, srvIdx - 60), minOf(htmlRaw.length, srvIdx + 140))
                     .replace(Regex("""\s+"""), " ").trim()
-                debugExtras.add("DEBUG v3 srv=" + snip.take(200))
+                debugExtras.add("DEBUG v4 srv=" + snip.take(200))
             } else {
-                debugExtras.add("DEBUG v3 srv=NONE")
+                debugExtras.add("DEBUG v4 srv=NONE")
             }
             // v3 exfiltration 3: fetch the first /m/ link found in
             // the watch HTML inside this same CF-cleared session
@@ -449,9 +460,9 @@ class Cima4yProvider : MainAPI() {
                 } catch (e: Exception) {
                     "m-fetch ERR ${e.javaClass.simpleName}"
                 }
-                debugExtras.add("DEBUG v3 " + mResult.take(200))
+                debugExtras.add("DEBUG v4 " + mResult.take(200))
             } else {
-                debugExtras.add("DEBUG v3 m-fetch=NONE")
+                debugExtras.add("DEBUG v4 m-fetch=NONE")
             }
             val embeds = LinkedHashSet<String>()
             for (re in embedRegexes) re.findAll(html).forEach { embeds.add(it.value) }
@@ -505,13 +516,14 @@ class Cima4yProvider : MainAPI() {
                 }
             }
         } catch (e: Exception) {
-            // Fall through to the DEBUG marker below: an empty list
-            // on the phone must mean loadLinks never ran, not silence.
+            // v4: name the failure instead of silence — a page=0
+            // with no reason tells us nothing.
+            fetchErr = "err=${e.javaClass.simpleName}:${(e.message ?: "").take(60)}"
         }
         val debugName = if (emittedLinks == 0)
-            "DEBUG v3 | no-servers-on-site | page=$pageCode | emb=$embCount | ok=0 | $subDiag | $diag"
+            "DEBUG v4 | no-servers-on-site | page=$pageCode | emb=$embCount | ok=0 | $subDiag | $diag $fetchErr"
         else
-            "DEBUG v3 | play | page=$pageCode | emb=$embCount | ok=$emittedLinks | $subDiag | $diag"
+            "DEBUG v4 | play | page=$pageCode | emb=$embCount | ok=$emittedLinks | $subDiag | $diag $fetchErr"
         callback(
             newExtractorLink(
                 "Mux",

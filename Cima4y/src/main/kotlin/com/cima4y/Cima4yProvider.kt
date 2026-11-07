@@ -142,6 +142,27 @@ class Cima4yProvider : MainAPI() {
         return cookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
     }
 
+    /** v14: force a fresh Cloudflare solve. CloudflareKiller
+     * never re-solves once savedCookies[host] is set — it
+     * replays the saved cookies on every request (no expiry
+     * check). A 403 / tiny body after an earlier good solve
+     * means those cookies went stale, so drop them AND the
+     * WebView cookies (mirrors the killer's own init) — the
+     * next request then takes the null branch and re-solves
+     * via WebView. Public API: savedCookies is a public
+     * MutableMap; CookieManager.removeAllCookies(null) is
+     * exactly what the killer's init calls. */
+    private fun clearCloudflareState() {
+        try {
+            cloudflareKiller.savedCookies.remove("cima4y.net")
+        } catch (e: Exception) {
+        }
+        try {
+            android.webkit.CookieManager.getInstance().removeAllCookies(null)
+        } catch (e: Exception) {
+        }
+    }
+
     // The site's FULL nav (16 categories, verified live from the
     // homepage 2026-11-07) + the home feed, every section titled
     // "<section> — Cima4y" with its full contents.
@@ -252,7 +273,7 @@ class Cima4yProvider : MainAPI() {
             val items = mergeShowCards(cards)
             if (items.isEmpty()) {
                 val debugTitle =
-                    "DEBUG v13 home ${request.name} page=$page len=${doc.html().length} cards=0"
+                    "DEBUG v14 home ${request.name} page=$page len=${doc.html().length} cards=0"
                 return newHomePageResponse(
                     request.name,
                     listOf(newMovieSearchResponse(debugTitle, request.data, TvType.Movie) {}),
@@ -262,7 +283,7 @@ class Cima4yProvider : MainAPI() {
             newHomePageResponse(request.name, items, hasNext = cards.size >= 50)
         } catch (e: Exception) {
             val debugTitle =
-                "DEBUG v13 home ${request.name} page=$page err=${e.javaClass.simpleName}"
+                "DEBUG v14 home ${request.name} page=$page err=${e.javaClass.simpleName}"
             newHomePageResponse(
                 request.name,
                 listOf(newMovieSearchResponse(debugTitle, request.data, TvType.Movie) {}),
@@ -489,7 +510,17 @@ class Cima4yProvider : MainAPI() {
         // cookies + ASCII Referer). Also fix the token decode
         // (strip .sig, urlsafe chars) and capture resolveUrl's
         // definition + the full fetch options.
-        var h3pCode = "-"
+        // v14: the v13 POST never ran — the watch GET itself
+        // 403'd on all 3 attempts. Root cause, from the
+        // CloudflareKiller source: once savedCookies[host] is
+        // set the killer replays the saved cookies forever and
+        // never re-solves (no expiry check), so a stale
+        // cf_clearance 403s forever. v14 clears the saved +
+        // WebView cookies on a 403/tiny body and retries, and
+        // runs three POST shapes (token JSON, empty, server
+        // JSON) with the full browser fetch header set.
+        var h3pCodes = "-"
+        var h3pBest = "-"
         var rslCtx = "-"
         var tokTail = "-"
         var tokJsonFull = ""
@@ -504,11 +535,19 @@ class Cima4yProvider : MainAPI() {
             // (page=200, len=6586, cf=1) and the token probe never
             // ran. Retry the GET when the page is a challenge
             // page (small or CF title), up to 3 attempts.
+            // v14: the v13 run 403'd "Access denied." (14 bytes)
+            // on ALL 3 attempts — plain retries cannot fix that:
+            // the killer was replaying a STALE cf_clearance and
+            // never re-solves once savedCookies[host] is set.
+            // On a 403 / tiny body, clear the saved + WebView
+            // cookies (max 2 clears) so the next request takes
+            // the null branch and re-solves via WebView.
             var htmlRaw = ""
             var isCf = true
             var attempts = 0
             var pageCodes = ""
-            while (attempts < 3) {
+            var clears = 0
+            while (attempts < 5) {
                 attempts++
                 try {
                     val resp = app.get(realData, headers = headers, interceptor = cloudflareKiller)
@@ -517,14 +556,18 @@ class Cima4yProvider : MainAPI() {
                     pageCode = resp.code
                 } catch (e: Exception) {
                     pageCodes += (if (pageCodes.isEmpty()) "" else ",") + "ERR"
-                    if (attempts >= 3) throw e
+                    if (attempts >= 5) throw e
                     try { Thread.sleep(2000) } catch (ignored: Exception) { }
                     continue
                 }
                 isCf = htmlRaw.contains("<title>Just a moment...</title>") ||
                     htmlRaw.contains("Attention Required")
                 if (!isCf && htmlRaw.length >= 20000) break
-                if (attempts < 3) {
+                if ((pageCode == 403 || htmlRaw.length < 500) && clears < 2) {
+                    clears++
+                    clearCloudflareState()
+                    try { Thread.sleep(1000) } catch (ignored: Exception) { }
+                } else if (attempts < 5) {
                     try { Thread.sleep(2000) } catch (ignored: Exception) { }
                 }
             }
@@ -538,14 +581,14 @@ class Cima4yProvider : MainAPI() {
                 "doodstream", "playmogo", "luluvido", "m1xdrop", "mxdrop"
             ).filter { htmlRaw.contains(it, ignoreCase = true) }
             val mCount = Regex("cima4y\\.net/m/").findAll(htmlRaw).count()
-            diag = "len=${htmlRaw.length} cf=${if (isCf) 1 else 0} att=$attempts codes=$pageCodes ifr=$ifrCount " +
+            diag = "len=${htmlRaw.length} cf=${if (isCf) 1 else 0} att=$attempts codes=$pageCodes clr=$clears ifr=$ifrCount " +
                 "hosts=${hostsFound.joinToString(",").ifEmpty { "-" }} m=$mCount"
             // v12: when the page comes back tiny (v11's 14-byte
             // body), SHOW the bytes — an error JSON names the
             // problem, an empty body names the killer/session.
             if (htmlRaw.length < 500) {
                 tinyBody = htmlRaw.replace(Regex("""\s+"""), " ").trim().take(200).ifEmpty { "(empty)" }
-                debugExtras.add("DEBUG v13 tinybody=" + tinyBody)
+                debugExtras.add("DEBUG v14 tinybody=" + tinyBody)
             }
             // v7: the embed set is declared here so the script
             // probe (below) can add to it too.
@@ -553,7 +596,7 @@ class Cima4yProvider : MainAPI() {
             // v3 exfiltration 1: every iframe src on the watch page.
             val iframeSrcs = Regex("""<iframe[^>]+(?:src|data-src)=["']([^"']+)["']""")
                 .findAll(htmlRaw).map { it.groupValues[1] }.toList()
-            debugExtras.add("DEBUG v13 iframes=" + iframeSrcs.joinToString(",").take(180).ifEmpty { "-" })
+            debugExtras.add("DEBUG v14 iframes=" + iframeSrcs.joinToString(",").take(180).ifEmpty { "-" })
             // v6: the player iframe (not the CF 1x1) is the one
             // whose /m/ link matters — keep it for the title line.
             playerIfr = iframeSrcs.firstOrNull {
@@ -565,9 +608,9 @@ class Cima4yProvider : MainAPI() {
             if (srvIdx != null) {
                 val snip = htmlRaw.substring(maxOf(0, srvIdx - 60), minOf(htmlRaw.length, srvIdx + 140))
                     .replace(Regex("""\s+"""), " ").trim()
-                debugExtras.add("DEBUG v13 srv=" + snip.take(200))
+                debugExtras.add("DEBUG v14 srv=" + snip.take(200))
             } else {
-                debugExtras.add("DEBUG v13 srv=NONE")
+                debugExtras.add("DEBUG v14 srv=NONE")
             }
             // v5 (panel #5): the panel's top diagnostics — which
             // script keywords are in the page, every <script src>,
@@ -578,21 +621,21 @@ class Cima4yProvider : MainAPI() {
                 "embed_url", "atob", "decode", "fromCharCode", "__hpv3"
             ).filter { htmlRaw.contains(it, ignoreCase = true) }
             kwHitsStr = kwHits.joinToString(",").take(40).ifEmpty { "-" }
-            debugExtras.add("DEBUG v13 kw=" + kwHits.joinToString(",").take(180).ifEmpty { "-" })
+            debugExtras.add("DEBUG v14 kw=" + kwHits.joinToString(",").take(180).ifEmpty { "-" })
             val scriptSrcs = Regex("""<script[^>]+src=["']([^"']+)["']""")
                 .findAll(htmlRaw).map { it.groupValues[1] }.toList()
             scriptCount = scriptSrcs.size
             jsPaths = scriptSrcs.joinToString(",") {
                 it.substringAfter("cima4y.net").ifEmpty { it }.take(40)
             }.take(90).ifEmpty { "-" }
-            debugExtras.add("DEBUG v13 scripts=" + scriptSrcs.joinToString(",").take(180).ifEmpty { "-" })
+            debugExtras.add("DEBUG v14 scripts=" + scriptSrcs.joinToString(",").take(180).ifEmpty { "-" })
             val hiddenInputs = Regex("""<input[^>]+type=["']hidden["'][^>]*>""", RegexOption.IGNORE_CASE)
                 .findAll(htmlRaw).map { it.value.take(120) }.toList()
-            debugExtras.add("DEBUG v13 hidden=" + hiddenInputs.joinToString(" | ").take(200).ifEmpty { "-" })
+            debugExtras.add("DEBUG v14 hidden=" + hiddenInputs.joinToString(" | ").take(200).ifEmpty { "-" })
             val hpv3Idx = htmlRaw.indexOf("__hpv3")
             hpv3Present = if (hpv3Idx >= 0) 1 else 0
             if (hpv3Idx >= 0) {
-                debugExtras.add("DEBUG v13 hpv3=" + htmlRaw.substring(hpv3Idx, minOf(htmlRaw.length, hpv3Idx + 220))
+                debugExtras.add("DEBUG v14 hpv3=" + htmlRaw.substring(hpv3Idx, minOf(htmlRaw.length, hpv3Idx + 220))
                     .replace(Regex("""\s+"""), " ").take(220))
                 // v9: the token PARSE keeps failing (tok=-) —
                 // carry the RAW block in the title so it can be
@@ -607,9 +650,9 @@ class Cima4yProvider : MainAPI() {
                 if (hpv3Token.isEmpty()) {
                     hpv3Token = Regex("""["']__hpv3["']\s*:\s*["']([^"']+)["']""").find(seg)?.groupValues?.get(1).orEmpty()
                 }
-                debugExtras.add("DEBUG v13 hpv3tok=" + hpv3Token.take(24).ifEmpty { "-" })
+                debugExtras.add("DEBUG v14 hpv3tok=" + hpv3Token.take(24).ifEmpty { "-" })
             } else {
-                debugExtras.add("DEBUG v13 hpv3=NONE")
+                debugExtras.add("DEBUG v14 hpv3=NONE")
             }
             // v9: the server button's OWN tag — every attribute
             // on it (data-*, onclick, ids) — by walking back
@@ -623,7 +666,7 @@ class Cima4yProvider : MainAPI() {
                         .replace(Regex("""\s+"""), " ").trim().take(180)
                 }
             }
-            debugExtras.add("DEBUG v13 btn=" + btnTag)
+            debugExtras.add("DEBUG v14 btn=" + btnTag)
             // v10: the resolver may be INLINE in the watch page
             // (the 3 external scripts are gtag + jquery +
             // cloudflareinsights — none is a custom bundle).
@@ -646,9 +689,9 @@ class Cima4yProvider : MainAPI() {
                 rslCtx = htmlRaw.substring(maxOf(0, rslIdx - 60), minOf(htmlRaw.length, rslIdx + 90))
                     .replace(Regex("""\s+"""), " ").trim().take(150)
             }
-            debugExtras.add("DEBUG v13 ifx=" + ifxCtx)
-            debugExtras.add("DEBUG v13 ius=" + iusCtx)
-            debugExtras.add("DEBUG v13 rsl=" + rslCtx)
+            debugExtras.add("DEBUG v14 ifx=" + ifxCtx)
+            debugExtras.add("DEBUG v14 ius=" + iusCtx)
+            debugExtras.add("DEBUG v14 rsl=" + rslCtx)
             // v7: the endpoint path is NOT in the HTML (kw has
             // fetch( + XMLHttpRequest + __hpv3 but no /ajax/ or
             // /api/ or getEmbed) — it must live in one of the
@@ -736,12 +779,12 @@ class Cima4yProvider : MainAPI() {
             }
             scriptVerdict = scriptHits.joinToString(";").take(120).ifEmpty { "-" }
             handlerVerdict = handlerCandidates.distinct().joinToString(",").take(80).ifEmpty { "-" }
-            debugExtras.add("DEBUG v13 scripts-grep=" + scriptVerdict)
-            debugExtras.add("DEBUG v13 handler=" + handlerVerdict)
-            debugExtras.add("DEBUG v13 sv=" + svCtx)
-            debugExtras.add("DEBUG v13 fx=" + fxCtx)
-            debugExtras.add("DEBUG v13 tokraw=" + tokRaw)
-            debugExtras.add("DEBUG v13 jsp=" + jsPaths)
+            debugExtras.add("DEBUG v14 scripts-grep=" + scriptVerdict)
+            debugExtras.add("DEBUG v14 handler=" + handlerVerdict)
+            debugExtras.add("DEBUG v14 sv=" + svCtx)
+            debugExtras.add("DEBUG v14 fx=" + fxCtx)
+            debugExtras.add("DEBUG v14 tokraw=" + tokRaw)
+            debugExtras.add("DEBUG v14 jsp=" + jsPaths)
             for (re in embedRegexes) re.findAll(html).forEach { embeds.add(it.value) }
             genericEmbedRegex.findAll(html).forEach {
                 val u = it.value
@@ -804,12 +847,12 @@ class Cima4yProvider : MainAPI() {
                 .filter { htmlRaw.contains(it, ignoreCase = true) }
             if (b64Hit.isNotEmpty()) {
                 b64Verdict = "HIT"
-                debugExtras.add("DEBUG v13 b64=" + b64Hit.replace(Regex("""\s+"""), " ").take(200))
+                debugExtras.add("DEBUG v14 b64=" + b64Hit.replace(Regex("""\s+"""), " ").take(200))
                 for (re in embedRegexes) re.findAll(b64Hit).forEach { embeds.add(it.value) }
             } else if (revHit.isNotEmpty()) {
-                debugExtras.add("DEBUG v13 rev=" + revHit.joinToString(","))
+                debugExtras.add("DEBUG v14 rev=" + revHit.joinToString(","))
             } else {
-                debugExtras.add("DEBUG v13 b64=NONE")
+                debugExtras.add("DEBUG v14 b64=NONE")
             }
             // v6 (panel #5, H3): fetch the PLAYER iframe's /m/
             // link first — v5 fetched the first /m/ in document
@@ -861,7 +904,7 @@ class Cima4yProvider : MainAPI() {
                         else -> "OPAQUE-HTML"
                     }
                     mNowCode = "${mResp.code}:$mVerdict"
-                    debugExtras.add("DEBUG v13 m-now code=${mResp.code} verdict=$mVerdict len=${mBody.length} head=" +
+                    debugExtras.add("DEBUG v14 m-now code=${mResp.code} verdict=$mVerdict len=${mBody.length} head=" +
                         mBody.take(80).replace(Regex("""\s+"""), " "))
                     for (re in embedRegexes) re.findAll(mBody).forEach { embeds.add(it.value) }
                     genericEmbedRegex.findAll(mBody).forEach {
@@ -873,10 +916,10 @@ class Cima4yProvider : MainAPI() {
                     // ERR hid whether /m/ 404s, hangs, or the
                     // killer's WebView throws.
                     mNowCode = e.javaClass.simpleName.take(10)
-                    debugExtras.add("DEBUG v13 m-now ERR ${e.javaClass.simpleName}")
+                    debugExtras.add("DEBUG v14 m-now ERR ${e.javaClass.simpleName}")
                 }
             } else {
-                debugExtras.add("DEBUG v13 m-now NONE")
+                debugExtras.add("DEBUG v14 m-now NONE")
             }
             // v8 (panel #6): the v5 probes are re-run with the
             // two fixes the panel flagged — ASCII Referer (the
@@ -987,57 +1030,73 @@ class Cima4yProvider : MainAPI() {
                     } catch (e: Exception) { "" }
                     tokJson = tokJsonFull.take(120).ifEmpty { "DECODE-ERR" }
                     val hUrl = mainUrl + "/__hpv3/video/" + hpv3FullToken
-                    val hHeaders = headers + mapOf("Accept" to "*/*") +
-                        (sessionCookieHeader().takeIf { it.isNotEmpty() }?.let { mapOf("Cookie" to it) } ?: emptyMap())
-                    val hResp = try {
-                        app.get(hUrl, headers = hHeaders, referer = asciiUrl(realData))
-                    } catch (e: Exception) {
-                        app.get(hUrl, headers = hHeaders, referer = asciiUrl(realData), interceptor = cloudflareKiller)
-                    }
-                    val hBody = hResp.text.replace("\\/", "/")
-                    val hCt = hResp.headers["Content-Type"].orEmpty().take(30)
-                    h3gCode = "${hResp.code}:$hCt:${hBody.take(200).replace(Regex("""\s+"""), " ").trim()}"
-                    debugExtras.add("DEBUG v13 h3get code=${hResp.code} ct=$hCt len=${hBody.length} head=" + hBody.take(200).replace(Regex("""\s+"""), " ").trim())
-                    for (re in embedRegexes) re.findAll(hBody).forEach { embeds.add(it.value) }
-                    genericEmbedRegex.findAll(hBody).forEach {
-                        val u = it.value
-                        if (!u.contains("cima4y.net")) embeds.add(u)
-                    }
-                    val embField = Regex(""""(?:embed|url|src)"\s*:\s*"([^"]+)"""").find(hBody)?.groupValues?.get(1)
-                    if (embField != null && embedRegexes.any { it.containsMatchIn(embField) }) embeds.add(embField)
-                    // v13: replay the page's own call — POST to
-                    // the token URL with the decoded token JSON
-                    // as the body (the Wecima2 pattern). ONE
-                    // attempt only: the token may be single-use.
-                    try {
-                        val pResp = app.post(
-                            hUrl,
-                            headers = probeHeaders + mapOf("Content-Type" to "application/json"),
-                            referer = asciiUrl(realData),
-                            requestBody = tokJsonFull.toRequestBody("application/json".toMediaType())
-                        )
-                        val pBody = pResp.text.replace("\\/", "/")
-                        val pCt = pResp.headers["Content-Type"].orEmpty().take(30)
-                        h3pCode = "${pResp.code}:$pCt:${pBody.take(200).replace(Regex("""\s+"""), " ").trim()}"
-                        debugExtras.add("DEBUG v13 h3post code=${pResp.code} ct=$pCt len=${pBody.length} head=" + pBody.take(200).replace(Regex("""\s+"""), " ").trim())
-                        for (re in embedRegexes) re.findAll(pBody).forEach { embeds.add(it.value) }
-                        genericEmbedRegex.findAll(pBody).forEach {
-                            val u = it.value
-                            if (!u.contains("cima4y.net")) embeds.add(u)
+                    // v14: the GET is DROPPED — v12 already proved
+                    // GET -> 403 "Access denied.", and a denied
+                    // GET might burn a single-use token (it
+                    // carries a nonce). Go straight to POST.
+                    h3gCode = "SKIP"
+                    // v14: POST variants — the page's fetch is a
+                    // POST, but its body is unknown (ifx was cut
+                    // off in v12). Try the three shapes in one
+                    // run, in likelihood order, stopping at the
+                    // first HIT. The token is re-minted on every
+                    // watch-page load, so burning one costs one
+                    // run. All variants carry the full browser
+                    // fetch header set (Origin + Sec-Fetch-*):
+                    // the v13 POST sent none of those, and the
+                    // site's human-signal gate may check them.
+                    val h3Headers = probeHeaders + mapOf(
+                        "Content-Type" to "application/json",
+                        "Origin" to mainUrl,
+                        "Sec-Fetch-Dest" to "empty",
+                        "Sec-Fetch-Mode" to "cors",
+                        "Sec-Fetch-Site" to "same-origin"
+                    )
+                    val variants = ArrayList<Pair<String, String>>()
+                    if (tokJsonFull.isNotBlank()) variants.add("json" to tokJsonFull)
+                    variants.add("empty" to "")
+                    variants.add("server" to """{"server":"earnvids"}""")
+                    val pCodes = ArrayList<String>()
+                    var bestHead = "-"
+                    for ((label, body) in variants) {
+                        try {
+                            val pResp = app.post(
+                                hUrl,
+                                headers = h3Headers,
+                                referer = asciiUrl(realData),
+                                requestBody = body.toRequestBody("application/json".toMediaType())
+                            )
+                            val pBody = pResp.text.replace("\\/", "/")
+                            val pCt = pResp.headers["Content-Type"].orEmpty().take(30)
+                            val hit = hostWords.any { pBody.contains(it, ignoreCase = true) }
+                            pCodes.add(if (hit) "HIT" else pResp.code.toString())
+                            if (bestHead == "-" || (pResp.code != 403 && bestHead.startsWith("403"))) {
+                                bestHead = "${pResp.code}:$pCt:${pBody.take(120).replace(Regex("""\s+"""), " ").trim()}"
+                            }
+                            debugExtras.add("DEBUG v14 h3post-$label code=${pResp.code} ct=$pCt len=${pBody.length} head=" + pBody.take(200).replace(Regex("""\s+"""), " ").trim())
+                            for (re in embedRegexes) re.findAll(pBody).forEach { embeds.add(it.value) }
+                            genericEmbedRegex.findAll(pBody).forEach {
+                                val u = it.value
+                                if (!u.contains("cima4y.net")) embeds.add(u)
+                            }
+                            val pEmb = Regex(""""(?:embed|url|src)"\s*:\s*"([^"]+)"""").find(pBody)?.groupValues?.get(1)
+                            if (pEmb != null && embedRegexes.any { it.containsMatchIn(pEmb) }) embeds.add(pEmb)
+                            if (hit) break
+                        } catch (e: Exception) {
+                            pCodes.add(e.javaClass.simpleName.take(10))
+                            debugExtras.add("DEBUG v14 h3post-$label ERR ${e.javaClass.simpleName}")
                         }
-                        val pEmb = Regex(""""(?:embed|url|src)"\s*:\s*"([^"]+)"""").find(pBody)?.groupValues?.get(1)
-                        if (pEmb != null && embedRegexes.any { it.containsMatchIn(pEmb) }) embeds.add(pEmb)
-                    } catch (e: Exception) {
-                        h3pCode = e.javaClass.simpleName.take(10)
-                        debugExtras.add("DEBUG v13 h3post ERR ${e.javaClass.simpleName}")
                     }
+                    h3pCodes = pCodes.joinToString(",").ifEmpty { "-" }
+                    h3pBest = bestHead
                 } catch (e: Exception) {
-                    h3gCode = e.javaClass.simpleName.take(10)
-                    debugExtras.add("DEBUG v13 h3get ERR ${e.javaClass.simpleName}")
+                    h3pCodes = e.javaClass.simpleName.take(10)
+                    debugExtras.add("DEBUG v14 h3post ERR ${e.javaClass.simpleName}")
                 }
             } else {
                 h3gCode = "NO-TOK"
-                debugExtras.add("DEBUG v13 h3get NO-TOK")
+                h3pCodes = "NO-TOK"
+                debugExtras.add("DEBUG v14 h3post NO-TOK")
             }
             // v6 (panel #5, Try 5): __hpv3 token exchange — parse
             // ts/n/p from the token block on THIS page and POST
@@ -1074,7 +1133,7 @@ class Cima4yProvider : MainAPI() {
                 ajaxResults.add("__hpv3/video=SKIP")
             }
             ajaxCodesStr = ajaxCodes.joinToString(",")
-            debugExtras.add("DEBUG v13 ajax=" + ajaxResults.joinToString(" | ").take(200))
+            debugExtras.add("DEBUG v14 ajax=" + ajaxResults.joinToString(" | ").take(200))
             embCount = embeds.size
             for (embed in embeds) {
                 try {
@@ -1123,11 +1182,16 @@ class Cima4yProvider : MainAPI() {
         // rsl= is resolveUrl's definition; tokt= is the token's
         // tail (reveals a .sig suffix); the token decode now
         // strips .sig and converts urlsafe chars.
-        val verdict = "aj=$ajaxCodesStr v2p=$v2pCode svr=$svrCode b64=$b64Verdict m=$mNowCode kw=$kwHitsStr js=$scriptCount h3=$hpv3Present tok=${hpv3Token.take(12).ifEmpty { "-" }} ifr=$playerIfr sc=$scriptVerdict handler=$handlerVerdict sv=$svCtx fx=$fxCtx tok=$tokRaw jsp=$jsPaths btn=$btnTag h3g=$h3gCode tokj=$tokJson ifx=$ifxCtx ius=$iusCtx body=$tinyBody h3p=$h3pCode rsl=$rslCtx tokt=$tokTail"
+        // v14: the v13 POST never ran — the gate 403'd first.
+        // clr= counts cookie clears (stale cf_clearance fix);
+        // h3p= is now the three POST variant codes
+        // (json,empty,server); h3pb= the head of the most
+        // informative POST response; the GET is dropped (SKIP).
+        val verdict = "aj=$ajaxCodesStr v2p=$v2pCode svr=$svrCode b64=$b64Verdict m=$mNowCode kw=$kwHitsStr js=$scriptCount h3=$hpv3Present tok=${hpv3Token.take(12).ifEmpty { "-" }} ifr=$playerIfr sc=$scriptVerdict handler=$handlerVerdict sv=$svCtx fx=$fxCtx tok=$tokRaw jsp=$jsPaths btn=$btnTag h3g=$h3gCode tokj=$tokJson ifx=$ifxCtx ius=$iusCtx body=$tinyBody h3p=$h3pCodes h3pb=$h3pBest rsl=$rslCtx tokt=$tokTail"
         val debugName = if (emittedLinks == 0)
-            "DEBUG v13 | no-servers-on-site | page=$pageCode | emb=$embCount | ok=0 | $subDiag | $diag | $verdict $fetchErr"
+            "DEBUG v14 | no-servers-on-site | page=$pageCode | emb=$embCount | ok=0 | $subDiag | $diag | $verdict $fetchErr"
         else
-            "DEBUG v13 | play | page=$pageCode | emb=$embCount | ok=$emittedLinks | $subDiag | $diag | $verdict $fetchErr"
+            "DEBUG v14 | play | page=$pageCode | emb=$embCount | ok=$emittedLinks | $subDiag | $diag | $verdict $fetchErr"
         callback(
             newExtractorLink(
                 "Mux",

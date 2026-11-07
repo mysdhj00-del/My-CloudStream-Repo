@@ -1,12 +1,12 @@
 // HorrorMovies CloudStream plugin module.
-version = 7
+version = 8
 
 android {
     namespace = "com.horror"
 }
 
 cloudstream {
-    description = "HorrorMovies (أفلام رعب) - Horror movies aggregated from MovizLand, EgyBest, MyCima and LaRosTV, with ratings where the source provides them"
+    description = "HorrorMovies (أفلام رعب) - Horror movies aggregated from MovizLand, EgyBest, MyCima, LaRosTV, TopCinema and AflamStream, with ratings where the source provides them"
     authors = listOf("Saher")
 
     /**

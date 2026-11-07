@@ -224,7 +224,7 @@ class Cima4yProvider : MainAPI() {
             val items = mergeShowCards(cards)
             if (items.isEmpty()) {
                 val debugTitle =
-                    "DEBUG v6 home ${request.name} page=$page len=${doc.html().length} cards=0"
+                    "DEBUG v7 home ${request.name} page=$page len=${doc.html().length} cards=0"
                 return newHomePageResponse(
                     request.name,
                     listOf(newMovieSearchResponse(debugTitle, request.data, TvType.Movie) {}),
@@ -234,7 +234,7 @@ class Cima4yProvider : MainAPI() {
             newHomePageResponse(request.name, items, hasNext = cards.size >= 50)
         } catch (e: Exception) {
             val debugTitle =
-                "DEBUG v6 home ${request.name} page=$page err=${e.javaClass.simpleName}"
+                "DEBUG v7 home ${request.name} page=$page err=${e.javaClass.simpleName}"
             newHomePageResponse(
                 request.name,
                 listOf(newMovieSearchResponse(debugTitle, request.data, TvType.Movie) {}),
@@ -412,6 +412,9 @@ class Cima4yProvider : MainAPI() {
         // v6: probe verdicts are carried in the MAIN debug line
         // (the player title) — the v5 extras only show in the
         // source list, which never arrived in a screenshot.
+        // v7: the v6 title DID arrive and it names the next
+        // steps — log exception classes, fetch the external
+        // scripts, fix the __hpv3 parse (unquoted keys).
         var kwHitsStr = "-"
         var scriptCount = 0
         var hpv3Present = 0
@@ -419,6 +422,7 @@ class Cima4yProvider : MainAPI() {
         var ajaxCodesStr = "-"
         var b64Verdict = "NONE"
         var mNowCode = "-"
+        var scriptVerdict = "-"
         val debugExtras = ArrayList<String>()
         val countingCallback: (ExtractorLink) -> Unit = { link ->
             emittedLinks++
@@ -446,10 +450,13 @@ class Cima4yProvider : MainAPI() {
             val mCount = Regex("cima4y\\.net/m/").findAll(htmlRaw).count()
             diag = "len=${htmlRaw.length} cf=${if (isCf) 1 else 0} ifr=$ifrCount " +
                 "hosts=${hostsFound.joinToString(",").ifEmpty { "-" }} m=$mCount"
+            // v7: the embed set is declared here so the script
+            // probe (below) can add to it too.
+            val embeds = LinkedHashSet<String>()
             // v3 exfiltration 1: every iframe src on the watch page.
             val iframeSrcs = Regex("""<iframe[^>]+(?:src|data-src)=["']([^"']+)["']""")
                 .findAll(htmlRaw).map { it.groupValues[1] }.toList()
-            debugExtras.add("DEBUG v6 iframes=" + iframeSrcs.joinToString(",").take(180).ifEmpty { "-" })
+            debugExtras.add("DEBUG v7 iframes=" + iframeSrcs.joinToString(",").take(180).ifEmpty { "-" })
             // v6: the player iframe (not the CF 1x1) is the one
             // whose /m/ link matters — keep it for the title line.
             playerIfr = iframeSrcs.firstOrNull {
@@ -461,9 +468,9 @@ class Cima4yProvider : MainAPI() {
             if (srvIdx != null) {
                 val snip = htmlRaw.substring(maxOf(0, srvIdx - 60), minOf(htmlRaw.length, srvIdx + 140))
                     .replace(Regex("""\s+"""), " ").trim()
-                debugExtras.add("DEBUG v6 srv=" + snip.take(200))
+                debugExtras.add("DEBUG v7 srv=" + snip.take(200))
             } else {
-                debugExtras.add("DEBUG v6 srv=NONE")
+                debugExtras.add("DEBUG v7 srv=NONE")
             }
             // v5 (panel #5): the panel's top diagnostics — which
             // script keywords are in the page, every <script src>,
@@ -474,23 +481,71 @@ class Cima4yProvider : MainAPI() {
                 "embed_url", "atob", "decode", "fromCharCode", "__hpv3"
             ).filter { htmlRaw.contains(it, ignoreCase = true) }
             kwHitsStr = kwHits.joinToString(",").take(40).ifEmpty { "-" }
-            debugExtras.add("DEBUG v6 kw=" + kwHits.joinToString(",").take(180).ifEmpty { "-" })
+            debugExtras.add("DEBUG v7 kw=" + kwHits.joinToString(",").take(180).ifEmpty { "-" })
             val scriptSrcs = Regex("""<script[^>]+src=["']([^"']+)["']""")
                 .findAll(htmlRaw).map { it.groupValues[1] }.toList()
             scriptCount = scriptSrcs.size
-            debugExtras.add("DEBUG v6 scripts=" + scriptSrcs.joinToString(",").take(180).ifEmpty { "-" })
+            debugExtras.add("DEBUG v7 scripts=" + scriptSrcs.joinToString(",").take(180).ifEmpty { "-" })
             val hiddenInputs = Regex("""<input[^>]+type=["']hidden["'][^>]*>""", RegexOption.IGNORE_CASE)
                 .findAll(htmlRaw).map { it.value.take(120) }.toList()
-            debugExtras.add("DEBUG v6 hidden=" + hiddenInputs.joinToString(" | ").take(200).ifEmpty { "-" })
+            debugExtras.add("DEBUG v7 hidden=" + hiddenInputs.joinToString(" | ").take(200).ifEmpty { "-" })
             val hpv3Idx = htmlRaw.indexOf("__hpv3")
             hpv3Present = if (hpv3Idx >= 0) 1 else 0
             if (hpv3Idx >= 0) {
-                debugExtras.add("DEBUG v6 hpv3=" + htmlRaw.substring(hpv3Idx, minOf(htmlRaw.length, hpv3Idx + 220))
+                debugExtras.add("DEBUG v7 hpv3=" + htmlRaw.substring(hpv3Idx, minOf(htmlRaw.length, hpv3Idx + 220))
                     .replace(Regex("""\s+"""), " ").take(220))
             } else {
-                debugExtras.add("DEBUG v6 hpv3=NONE")
+                debugExtras.add("DEBUG v7 hpv3=NONE")
             }
-            val embeds = LinkedHashSet<String>()
+            // v7: the endpoint path is NOT in the HTML (kw has
+            // fetch( + XMLHttpRequest + __hpv3 but no /ajax/ or
+            // /api/ or getEmbed) — it must live in one of the
+            // external scripts. Fetch each in-session and grep it
+            // for the resolver keywords and the embed hosts; a
+            // hit is fed straight into the embed set.
+            val scriptKw = listOf(
+                "fetch(", "XMLHttpRequest", "/ajax/", "/api/", "/player",
+                "getEmbed", "getServer", "embed_url", "atob", "__hpv3"
+            )
+            val scriptHosts = listOf(
+                "fastvid", "vinovo", "uqload", "voe", "doodstream",
+                "luluvido", "m1xdrop", "byse"
+            )
+            val scriptHits = ArrayList<String>()
+            for ((si, src) in scriptSrcs.withIndex()) {
+                try {
+                    val sUrl = when {
+                        src.startsWith("http") -> src
+                        src.startsWith("//") -> "https:$src"
+                        src.startsWith("/") -> mainUrl + src
+                        else -> "$mainUrl/$src"
+                    }
+                    val sText = app.get(
+                        sUrl, headers = headers, referer = realData,
+                        interceptor = cloudflareKiller
+                    ).text
+                    val hits = scriptKw.filter { sText.contains(it, ignoreCase = true) } +
+                        scriptHosts.filter { sText.contains(it, ignoreCase = true) }
+                    scriptHits.add("s${si + 1}:${hits.joinToString(",").take(60).ifEmpty { "-" }}")
+                    for (re in embedRegexes) re.findAll(sText.replace("\\/", "/")).forEach { embeds.add(it.value) }
+                    for (m in Regex("""[A-Za-z0-9+/=]{40,}""").findAll(sText)) {
+                        val s = m.value
+                        try {
+                            val dec = String(Base64.decode(s, Base64.DEFAULT), Charsets.UTF_8)
+                            if (scriptHosts.any { dec.contains(it, ignoreCase = true) }) {
+                                b64Verdict = "HIT"
+                                for (re in embedRegexes) re.findAll(dec).forEach { embeds.add(it.value) }
+                                break
+                            }
+                        } catch (e: Exception) {
+                        }
+                    }
+                } catch (e: Exception) {
+                    scriptHits.add("s${si + 1}:ERR-${e.javaClass.simpleName.take(10)}")
+                }
+            }
+            scriptVerdict = scriptHits.joinToString(";").take(120).ifEmpty { "-" }
+            debugExtras.add("DEBUG v7 scripts-grep=" + scriptVerdict)
             for (re in embedRegexes) re.findAll(html).forEach { embeds.add(it.value) }
             genericEmbedRegex.findAll(html).forEach {
                 val u = it.value
@@ -553,12 +608,12 @@ class Cima4yProvider : MainAPI() {
                 .filter { htmlRaw.contains(it, ignoreCase = true) }
             if (b64Hit.isNotEmpty()) {
                 b64Verdict = "HIT"
-                debugExtras.add("DEBUG v6 b64=" + b64Hit.replace(Regex("""\s+"""), " ").take(200))
+                debugExtras.add("DEBUG v7 b64=" + b64Hit.replace(Regex("""\s+"""), " ").take(200))
                 for (re in embedRegexes) re.findAll(b64Hit).forEach { embeds.add(it.value) }
             } else if (revHit.isNotEmpty()) {
-                debugExtras.add("DEBUG v6 rev=" + revHit.joinToString(","))
+                debugExtras.add("DEBUG v7 rev=" + revHit.joinToString(","))
             } else {
-                debugExtras.add("DEBUG v6 b64=NONE")
+                debugExtras.add("DEBUG v7 b64=NONE")
             }
             // v6 (panel #5, H3): fetch the PLAYER iframe's /m/
             // link first — v5 fetched the first /m/ in document
@@ -573,19 +628,34 @@ class Cima4yProvider : MainAPI() {
                 ?: Regex("""https://cima4y\.net/m/[A-Za-z0-9]+""").find(htmlRaw)?.value
             if (firstM != null) {
                 try {
-                    val mResp = app.get(
-                        firstM,
-                        headers = headers + mapOf(
-                            "Sec-Fetch-Dest" to "iframe",
-                            "Sec-Fetch-Mode" to "navigate",
-                            "Sec-Fetch-Site" to "same-origin"
-                        ),
-                        referer = realData,
-                        interceptor = cloudflareKiller
-                    )
+                    // v7: try WITHOUT the killer first — if the
+                    // killer's WebView is what throws on /m/,
+                    // the plain fetch returns the real code.
+                    val mResp = try {
+                        app.get(
+                            firstM,
+                            headers = headers + mapOf(
+                                "Sec-Fetch-Dest" to "iframe",
+                                "Sec-Fetch-Mode" to "navigate",
+                                "Sec-Fetch-Site" to "same-origin"
+                            ),
+                            referer = realData
+                        )
+                    } catch (e: Exception) {
+                        app.get(
+                            firstM,
+                            headers = headers + mapOf(
+                                "Sec-Fetch-Dest" to "iframe",
+                                "Sec-Fetch-Mode" to "navigate",
+                                "Sec-Fetch-Site" to "same-origin"
+                            ),
+                            referer = realData,
+                            interceptor = cloudflareKiller
+                        )
+                    }
                     mNowCode = mResp.code.toString()
                     val mBody = mResp.text.replace("\\/", "/")
-                    debugExtras.add("DEBUG v6 m-now code=${mResp.code} len=${mBody.length} head=" +
+                    debugExtras.add("DEBUG v7 m-now code=${mResp.code} len=${mBody.length} head=" +
                         mBody.take(80).replace(Regex("""\s+"""), " "))
                     for (re in embedRegexes) re.findAll(mBody).forEach { embeds.add(it.value) }
                     genericEmbedRegex.findAll(mBody).forEach {
@@ -593,11 +663,14 @@ class Cima4yProvider : MainAPI() {
                         if (!u.contains("cima4y.net")) embeds.add(u)
                     }
                 } catch (e: Exception) {
-                    mNowCode = "ERR"
-                    debugExtras.add("DEBUG v6 m-now ERR ${e.javaClass.simpleName}")
+                    // v7: name the exception class — v6's bare
+                    // ERR hid whether /m/ 404s, hangs, or the
+                    // killer's WebView throws.
+                    mNowCode = e.javaClass.simpleName.take(10)
+                    debugExtras.add("DEBUG v7 m-now ERR ${e.javaClass.simpleName}")
                 }
             } else {
-                debugExtras.add("DEBUG v6 m-now NONE")
+                debugExtras.add("DEBUG v7 m-now NONE")
             }
             // v5 (panel #5, H1): probe candidate AJAX resolver
             // endpoints — POST {"id": slug, "server": "earnvids"}
@@ -627,17 +700,21 @@ class Cima4yProvider : MainAPI() {
                         for (re in embedRegexes) re.findAll(rText.replace("\\/", "/")).forEach { embeds.add(it.value) }
                     }
                 } catch (e: Exception) {
-                    ajaxCodes.add("ERR")
-                    ajaxResults.add("$ep=ERR")
+                    // v7: record the exception class, not bare ERR.
+                    ajaxCodes.add(e.javaClass.simpleName.take(10))
+                    ajaxResults.add("$ep=ERR-${e.javaClass.simpleName.take(10)}")
                 }
             }
             // v6 (panel #5, Try 5): __hpv3 token exchange — parse
             // ts/n/p from the token block on THIS page and POST
             // it to /__hpv3/video. SKIP when no token is present.
+            // v7: keys may be UNQUOTED in the JS object literal
+            // ({v:3,p:"...",ts:123,n:"..."}), so the regex allows
+            // both quoted and unquoted keys.
             val hpv3Seg = if (hpv3Idx >= 0) htmlRaw.substring(hpv3Idx, minOf(htmlRaw.length, hpv3Idx + 600)) else ""
-            val tsVal = Regex("\"ts\"\\s*:\\s*\"?(\\d+)").find(hpv3Seg)?.groupValues?.get(1)
-            val nVal = Regex("\"n\"\\s*:\\s*\"([^\"]+)\"").find(hpv3Seg)?.groupValues?.get(1)
-            val pVal = Regex("\"p\"\\s*:\\s*\"([^\"]+)\"").find(hpv3Seg)?.groupValues?.get(1)
+            val tsVal = Regex("\"?ts\"?\\s*:\\s*\"?(\\d+)").find(hpv3Seg)?.groupValues?.get(1)
+            val nVal = Regex("\"?n\"?\\s*:\\s*\"([^\"]+)\"").find(hpv3Seg)?.groupValues?.get(1)
+            val pVal = Regex("\"?p\"?\\s*:\\s*\"([^\"]+)\"").find(hpv3Seg)?.groupValues?.get(1)
             if (tsVal != null && nVal != null && pVal != null) {
                 try {
                     val hJson = """{"v":3,"p":"$pVal","k":"video","ts":$tsVal,"n":"$nVal"}"""
@@ -658,15 +735,15 @@ class Cima4yProvider : MainAPI() {
                         for (re in embedRegexes) re.findAll(rText.replace("\\/", "/")).forEach { embeds.add(it.value) }
                     }
                 } catch (e: Exception) {
-                    ajaxCodes.add("h3:ERR")
-                    ajaxResults.add("__hpv3/video=ERR")
+                    ajaxCodes.add("h3:" + e.javaClass.simpleName.take(10))
+                    ajaxResults.add("__hpv3/video=ERR-${e.javaClass.simpleName.take(10)}")
                 }
             } else {
                 ajaxCodes.add("h3:SKIP")
                 ajaxResults.add("__hpv3/video=SKIP")
             }
             ajaxCodesStr = ajaxCodes.joinToString(",")
-            debugExtras.add("DEBUG v6 ajax=" + ajaxResults.joinToString(" | ").take(200))
+            debugExtras.add("DEBUG v7 ajax=" + ajaxResults.joinToString(" | ").take(200))
             embCount = embeds.size
             for (embed in embeds) {
                 try {
@@ -687,11 +764,12 @@ class Cima4yProvider : MainAPI() {
         // v6: the verdict lives in the title itself — ajax codes
         // (in probe order), Base64, /m/ code, script keywords,
         // script count, __hpv3 presence, player iframe src.
-        val verdict = "aj=$ajaxCodesStr b64=$b64Verdict m=$mNowCode kw=$kwHitsStr js=$scriptCount h3=$hpv3Present ifr=$playerIfr"
+        // v7: adds the scripts-grep verdict (sc=).
+        val verdict = "aj=$ajaxCodesStr b64=$b64Verdict m=$mNowCode kw=$kwHitsStr js=$scriptCount h3=$hpv3Present ifr=$playerIfr sc=$scriptVerdict"
         val debugName = if (emittedLinks == 0)
-            "DEBUG v6 | no-servers-on-site | page=$pageCode | emb=$embCount | ok=0 | $subDiag | $diag | $verdict $fetchErr"
+            "DEBUG v7 | no-servers-on-site | page=$pageCode | emb=$embCount | ok=0 | $subDiag | $diag | $verdict $fetchErr"
         else
-            "DEBUG v6 | play | page=$pageCode | emb=$embCount | ok=$emittedLinks | $subDiag | $diag | $verdict $fetchErr"
+            "DEBUG v7 | play | page=$pageCode | emb=$embCount | ok=$emittedLinks | $subDiag | $diag | $verdict $fetchErr"
         callback(
             newExtractorLink(
                 "Mux",

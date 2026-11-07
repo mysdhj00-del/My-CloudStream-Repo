@@ -221,7 +221,7 @@ class Cima4yProvider : MainAPI() {
             val items = mergeShowCards(cards)
             if (items.isEmpty()) {
                 val debugTitle =
-                    "DEBUG v1 home ${request.name} page=$page len=${doc.html().length} cards=0"
+                    "DEBUG v2 home ${request.name} page=$page len=${doc.html().length} cards=0"
                 return newHomePageResponse(
                     request.name,
                     listOf(newMovieSearchResponse(debugTitle, request.data, TvType.Movie) {}),
@@ -231,7 +231,7 @@ class Cima4yProvider : MainAPI() {
             newHomePageResponse(request.name, items, hasNext = cards.size >= 50)
         } catch (e: Exception) {
             val debugTitle =
-                "DEBUG v1 home ${request.name} page=$page err=${e.javaClass.simpleName}"
+                "DEBUG v2 home ${request.name} page=$page err=${e.javaClass.simpleName}"
             newHomePageResponse(
                 request.name,
                 listOf(newMovieSearchResponse(debugTitle, request.data, TvType.Movie) {}),
@@ -382,18 +382,71 @@ class Cima4yProvider : MainAPI() {
         var pageCode = 0
         var embCount = 0
         var emittedLinks = 0
+        // v2: diagnose WHAT the phone actually received — the v1
+        // on-device verdict (Tulsa E1) was page=200 emb=0, i.e.
+        // the watch page loaded but no embed URL matched. Either
+        // the page is a CF challenge page, the URLs are escaped /
+        // protocol-relative, or they live behind the player
+        // iframe (/m/ redirector) and JS. The diagnostics below
+        // make the next screenshot decisive.
+        var diag = ""
         val countingCallback: (ExtractorLink) -> Unit = { link ->
             emittedLinks++
             callback(link)
         }
         try {
-            val html = app.get(realData, headers = headers, interceptor = cloudflareKiller).text
+            val htmlRaw = app.get(realData, headers = headers, interceptor = cloudflareKiller).text
             pageCode = 200
+            val html = htmlRaw.replace("\\/", "/")
+            val isCf = htmlRaw.contains("Just a moment") ||
+                htmlRaw.contains("Turnstile") ||
+                htmlRaw.contains("challenge-platform")
+            val ifrCount = Regex("<iframe", RegexOption.IGNORE_CASE).findAll(htmlRaw).count()
+            val hostsFound = listOf(
+                "fastvid", "vinovo", "uqload", "byse", "voe", "ok.ru",
+                "doodstream", "playmogo", "luluvido", "m1xdrop", "mxdrop"
+            ).filter { htmlRaw.contains(it, ignoreCase = true) }
+            val mCount = Regex("cima4y\\.net/m/").findAll(htmlRaw).count()
+            diag = "len=${htmlRaw.length} cf=${if (isCf) 1 else 0} ifr=$ifrCount " +
+                "hosts=${hostsFound.joinToString(",").ifEmpty { "-" }} m=$mCount"
             val embeds = LinkedHashSet<String>()
             for (re in embedRegexes) re.findAll(html).forEach { embeds.add(it.value) }
             genericEmbedRegex.findAll(html).forEach {
                 val u = it.value
                 if (!u.contains("cima4y.net")) embeds.add(u)
+            }
+            // v2: protocol-relative embeds (//fastvid.cam/embed/...)
+            Regex("""//(?:www\.)?(?:fastvid\.cam|vinovo\.to|uqload\.(?:vc|is|to)|bysevepoin\.com|voe\.sx|ok\.ru|doodstream\.com|playmogo\.com|luluvido\.com|m1xdrop\.bz|mxdrop\.click)/(?:embed|e|videoembed)/[A-Za-z0-9_-]+(?:\.html)?""")
+                .findAll(html).forEach { embeds.add("https:" + it.value) }
+            // v2: follow the player iframe src — on the watch page
+            // it may be an /m/ redirector that only resolves
+            // inside the phone's CF-cleared session (from curl it
+            // 404s instantly, so the sandbox cannot prove it).
+            // If it IS an embed URL, take it directly; else scan
+            // the page it leads to for embeds.
+            val iframeSrc = Regex("""<iframe[^>]+(?:src|data-src)=["']([^"']+)["']""")
+                .find(htmlRaw)?.groupValues?.get(1)
+            if (!iframeSrc.isNullOrBlank()) {
+                try {
+                    val iframeUrl = when {
+                        iframeSrc.startsWith("http") -> iframeSrc
+                        iframeSrc.startsWith("//") -> "https:$iframeSrc"
+                        else -> mainUrl + iframeSrc
+                    }
+                    if (embedRegexes.any { it.containsMatchIn(iframeUrl) }) {
+                        embeds.add(iframeUrl)
+                    } else {
+                        val iframeHtml = app.get(
+                            iframeUrl, headers = headers, interceptor = cloudflareKiller
+                        ).text.replace("\\/", "/")
+                        for (re in embedRegexes) re.findAll(iframeHtml).forEach { embeds.add(it.value) }
+                        genericEmbedRegex.findAll(iframeHtml).forEach {
+                            val u = it.value
+                            if (!u.contains("cima4y.net")) embeds.add(u)
+                        }
+                    }
+                } catch (e: Exception) {
+                }
             }
             embCount = embeds.size
             for (embed in embeds) {
@@ -412,9 +465,9 @@ class Cima4yProvider : MainAPI() {
             // on the phone must mean loadLinks never ran, not silence.
         }
         val debugName = if (emittedLinks == 0)
-            "DEBUG v1 | no-servers-on-site | page=$pageCode | emb=$embCount | ok=0 | $subDiag"
+            "DEBUG v2 | no-servers-on-site | page=$pageCode | emb=$embCount | ok=0 | $subDiag | $diag"
         else
-            "DEBUG v1 | play | page=$pageCode | emb=$embCount | ok=$emittedLinks | $subDiag"
+            "DEBUG v2 | play | page=$pageCode | emb=$embCount | ok=$emittedLinks | $subDiag | $diag"
         callback(
             newExtractorLink(
                 "Mux",

@@ -252,7 +252,7 @@ class Cima4yProvider : MainAPI() {
             val items = mergeShowCards(cards)
             if (items.isEmpty()) {
                 val debugTitle =
-                    "DEBUG v9 home ${request.name} page=$page len=${doc.html().length} cards=0"
+                    "DEBUG v10 home ${request.name} page=$page len=${doc.html().length} cards=0"
                 return newHomePageResponse(
                     request.name,
                     listOf(newMovieSearchResponse(debugTitle, request.data, TvType.Movie) {}),
@@ -262,7 +262,7 @@ class Cima4yProvider : MainAPI() {
             newHomePageResponse(request.name, items, hasNext = cards.size >= 50)
         } catch (e: Exception) {
             val debugTitle =
-                "DEBUG v9 home ${request.name} page=$page err=${e.javaClass.simpleName}"
+                "DEBUG v10 home ${request.name} page=$page err=${e.javaClass.simpleName}"
             newHomePageResponse(
                 request.name,
                 listOf(newMovieSearchResponse(debugTitle, request.data, TvType.Movie) {}),
@@ -468,6 +468,15 @@ class Cima4yProvider : MainAPI() {
         var tokRaw = "-"
         var jsPaths = "-"
         var btnTag = "-"
+        // v10: the v9 title CRACKED it — the token is a base64
+        // JSON used as a PATH (/__hpv3/video/<b64>), not a JSON
+        // block. Fetch that URL as a GET; also exfiltrate the
+        // INLINE script's fetch( call and __hpv3 usage (the 3
+        // external scripts are just gtag + jquery + CF beacon).
+        var h3gCode = "-"
+        var tokJson = "-"
+        var ifxCtx = "-"
+        var iusCtx = "-"
         val debugExtras = ArrayList<String>()
         val countingCallback: (ExtractorLink) -> Unit = { link ->
             emittedLinks++
@@ -501,7 +510,7 @@ class Cima4yProvider : MainAPI() {
             // v3 exfiltration 1: every iframe src on the watch page.
             val iframeSrcs = Regex("""<iframe[^>]+(?:src|data-src)=["']([^"']+)["']""")
                 .findAll(htmlRaw).map { it.groupValues[1] }.toList()
-            debugExtras.add("DEBUG v9 iframes=" + iframeSrcs.joinToString(",").take(180).ifEmpty { "-" })
+            debugExtras.add("DEBUG v10 iframes=" + iframeSrcs.joinToString(",").take(180).ifEmpty { "-" })
             // v6: the player iframe (not the CF 1x1) is the one
             // whose /m/ link matters — keep it for the title line.
             playerIfr = iframeSrcs.firstOrNull {
@@ -513,9 +522,9 @@ class Cima4yProvider : MainAPI() {
             if (srvIdx != null) {
                 val snip = htmlRaw.substring(maxOf(0, srvIdx - 60), minOf(htmlRaw.length, srvIdx + 140))
                     .replace(Regex("""\s+"""), " ").trim()
-                debugExtras.add("DEBUG v9 srv=" + snip.take(200))
+                debugExtras.add("DEBUG v10 srv=" + snip.take(200))
             } else {
-                debugExtras.add("DEBUG v9 srv=NONE")
+                debugExtras.add("DEBUG v10 srv=NONE")
             }
             // v5 (panel #5): the panel's top diagnostics — which
             // script keywords are in the page, every <script src>,
@@ -526,7 +535,7 @@ class Cima4yProvider : MainAPI() {
                 "embed_url", "atob", "decode", "fromCharCode", "__hpv3"
             ).filter { htmlRaw.contains(it, ignoreCase = true) }
             kwHitsStr = kwHits.joinToString(",").take(40).ifEmpty { "-" }
-            debugExtras.add("DEBUG v9 kw=" + kwHits.joinToString(",").take(180).ifEmpty { "-" })
+            debugExtras.add("DEBUG v10 kw=" + kwHits.joinToString(",").take(180).ifEmpty { "-" })
             val scriptSrcs = Regex("""<script[^>]+src=["']([^"']+)["']""")
                 .findAll(htmlRaw).map { it.groupValues[1] }.toList()
             scriptCount = scriptSrcs.size
@@ -536,11 +545,11 @@ class Cima4yProvider : MainAPI() {
             debugExtras.add("DEBUG v9 scripts=" + scriptSrcs.joinToString(",").take(180).ifEmpty { "-" })
             val hiddenInputs = Regex("""<input[^>]+type=["']hidden["'][^>]*>""", RegexOption.IGNORE_CASE)
                 .findAll(htmlRaw).map { it.value.take(120) }.toList()
-            debugExtras.add("DEBUG v9 hidden=" + hiddenInputs.joinToString(" | ").take(200).ifEmpty { "-" })
+            debugExtras.add("DEBUG v10 hidden=" + hiddenInputs.joinToString(" | ").take(200).ifEmpty { "-" })
             val hpv3Idx = htmlRaw.indexOf("__hpv3")
             hpv3Present = if (hpv3Idx >= 0) 1 else 0
             if (hpv3Idx >= 0) {
-                debugExtras.add("DEBUG v9 hpv3=" + htmlRaw.substring(hpv3Idx, minOf(htmlRaw.length, hpv3Idx + 220))
+                debugExtras.add("DEBUG v10 hpv3=" + htmlRaw.substring(hpv3Idx, minOf(htmlRaw.length, hpv3Idx + 220))
                     .replace(Regex("""\s+"""), " ").take(220))
                 // v9: the token PARSE keeps failing (tok=-) —
                 // carry the RAW block in the title so it can be
@@ -555,9 +564,9 @@ class Cima4yProvider : MainAPI() {
                 if (hpv3Token.isEmpty()) {
                     hpv3Token = Regex("""["']__hpv3["']\s*:\s*["']([^"']+)["']""").find(seg)?.groupValues?.get(1).orEmpty()
                 }
-                debugExtras.add("DEBUG v9 hpv3tok=" + hpv3Token.take(24).ifEmpty { "-" })
+                debugExtras.add("DEBUG v10 hpv3tok=" + hpv3Token.take(24).ifEmpty { "-" })
             } else {
-                debugExtras.add("DEBUG v9 hpv3=NONE")
+                debugExtras.add("DEBUG v10 hpv3=NONE")
             }
             // v9: the server button's OWN tag — every attribute
             // on it (data-*, onclick, ids) — by walking back
@@ -571,7 +580,24 @@ class Cima4yProvider : MainAPI() {
                         .replace(Regex("""\s+"""), " ").trim().take(180)
                 }
             }
-            debugExtras.add("DEBUG v9 btn=" + btnTag)
+            debugExtras.add("DEBUG v10 btn=" + btnTag)
+            // v10: the resolver may be INLINE in the watch page
+            // (the 3 external scripts are gtag + jquery +
+            // cloudflareinsights — none is a custom bundle).
+            // Capture the fetch( call and the __hpv3 usage from
+            // the HTML itself.
+            val fxInlineIdx = htmlRaw.indexOf("fetch(").takeIf { it >= 0 }
+            if (fxInlineIdx != null) {
+                ifxCtx = htmlRaw.substring(fxInlineIdx, minOf(htmlRaw.length, fxInlineIdx + 150))
+                    .replace(Regex("""\s+"""), " ").trim().take(150)
+            }
+            val hpv3SecondIdx = htmlRaw.indexOf("__hpv3", hpv3Idx + 6).takeIf { it >= 0 }
+            if (hpv3SecondIdx != null) {
+                iusCtx = htmlRaw.substring(maxOf(0, hpv3SecondIdx - 40), minOf(htmlRaw.length, hpv3SecondIdx + 110))
+                    .replace(Regex("""\s+"""), " ").trim().take(150)
+            }
+            debugExtras.add("DEBUG v10 ifx=" + ifxCtx)
+            debugExtras.add("DEBUG v10 ius=" + iusCtx)
             // v7: the endpoint path is NOT in the HTML (kw has
             // fetch( + XMLHttpRequest + __hpv3 but no /ajax/ or
             // /api/ or getEmbed) — it must live in one of the
@@ -659,12 +685,12 @@ class Cima4yProvider : MainAPI() {
             }
             scriptVerdict = scriptHits.joinToString(";").take(120).ifEmpty { "-" }
             handlerVerdict = handlerCandidates.distinct().joinToString(",").take(80).ifEmpty { "-" }
-            debugExtras.add("DEBUG v9 scripts-grep=" + scriptVerdict)
-            debugExtras.add("DEBUG v9 handler=" + handlerVerdict)
-            debugExtras.add("DEBUG v9 sv=" + svCtx)
-            debugExtras.add("DEBUG v9 fx=" + fxCtx)
-            debugExtras.add("DEBUG v9 tokraw=" + tokRaw)
-            debugExtras.add("DEBUG v9 jsp=" + jsPaths)
+            debugExtras.add("DEBUG v10 scripts-grep=" + scriptVerdict)
+            debugExtras.add("DEBUG v10 handler=" + handlerVerdict)
+            debugExtras.add("DEBUG v10 sv=" + svCtx)
+            debugExtras.add("DEBUG v10 fx=" + fxCtx)
+            debugExtras.add("DEBUG v10 tokraw=" + tokRaw)
+            debugExtras.add("DEBUG v10 jsp=" + jsPaths)
             for (re in embedRegexes) re.findAll(html).forEach { embeds.add(it.value) }
             genericEmbedRegex.findAll(html).forEach {
                 val u = it.value
@@ -727,12 +753,12 @@ class Cima4yProvider : MainAPI() {
                 .filter { htmlRaw.contains(it, ignoreCase = true) }
             if (b64Hit.isNotEmpty()) {
                 b64Verdict = "HIT"
-                debugExtras.add("DEBUG v9 b64=" + b64Hit.replace(Regex("""\s+"""), " ").take(200))
+                debugExtras.add("DEBUG v10 b64=" + b64Hit.replace(Regex("""\s+"""), " ").take(200))
                 for (re in embedRegexes) re.findAll(b64Hit).forEach { embeds.add(it.value) }
             } else if (revHit.isNotEmpty()) {
-                debugExtras.add("DEBUG v9 rev=" + revHit.joinToString(","))
+                debugExtras.add("DEBUG v10 rev=" + revHit.joinToString(","))
             } else {
-                debugExtras.add("DEBUG v9 b64=NONE")
+                debugExtras.add("DEBUG v10 b64=NONE")
             }
             // v6 (panel #5, H3): fetch the PLAYER iframe's /m/
             // link first — v5 fetched the first /m/ in document
@@ -784,7 +810,7 @@ class Cima4yProvider : MainAPI() {
                         else -> "OPAQUE-HTML"
                     }
                     mNowCode = "${mResp.code}:$mVerdict"
-                    debugExtras.add("DEBUG v9 m-now code=${mResp.code} verdict=$mVerdict len=${mBody.length} head=" +
+                    debugExtras.add("DEBUG v10 m-now code=${mResp.code} verdict=$mVerdict len=${mBody.length} head=" +
                         mBody.take(80).replace(Regex("""\s+"""), " "))
                     for (re in embedRegexes) re.findAll(mBody).forEach { embeds.add(it.value) }
                     genericEmbedRegex.findAll(mBody).forEach {
@@ -796,10 +822,10 @@ class Cima4yProvider : MainAPI() {
                     // ERR hid whether /m/ 404s, hangs, or the
                     // killer's WebView throws.
                     mNowCode = e.javaClass.simpleName.take(10)
-                    debugExtras.add("DEBUG v9 m-now ERR ${e.javaClass.simpleName}")
+                    debugExtras.add("DEBUG v10 m-now ERR ${e.javaClass.simpleName}")
                 }
             } else {
-                debugExtras.add("DEBUG v9 m-now NONE")
+                debugExtras.add("DEBUG v10 m-now NONE")
             }
             // v8 (panel #6): the v5 probes are re-run with the
             // two fixes the panel flagged — ASCII Referer (the
@@ -883,6 +909,49 @@ class Cima4yProvider : MainAPI() {
             // headline probe) — its code sits in ajaxCodes at
             // index 4; surface it as svr= in the title.
             svrCode = ajaxCodes.getOrNull(4) ?: "-"
+            // v10: BREAKTHROUGH from the v9 title — the token
+            // is NOT a JSON block in the HTML; it is a base64
+            // JSON used as a PATH: /__hpv3/video/<b64> (decoded
+            // in the sandbox: {"v":3,"p":"/watch/<slug>",...}).
+            // The v6/v8 probes POSTed JSON to /__hpv3/video —
+            // the wrong method AND the wrong path. Fetch the URL
+            // the page itself contains, as a GET, in-session.
+            val hpv3FullToken = Regex("""__hpv3/video/([A-Za-z0-9+/=_.-]+)""")
+                .find(htmlRaw)?.groupValues?.get(1).orEmpty().trimEnd('.')
+            if (hpv3FullToken.isNotEmpty()) {
+                try {
+                    val padded = hpv3FullToken + "=".repeat((4 - hpv3FullToken.length % 4) % 4)
+                    tokJson = try {
+                        String(Base64.decode(padded, Base64.DEFAULT), Charsets.UTF_8)
+                            .replace(Regex("""\s+"""), " ").trim().take(120)
+                    } catch (e: Exception) { "DECODE-ERR" }
+                    val hUrl = mainUrl + "/__hpv3/video/" + hpv3FullToken
+                    val hHeaders = headers + mapOf("Accept" to "*/*") +
+                        (sessionCookieHeader().takeIf { it.isNotEmpty() }?.let { mapOf("Cookie" to it) } ?: emptyMap())
+                    val hResp = try {
+                        app.get(hUrl, headers = hHeaders, referer = asciiUrl(realData))
+                    } catch (e: Exception) {
+                        app.get(hUrl, headers = hHeaders, referer = asciiUrl(realData), interceptor = cloudflareKiller)
+                    }
+                    val hBody = hResp.text.replace("\\/", "/")
+                    val hCt = hResp.headers["Content-Type"].orEmpty().take(30)
+                    h3gCode = "${hResp.code}:$hCt:${hBody.take(200).replace(Regex("""\s+"""), " ").trim()}"
+                    debugExtras.add("DEBUG v10 h3get code=${hResp.code} ct=$hCt len=${hBody.length} head=" + hBody.take(200).replace(Regex("""\s+"""), " ").trim())
+                    for (re in embedRegexes) re.findAll(hBody).forEach { embeds.add(it.value) }
+                    genericEmbedRegex.findAll(hBody).forEach {
+                        val u = it.value
+                        if (!u.contains("cima4y.net")) embeds.add(u)
+                    }
+                    val embField = Regex(""""(?:embed|url|src)"\s*:\s*"([^"]+)"""").find(hBody)?.groupValues?.get(1)
+                    if (embField != null && embedRegexes.any { it.containsMatchIn(embField) }) embeds.add(embField)
+                } catch (e: Exception) {
+                    h3gCode = e.javaClass.simpleName.take(10)
+                    debugExtras.add("DEBUG v10 h3get ERR ${e.javaClass.simpleName}")
+                }
+            } else {
+                h3gCode = "NO-TOK"
+                debugExtras.add("DEBUG v10 h3get NO-TOK")
+            }
             // v6 (panel #5, Try 5): __hpv3 token exchange — parse
             // ts/n/p from the token block on THIS page and POST
             // it to /__hpv3/video. SKIP when no token is present.
@@ -918,7 +987,7 @@ class Cima4yProvider : MainAPI() {
                 ajaxResults.add("__hpv3/video=SKIP")
             }
             ajaxCodesStr = ajaxCodes.joinToString(",")
-            debugExtras.add("DEBUG v9 ajax=" + ajaxResults.joinToString(" | ").take(200))
+            debugExtras.add("DEBUG v10 ajax=" + ajaxResults.joinToString(" | ").take(200))
             embCount = embeds.size
             for (embed in embeds) {
                 try {
@@ -948,11 +1017,16 @@ class Cima4yProvider : MainAPI() {
         // the CODE itself: sv= (server-name context in the
         // script), fx= (the fetch( call), tok= (raw __hpv3
         // block), jsp= (script paths), btn= (server button tag).
-        val verdict = "aj=$ajaxCodesStr v2p=$v2pCode svr=$svrCode b64=$b64Verdict m=$mNowCode kw=$kwHitsStr js=$scriptCount h3=$hpv3Present tok=${hpv3Token.take(12).ifEmpty { "-" }} ifr=$playerIfr sc=$scriptVerdict handler=$handlerVerdict sv=$svCtx fx=$fxCtx tok=$tokRaw jsp=$jsPaths btn=$btnTag"
+        // v10: the v9 title cracked the token — it is a base64
+        // JSON used as a PATH. h3g= is the GET of that URL
+        // (code:content-type:body head); tokj= the decoded
+        // token JSON; ifx=/ius= the inline script's fetch( call
+        // and __hpv3 usage.
+        val verdict = "aj=$ajaxCodesStr v2p=$v2pCode svr=$svrCode b64=$b64Verdict m=$mNowCode kw=$kwHitsStr js=$scriptCount h3=$hpv3Present tok=${hpv3Token.take(12).ifEmpty { "-" }} ifr=$playerIfr sc=$scriptVerdict handler=$handlerVerdict sv=$svCtx fx=$fxCtx tok=$tokRaw jsp=$jsPaths btn=$btnTag h3g=$h3gCode tokj=$tokJson ifx=$ifxCtx ius=$iusCtx"
         val debugName = if (emittedLinks == 0)
-            "DEBUG v9 | no-servers-on-site | page=$pageCode | emb=$embCount | ok=0 | $subDiag | $diag | $verdict $fetchErr"
+            "DEBUG v10 | no-servers-on-site | page=$pageCode | emb=$embCount | ok=0 | $subDiag | $diag | $verdict $fetchErr"
         else
-            "DEBUG v9 | play | page=$pageCode | emb=$embCount | ok=$emittedLinks | $subDiag | $diag | $verdict $fetchErr"
+            "DEBUG v10 | play | page=$pageCode | emb=$embCount | ok=$emittedLinks | $subDiag | $diag | $verdict $fetchErr"
         callback(
             newExtractorLink(
                 "Mux",

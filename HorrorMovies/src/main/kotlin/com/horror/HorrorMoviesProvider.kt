@@ -52,16 +52,31 @@ import org.jsoup.nodes.Document
  * - TOPCINEMA (topcinema.film → topcinemaa.vip): /genre/رعب/ renders
  *   a.recent--block cards. Watch page /watch/ lists li.server--item
  *   (data-id, data-server) → POST Single/Server.php → iframe.
- *   v8 FIX: the POST must go to the SAME host as the watch page
- *   (topcinemaa.vip) — posting to topcinema.film returns an EMPTY
- *   iframe src (verified live 2026-11-07). Only host served is
- *   down.vidtube.one, unreachable from datacenter IPs (sandbox:
- *   ChunkedEncodingError / 403) — lane is extractor-dependent,
- *   unproven in the sandbox.
+ *   v9 FIX (the v8 bug — user report 2026-11-08 "توب سينما لا تعمل"):
+ *   v8 built the POST URL from watchUrl minus "/watch/" — the FILM
+ *   URL — so the POST went to <film-slug>/wp-content/.../Server.php
+ *   and came back HTTP 301 + EMPTY body; all 10 server POSTs were
+ *   silently skipped and only the single vidtube iframe survived
+ *   (no stock extractor + CF-403). v9 POSTs to the watch page's
+ *   ORIGIN (site root), verified live 2026-11-08: 10/10 servers
+ *   return a real iframe. Resolvers: stock extractors StreamWish,
+ *   Doodstream, Byse, Firestream, Streamtape; packed-JS digs
+ *   OkStream + LuluStream (both yield direct tokenized m3u8s).
+ *   VidTube has NO stock extractor and is CF-403 from the sandbox;
+ *   UpDown + Filelions unproven — not needed, 7 paths is plenty.
  * - AFLAMSTREAM (aflamstream.com): /category/أفلام-رعب-… renders
  *   div.ht_grid_1_4 cards; post id → /watch/?id={id} →
  *   .server-btn[data-url] (luluvido + nuvorel direct m3u8s verified
- *   live 2026-11-07, 3/3 films).
+ *   live 2026-11-07, 3/3 films). v9 re-check (2026-11-08, user
+ *   report "أفلام ستريم لا تعمل"): 3 films (Apocalypse Z 14219,
+ *   Crawlers 14314, Beware Boiuna 14310) all carry the SAME 4
+ *   servers (nuvorel, luluvido, playmogo, streamtape); nuvorel
+ *   master.m3u8 → HTTP 200 (2,242 B) and luluvido unpacked
+ *   master.m3u8 → HTTP 200 — the chain is ALIVE from the sandbox
+ *   and NOT reproducible as broken here. If v9 still fails
+ *   on-device, the DEBUG line (srv=/ext=/dig=/relay=) pinpoints it:
+ *   srv=0 means the watch fetch failed; srv=4 ext=0 dig=0 means
+ *   the embeds all failed on the phone (extractor/CF per-host).
  * - CIMA4Y (cima4y.net): HELD OUT of v8 (2026-11-07 12:06).
  *   The horror source itself is real — /category/افلام-اجنبي?genre=رعب
  *   serves 50 FILM cards/page (all /film/, 0 episodes), &page=N
@@ -96,16 +111,19 @@ import org.jsoup.nodes.Document
  * (p1: 11 films of 30; p2-p5: 0 films; p10+: films again), so
  * unfiltered cards showed episode posts as "films".
  *
- * CENSUS (v8, live 2026-11-07, REAL direct links only):
+ * CENSUS (v9, live 2026-11-08, REAL direct links only):
  * moviz 3/3 alive (vidspeed packed-unpack m3u8; +uqload once),
  * eg 3/3 alive (1vid packed-unpack m3u8), af 3/3 alive
- * (nuvorel direct m3u8 + luluvido packed-unpack m3u8),
+ * (nuvorel direct m3u8 → 200; luluvido packed-unpack m3u8 → 200;
+ * +playmogo/doodstream +streamtape via stock extractors),
  * lar 0/3 direct-in-sandbox (13-19 embeds: mixdrop/doodstream/
  * share4max — MixDrop URL lives in MDCore.wurl, only the
  * CloudStream extractor resolves it; doodstream 403s from the
- * sandbox), top 0/3 direct-in-sandbox (1 vidtube embed each,
- * unreachable), myc 0 cards (403 CF), cima4y watch pages
- * connection-reset from the sandbox (CF Turnstile).
+ * sandbox), top 10/10 Server.php POSTs return a real iframe at
+ * the site ROOT (v8's slug-path POST 301s empty — THE v8 BUG);
+ * okstream + luluvdo packed-unpack m3u8s verified; myc 0 cards
+ * (403 CF), cima4y watch pages connection-reset from the sandbox
+ * (CF Turnstile).
  *
  * SPEED (his standing order): every loadLinks runs on a wall-clock
  * budget — extractors fastest-first, capped links, digs capped,
@@ -762,7 +780,7 @@ class HorrorMoviesProvider : MainAPI() {
     // ---------------------------------------------------------------
     private val priorityHosts = listOf(
         "mixdrop", "hgcloud", "streamhg", "vidmoly", "byse", "doodstream",
-        "streamwish", "uqload", "voe", "filemoon", "vidhide", "earnvids"
+        "streamwish", "streamtape", "uqload", "voe", "filemoon", "vidhide", "earnvids"
     )
 
     override suspend fun loadLinks(
@@ -834,7 +852,7 @@ class HorrorMoviesProvider : MainAPI() {
         }
         if (emitted == 0 && allowDebug) {
             emitDebug(
-                listOf("Horror·$lane", "srv=${embeds.size}", "ext=$extOk",
+                listOf("Horror v9·$lane", "srv=${embeds.size}", "ext=$extOk",
                     "dig=$digOk", "relay=$relayOk", "t=${elapsed() / 1000}s"),
                 callback
             )
@@ -1227,11 +1245,26 @@ class HorrorMoviesProvider : MainAPI() {
                 items += id to idx
             }
         }
-        // v8: POST to the SAME host as the watch page — posting to
-        // topcinema.film returns an empty iframe src, while the
-        // watch-page host (topcinemaa.vip) returns the real embed
-        // (verified live 2026-11-07).
-        val postBase = watchUrl.substringBefore("/watch/").trimEnd('/')
+        // v9 FIX: POST to the watch page's ORIGIN (scheme + host).
+        // v8 built postBase as watchUrl minus "/watch/" — that is the
+        // FILM URL, so the POST went to
+        // https://topcinemaa.vip/<film-slug>/wp-content/.../Server.php
+        // and came back HTTP 301 with an EMPTY body — all 10 server
+        // POSTs silently skipped, leaving only the single vidtube
+        // iframe from the page itself (no stock extractor + CF-403
+        // from the sandbox). That is why TopCinema played NOTHING
+        // on-device. The POST must go to the site ROOT:
+        // https://topcinemaa.vip/wp-content/.../Server.php
+        // (verified live 2026-11-08: 10/10 servers return a real
+        // iframe: VideoTube, OkStream, UpDown, StreamWish, Doodstream,
+        // Filelions, Byse, Firestream, Streamtape, LuluStream).
+        // Origin is taken from the fetched page's final URL
+        // (doc.baseUri, after redirects) so a future domain move
+        // needs no code change.
+        val finalWatchUrl = doc.baseUri().ifBlank { watchUrl }
+        val postBase = Regex("""^(https?://[^/]+)""").find(finalWatchUrl)
+            ?.groupValues?.get(1)
+            ?: "https://topcinemaa.vip"
         if (postId != null) {
             for ((id, idx) in items) {
                 if (elapsed() > 12000) break

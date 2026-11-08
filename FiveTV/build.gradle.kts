@@ -1,12 +1,12 @@
 // FiveTV CloudStream plugin module.
-version = 1
+version = 2
 
 android {
     namespace = "com.fivetv"
 }
 
 cloudstream {
-    description = "FiveTV (فايف تي في) - أفلام ومسلسلات مترجمة من 5TV: أحدث الحلقات والإضافات والأفلام، مع بحث كامل"
+    description = "FiveTV (فايف تي في) - أفلام ومسلسلات مترجمة من 5TV: أفلام أجنبية، الدراما اليابانية، الأفلام الصينية، الأفلام الكورية، الدراما الكورية، وأحدث الحلقات والإضافات والأفلام، مع بحث كامل"
     authors = listOf("Saher")
 
     /**

@@ -27,16 +27,35 @@ import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 
 /**
- * FiveTV (فايف تي في) v1 — CATALOG-FIRST.
+ * FiveTV (فايف تي في) v2 — CATALOG-FIRST.
  *
  * Site: https://new61.5tv.lol — Arabic RTL dark UI, movies + TV series,
  * heavy Asian drama (Korean, Chinese, Japanese, Thai, Taiwanese,
- * Turkish) + foreign movies/series. No live TV, no explicit anime
- * section. No login needed for browsing or old films.
+ * Turkish) + foreign movies/series. No live TV. No login needed for
+ * browsing or old films (but see the VIP redirect note below).
  *
  * URL model (verified live in a real browser, 2026-11-08):
  * - Lists: /latest-episodes/ (56,014 episodes, 1,167 pages),
  *   /latest-additions/, /latest-movies/.
+ * - Home sections (v2): the FIVE sections the user sent himself
+ *   (2026-11-08 13:56-14:01, authoritative — they supersede the
+ *   six sections a browser study had found earlier):
+ *   أفلام أجنبية /category/الأفلام-الأجنبية/ (45 pages, verified),
+ *   الدراما اليابانية /category/الدراما-اليابانية/ (sent with
+ *   /page/14/ — the base is used, pagination appends /page/N/),
+ *   الأفلام الصينية /category/الأفلام-الصينية/,
+ *   الأفلام الكورية /category/الأفلام-الكورية/,
+ *   الدراما الكورية /category/الدراما-الكورية/.
+ *   Below them, the three v1 latest lanes
+ *   (/latest-episodes/, /latest-additions/, /latest-movies/).
+ * - Pagination is /page/N/ on ALL sections (verified on category
+ *   pages; the site appends ?ftv_vip_checked=1 itself — the
+ *   provider never adds it).
+ * - SIDEWAYS SCROLL SHOWS ALL PAGES (his explicit order, v2):
+ *   a lane ends ONLY when a page brings zero NEW cards.
+ *   Cards are deduped by URL across pages, so a past-the-end
+ *   page that clamps to the last page yields zero new cards and
+ *   the lane stops — no fixed page cap anywhere.
  * - Movie detail: /movie/<slug>-<year>/ (e.g. Batman Begins 2005).
  *   Shows poster + backdrop, Arabic+English title, year, duration
  *   (2h 20m), quality HD 1080p, language, country, genres, a full
@@ -96,15 +115,16 @@ import org.jsoup.nodes.Document
  * never a crash. Old films/episodes are free.
  *
  * UNVERIFIED ASSUMPTIONS (phone test decides, flagged honestly):
- * - List pagination "?page=N" was never reported by the study
- *   browser — the phone test (scroll a lane to its end) confirms
- *   or refutes it. hasNext is capped by numbered pagination links
- *   when present, else by the lane cap (ep: 1,167 documented).
+ * - /page/N/ pagination was verified on category pages only; on
+ *   the latest lanes it is assumed from the same site-wide
+ *   pattern — the phone test (scroll a lane to its end) confirms
+ *   or refutes it. If a lane clamps past-the-end pages to page 1,
+ *   the cross-page dedupe still ends the lane cleanly.
  * - Card/series/episode selectors are GENERIC and anchor-based on
  *   the documented URL model (/movie/, /series/, /episode/) — no
  *   CSS class names were invented. Season is always 1 in v1 (the
  *   study saw numbered episodes only, no season marker).
- * - No subtitle gear in v1 (a later version can port the shared
+ * - No subtitle gear in v2 (a later version can port the shared
  *   auto-English gear once playback is proven).
  */
 class FiveTVProvider : MainAPI() {
@@ -132,7 +152,13 @@ class FiveTVProvider : MainAPI() {
 
     private val cloudflareKiller by lazy { CloudflareKiller() }
 
+    // The five user-sent sections first, then the three v1 latest lanes.
     override val mainPage = mainPageOf(
+        "af:$mainUrl/category/%d8%a7%d9%84%d8%a3%d9%81%d9%84%d8%a7%d9%85-%d8%a7%d9%84%d8%a3%d8%ac%d9%86%d8%a8%d9%8a%d8%a9/" to "أفلام أجنبية — فايف تي في",
+        "jd:$mainUrl/category/%d8%a7%d9%84%d8%af%d8%b1%d8%a7%d9%85%d8%a7-%d8%a7%d9%84%d9%8a%d8%a7%d8%a8%d8%a7%d9%86%d9%8a%d8%a9/" to "الدراما اليابانية — فايف تي في",
+        "cf:$mainUrl/category/%d8%a7%d9%84%d8%a3%d9%81%d9%84%d8%a7%d9%85-%d8%a7%d9%84%d8%b5%d9%8a%d9%86%d9%8a%d8%a9/" to "الأفلام الصينية — فايف تي في",
+        "kf:$mainUrl/category/%d8%a7%d9%84%d8%a3%d9%81%d9%84%d8%a7%d9%85-%d8%a7%d9%84%d9%83%d9%88%d8%b1%d9%8a%d8%a9/" to "الأفلام الكورية — فايف تي في",
+        "kd:$mainUrl/category/%d8%a7%d9%84%d8%af%d8%b1%d8%a7%d9%85%d8%a7-%d8%a7%d9%84%d9%83%d9%88%d8%b1%d9%8a%d8%a9/" to "الدراما الكورية — فايف تي في",
         "ep:$mainUrl/latest-episodes/" to "أحدث الحلقات — فايف تي في",
         "add:$mainUrl/latest-additions/" to "أحدث الإضافات — فايف تي في",
         "mov:$mainUrl/latest-movies/" to "أحدث الأفلام — فايف تي في"
@@ -244,6 +270,10 @@ class FiveTVProvider : MainAPI() {
         return first
     }
 
+    // Cross-page card dedupe per lane: a past-the-end page that
+    // clamps to the last page must not loop the lane forever.
+    private val laneSeen = HashMap<String, MutableSet<String>>()
+
     // ---------------------------------------------------------------
     // Home
     // ---------------------------------------------------------------
@@ -251,28 +281,26 @@ class FiveTVProvider : MainAPI() {
         page: Int,
         request: MainPageRequest
     ): HomePageResponse {
-        val (lane, base) = request.data.split(":", limit = 2)
-        // Pagination "?page=N" is UNVERIFIED (see KDoc) — the phone
-        // test confirms or refutes it.
-        val url = if (page <= 1) base else base + "?page=$page"
+        val (_, base) = request.data.split(":", limit = 2)
+        // Pagination is /page/N/ on every section (verified on
+        // category pages). The base always ends with "/".
+        val url = if (page <= 1) base else base + "page/$page/"
         val doc = getDoc(url) ?: return newHomePageResponse(emptyList(), false)
+        // VIP redirect: a section that needs VIP lands on
+        // ur5ive.vip/login — no cards, no crash, lane ends.
+        val loc = doc.location().lowercase()
+        if (loc.contains("ur5ive.vip") || loc.contains("/login") ||
+            doc.text().contains("مخصصة فقط لمشتركي")
+        ) return newHomePageResponse(emptyList(), false)
         val cards = parseCards(doc)
-        val maxPage = doc.select("a[href]").mapNotNull { a ->
-            if (a.text().trim().toIntOrNull() == null) return@mapNotNull null
-            val href = a.attr("href")
-            (Regex("""[?&]page=(\d+)""").find(href)?.groupValues?.get(1)
-                ?: Regex("""/page/(\d+)/""").find(href)?.groupValues?.get(1))
-                ?.toIntOrNull()
-        }.maxOrNull()
-        val laneCap = when (lane) {
-            "ep" -> 1167 // documented: /latest-episodes/ = 1,167 pages
-            else -> 100
-        }
-        val cap = maxPage ?: laneCap
-        val hasNext = cards.isNotEmpty() && page < cap
+        // A lane ends ONLY when a page brings zero NEW cards —
+        // never a fixed page cap, never after page 1. A clamped
+        // past-the-end page yields zero new cards via this dedupe.
+        val seen = laneSeen.getOrPut(request.data) { LinkedHashSet() }
+        val fresh = cards.filter { seen.add(it.url) }
         return newHomePageResponse(
-            listOf(HomePageList(request.name, cards, isHorizontalImages = true)),
-            hasNext
+            listOf(HomePageList(request.name, fresh, isHorizontalImages = true)),
+            fresh.isNotEmpty()
         )
     }
 
@@ -608,7 +636,7 @@ class FiveTVProvider : MainAPI() {
         fun elapsed() = System.currentTimeMillis() - t0
         val doc = getDoc(data, referer = "$mainUrl/")
         if (doc == null) {
-            emitDebug(listOf("FiveTV v1", "page-fail", "gate?"), callback)
+            emitDebug(listOf("FiveTV v2", "page-fail", "gate?"), callback)
             return true
         }
         val pageText = doc.text()
@@ -717,7 +745,7 @@ class FiveTVProvider : MainAPI() {
         }
         if (emitted == 0 && allowDebug) {
             emitDebug(
-                listOf("FiveTV v1") + diagExtra +
+                listOf("FiveTV v2") + diagExtra +
                     listOf("srv=${embeds.size}", "ext=$extOk",
                         "dig=$digOk", "relay=$relayOk", "t=${elapsed() / 1000}s"),
                 callback

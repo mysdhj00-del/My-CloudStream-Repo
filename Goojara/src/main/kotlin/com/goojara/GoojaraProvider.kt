@@ -22,13 +22,26 @@ import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.loadExtractor
 import com.lagradost.cloudstream3.utils.newExtractorLink
+import android.annotation.SuppressLint
+import android.content.Context
+import android.os.Handler
+import android.os.Looper
+import android.webkit.CookieManager
+import android.webkit.WebResourceRequest
+import android.webkit.WebView
+import android.webkit.WebViewClient
+import com.lagradost.api.getContext
+import java.util.Collections
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import org.json.JSONObject
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
+import org.jsoup.select.Elements
 
 /**
- * Goojara provider for CloudStream 3 — v3, CATALOG-FIRST.
+ * Goojara provider for CloudStream 3 — v4, CATALOG-FIRST.
  *
  * Site: https://ww1.goojara.to — movies + TV series, English
  * titles, no login needed for browsing. Traced live from the
@@ -382,6 +395,140 @@ class GoojaraProvider : MainAPI() {
 
     // ---------- loadLinks ----------
 
+    // ---- Hidden-WebView session (v4) ---------------------------------
+    // The panel's convergent answer to the go.php lock: go.php 404s
+    // for plain HTTP because the session cookie is minted by the
+    // site's JavaScript (document.cookie), which no HTTP client
+    // ever sees. So load the detail page in a hidden WebView on
+    // the main thread, let the JS run, read the cookies from
+    // CookieManager, and replay go.php with them. If that still
+    // 404s, load a go.php link inside the WebView and capture the
+    // final video-host URL from its navigation.
+    // Pattern copied from the app's own WebViewResolver:
+    // WebView(getContext() as Context) on the main thread,
+    // javaScriptEnabled + domStorageEnabled, CookieManager for
+    // cookies. Plugin code must NOT use coroutine builders (CI
+    // law), so main-thread work uses Handler + CountDownLatch.
+
+    /** Run [block] on the main thread, wait up to [timeoutMs]. */
+    private fun runOnMain(timeoutMs: Long, block: () -> Unit): Boolean {
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            runCatching { block() }
+            return true
+        }
+        val latch = CountDownLatch(1)
+        Handler(Looper.getMainLooper()).post {
+            try {
+                block()
+            } catch (e: Exception) {
+            } finally {
+                latch.countDown()
+            }
+        }
+        return latch.await(timeoutMs, TimeUnit.MILLISECONDS)
+    }
+
+    private fun isOutsideGoojara(url: String): Boolean {
+        if (!url.startsWith("http")) return false
+        return !url.contains("goojara.to")
+    }
+
+    /**
+     * Load [pageUrl] in a hidden WebView (main thread, JS on) and
+     * return the goojara.to cookies the site's JS set, or null.
+     * Fail-soft, time-boxed, never throws.
+     */
+    @SuppressLint("SetJavaScriptEnabled")
+    private fun webViewCookies(pageUrl: String): String? {
+        val ctx = (getContext() as? Context) ?: return null
+        val holder = arrayOfNulls<WebView>(1)
+        val finished = CountDownLatch(1)
+        var created = false
+        runOnMain(5000) {
+            try {
+                val wv = WebView(ctx)
+                wv.settings.javaScriptEnabled = true
+                wv.settings.domStorageEnabled = true
+                wv.settings.userAgentString = headers["User-Agent"] ?: wv.settings.userAgentString
+                wv.webViewClient = object : WebViewClient() {
+                    override fun onPageFinished(view: WebView, url: String) {
+                        finished.countDown()
+                    }
+                }
+                holder[0] = wv
+                created = true
+                wv.loadUrl(pageUrl)
+            } catch (e: Exception) {
+                finished.countDown()
+            }
+        }
+        if (!created) return null
+        finished.await(15000, TimeUnit.MILLISECONDS)
+        // Let the site's JS challenge finish and set its cookie.
+        Thread.sleep(4000)
+        var cookies: String? = null
+        runOnMain(5000) {
+            cookies = runCatching { CookieManager.getInstance().getCookie(pageUrl) }.getOrNull()
+                ?: runCatching { CookieManager.getInstance().getCookie(mainUrl) }.getOrNull()
+            runCatching { CookieManager.getInstance().flush() }
+        }
+        runOnMain(5000) {
+            runCatching { holder[0]?.stopLoading() }
+            runCatching { holder[0]?.destroy() }
+            holder[0] = null
+        }
+        return cookies?.takeIf { it.isNotBlank() }
+    }
+
+    /**
+     * Load [goUrl] in a hidden WebView and return the first URL
+     * outside goojara.to the WebView navigates to (the video host
+     * the site redirects to), or null. Fail-soft, time-boxed.
+     */
+    @SuppressLint("SetJavaScriptEnabled")
+    private fun webViewIntercept(goUrl: String): String? {
+        val ctx = (getContext() as? Context) ?: return null
+        val holder = arrayOfNulls<WebView>(1)
+        val seen = Collections.synchronizedList(ArrayList<String>())
+        val done = CountDownLatch(1)
+        var created = false
+        runOnMain(5000) {
+            try {
+                val wv = WebView(ctx)
+                wv.settings.javaScriptEnabled = true
+                wv.settings.domStorageEnabled = true
+                wv.settings.userAgentString = headers["User-Agent"] ?: wv.settings.userAgentString
+                wv.webViewClient = object : WebViewClient() {
+                    override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
+                        seen.add(request.url.toString())
+                        if (isOutsideGoojara(request.url.toString())) done.countDown()
+                        return false
+                    }
+
+                    override fun onPageFinished(view: WebView, url: String) {
+                        seen.add(url)
+                        if (isOutsideGoojara(url)) done.countDown()
+                    }
+                }
+                holder[0] = wv
+                created = true
+                wv.loadUrl(goUrl)
+            } catch (e: Exception) {
+                done.countDown()
+            }
+        }
+        if (!created) return null
+        done.await(12000, TimeUnit.MILLISECONDS)
+        Thread.sleep(1500)
+        val found = synchronized(seen) { seen.firstOrNull { isOutsideGoojara(it) } }
+        runOnMain(5000) {
+            runCatching { holder[0]?.stopLoading() }
+            runCatching { holder[0]?.destroy() }
+            holder[0] = null
+        }
+        return found
+    }
+
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -405,21 +552,24 @@ class GoojaraProvider : MainAPI() {
         var goResolved = 0
         val hosts = ArrayList<String>()
         val t0 = System.currentTimeMillis()
-        try {
-            val doc = app.get(realData, headers = headers).document
-            val links = doc.select("a[href*=go.php?url=]")
-            goTotal = links.size
+        var wvDiag = "wv:-"
+        // One resolve pass over the go.php links, optionally carrying
+        // a session Cookie header. Returns how many links resolved
+        // to a different final URL.
+        suspend fun resolveOnce(links: Elements, cookie: String?): Int {
+            var resolved = 0
+            val reqHeaders = if (cookie != null) headers + ("Cookie" to cookie) else headers
             for (a in links) {
                 if (System.currentTimeMillis() - t0 > 25000) break
                 val goUrl = normUrl(a.attr("href"))
                 val host = a.text().trim().split(" ").firstOrNull()
                     ?.lowercase()?.ifBlank { null } ?: "go"
                 val res = runCatching {
-                    app.get(goUrl, headers = headers, referer = realData)
+                    app.get(goUrl, headers = reqHeaders, referer = realData)
                 }.getOrNull() ?: continue
                 val finalUrl = res.url
                 if (res.code !in 200..299 || finalUrl == goUrl) continue
-                goResolved++
+                resolved++
                 if (!hosts.contains(host)) hosts += host
                 try {
                     if (tryDirectExtract(finalUrl, goUrl, countingCallback)) {
@@ -431,12 +581,54 @@ class GoojaraProvider : MainAPI() {
                     // One dead host must not kill the rest.
                 }
             }
+            return resolved
+        }
+        var links: Elements? = null
+        try {
+            val doc = app.get(realData, headers = headers).document
+            val found = doc.select("a[href*=go.php?url=]")
+            goTotal = found.size
+            links = found
         } catch (e: Exception) {
             // Fall through to the DEBUG marker below.
         }
+        val list = links
+        if (list != null && list.isNotEmpty()) {
+            // Phase 0: plain HTTP, exactly as v3.
+            goResolved = resolveOnce(list, null)
+            // Phase 1: hidden WebView session (only when plain found nothing).
+            if (goResolved == 0) {
+                val cookies = runCatching { webViewCookies(realData) }.getOrNull()
+                wvDiag = if (cookies != null) "wv:ck${cookies.length}" else "wv:no-ck"
+                if (cookies != null) {
+                    goResolved = resolveOnce(list, cookies)
+                }
+            }
+            // Phase 2: intercept the first go.php link inside the WebView.
+            if (goResolved == 0) {
+                val firstGo = runCatching { normUrl(list.first()?.attr("href") ?: "") }.getOrNull()
+                    ?.takeIf { it.isNotBlank() }
+                if (firstGo != null) {
+                    val intercepted = runCatching { webViewIntercept(firstGo) }.getOrNull()
+                    if (intercepted != null) {
+                        wvDiag += "/int:" + intercepted.take(60)
+                        try {
+                            if (tryDirectExtract(intercepted, firstGo, countingCallback)) {
+                                digCount++
+                            } else {
+                                loadExtractor(intercepted, firstGo, subtitleCallback, countingCallback)
+                            }
+                        } catch (e: Exception) {
+                        }
+                    } else {
+                        wvDiag += "/int:-"
+                    }
+                }
+            }
+        }
         val secs = (System.currentTimeMillis() - t0) / 1000
         val hostsCsv = hosts.joinToString(",").take(80)
-        val debugName = "DEBUG Goojara v3 | hosts=$hostsCsv | srv=$goResolved/$goTotal | ext=$emittedLinks | dig=$digCount | t=${secs}s | $subDiag"
+        val debugName = "DEBUG Goojara v4 | hosts=$hostsCsv | srv=$goResolved/$goTotal | ext=$emittedLinks | dig=$digCount | t=${secs}s | $wvDiag | $subDiag"
         callback(
             newExtractorLink(
                 "Mux",

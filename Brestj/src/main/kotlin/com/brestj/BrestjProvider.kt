@@ -30,14 +30,19 @@ import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 
 /**
- * Brestj (brstej.com) provider for CloudStream 3.
+ * Brestj (prstej.lat — the site moved from brstej.com, new template
+ * "prestige-theme-v14") provider for CloudStream 3.
  *
- * Built against the live structure verified on 2026-10-15. Brestj runs the
- * same PHP template family as MyCima (watch.php?vid={id} for movies AND
- * episodes; an episode page lists its series' sibling episodes as titled
- * anchors; listings are cat03.php?cat={slug} and newvideo.php, paginating
- * with &page={n}; search is search.php?keywords={q}; cards carry a title
- * attribute and a real poster img).
+ * Built against the live structure verified on 2026-10-15, re-verified
+ * 2026-11-12 after the move. Brestj runs the same PHP template family
+ * as MyCima (video.php?vid={id} for movies AND episodes; an episode
+ * page lists its series' sibling episodes as titled anchors; listings
+ * are cat03.php?cat={slug} and new-videos.php, paginating with
+ * &page={n}; search is search.php?keywords={q}). Cards are SPLIT
+ * across several anchors sharing one video.php URL — a photo anchor
+ * (img, duration text, aria-label), a title anchor (clean text, no
+ * img) and a detail anchor ("للمشاهدة ←") — so parseCards groups
+ * anchors by URL and merges poster + title per card.
  * - Playback (traced before writing this): play.php?vid={id} lists the
  *   servers as direct embeds (hdup400, film77, hd-vk, ok.ru, ...). The
  *   app's extractors know only some of them, so loadLinks reuses the
@@ -51,7 +56,7 @@ import org.jsoup.nodes.Element
  * - Every request carries an Android-Chrome header set.
  */
 class BrestjProvider : MainAPI() {
-    override var mainUrl = "https://brstej.com"
+    override var mainUrl = "https://prstej.lat"
     override var name = "Brestj"
     override var lang = "ar"
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries, TvType.Anime)
@@ -70,7 +75,7 @@ class BrestjProvider : MainAPI() {
 
     // Sections mirror the site's own category menu.
     override val mainPage = mainPageOf(
-        "$mainUrl/newvideo.php" to "المضاف حديثا",
+        "$mainUrl/new-videos.php" to "المضاف حديثا",
         "$mainUrl/cat03.php?cat=aflamajnby3-2024" to "أفلام أجنبية",
         "$mainUrl/cat03.php?cat=aflam02-2024" to "أفلام عربية",
         "$mainUrl/cat03.php?cat=turkish3-movies2024" to "أفلام تركية",
@@ -99,23 +104,68 @@ class BrestjProvider : MainAPI() {
     private fun isAnimeTitle(title: String): Boolean =
         title.contains("انمي") || title.contains("أنمي") || title.contains("كرتون")
 
-    private fun Element.toCard(): SearchResponse? {
-        val href = fixUrl(attr("href"))
-        if (!href.contains("watch.php?vid=")) return null
-        val title = cleanTitle(attr("title").ifBlank { text() })
-        if (title.isBlank()) return null
-        val img = selectFirst("img")
-        val poster = fixUrlNull(img?.attr("data-echo"))
-            ?: fixUrlNull(img?.attr("data-src"))
-            ?: fixUrlNull(img?.attr("src"))?.takeIf { !it.contains("blank") && !it.contains("pixel") }
+    /** "مشاهدة فيلم TITLE مترجم اون لاين HD" → "TITLE". */
+    private fun cleanAriaLabel(raw: String): String {
+        var s = raw.trim()
+        s = s.removePrefix("مشاهدة فيلم").removePrefix("مشاهدة مسلسل")
+            .removePrefix("مشاهدة انمي").removePrefix("مشاهدة").trim()
+        s = s.removeSuffix("مترجم اون لاين HD").removeSuffix("مترجم اون لاين").trim()
+        return cleanTitle(s)
+    }
+
+    /** Text that must never become a title: a duration badge ("1:30:37")
+     * or the detail anchor ("للمشاهدة ←"). */
+    private fun isJunkTitleText(text: String): Boolean {
+        if (text.isBlank()) return true
+        if (Regex("""^\d+:\d+(:\d+)?$""").matches(text)) return true
+        if (text.contains("للمشاهدة")) return true
+        return false
+    }
+
+    /**
+     * Merges one card's anchors (all sharing one video.php URL) into a
+     * single SearchResponse. The new template splits each card across a
+     * photo anchor (img, duration text, aria-label), a title anchor
+     * (clean text, no img) and a detail anchor ("للمشاهدة ←").
+     */
+    private fun List<Element>.toCard(href: String): SearchResponse? {
+        // Poster: the <img> inside ANY same-URL anchor.
+        var poster: String? = null
+        for (a in this) {
+            val img = a.selectFirst("img") ?: continue
+            poster = fixUrlNull(img.attr("data-echo"))
+                ?: fixUrlNull(img.attr("data-src"))
+                ?: fixUrlNull(img.attr("src"))?.takeIf { !it.contains("blank") && !it.contains("pixel") }
+            if (poster != null) break
+        }
+        // Title: prefer the clean text of a non-photo anchor; fall back to
+        // the photo anchor's aria-label (or the img alt, which carries the
+        // same label on cat pages).
+        var title: String? = null
+        for (a in this) {
+            val text = a.text().trim().replace(Regex("""\s+"""), " ")
+            if (isJunkTitleText(text)) continue
+            title = cleanTitle(a.attr("title").ifBlank { text })
+            if (!title.isNullOrBlank()) break
+        }
+        if (title.isNullOrBlank()) {
+            for (a in this) {
+                val label = a.attr("aria-label").trim()
+                if (label.isNotBlank()) {
+                    title = cleanAriaLabel(label)
+                    if (!title.isNullOrBlank()) break
+                }
+                val alt = a.selectFirst("img")?.attr("alt")?.trim().orEmpty()
+                if (alt.isNotBlank()) {
+                    title = cleanAriaLabel(alt)
+                    if (!title.isNullOrBlank()) break
+                }
+            }
+        }
+        if (title.isNullOrBlank()) return null
         val year = Regex("""(19|20)\d{2}""").find(title)?.value?.toIntOrNull()
         val isSeries = title.contains("مسلسل") || title.contains("الحلقة") || title.contains("الموسم")
         return when {
-            isAnimeTitle(title) && isSeries ->
-                newAnimeSearchResponse(title, href, TvType.Anime) {
-                    this.posterUrl = poster
-                    this.year = year
-                }
             isAnimeTitle(title) ->
                 newAnimeSearchResponse(title, href, TvType.Anime) {
                     this.posterUrl = poster
@@ -135,16 +185,19 @@ class BrestjProvider : MainAPI() {
     }
 
     private fun Document.parseCards(): List<SearchResponse> {
-        val seen = LinkedHashMap<String, SearchResponse>()
-        select("a[href*=\"watch.php?vid=\"]").forEach { a ->
-            val item = runCatching { a.toCard() }.getOrNull() ?: return@forEach
-            // Keep the richest variant (the one carrying a poster).
-            val existing = seen[item.url]
-            if (existing == null || (existing.posterUrl == null && item.posterUrl != null)) {
-                seen[item.url] = item
-            }
+        // Group every video.php anchor by its URL, then merge each group
+        // into one card (poster + title may live on different anchors).
+        val byUrl = LinkedHashMap<String, MutableList<Element>>()
+        select("a[href*=\"video.php?vid=\"]").forEach { a ->
+            val href = fixUrl(a.attr("href"))
+            byUrl.getOrPut(href) { mutableListOf() } += a
         }
-        return seen.values.toList()
+        val out = ArrayList<SearchResponse>()
+        for ((href, anchors) in byUrl) {
+            val item = runCatching { anchors.toCard(href) }.getOrNull() ?: continue
+            out += item
+        }
+        return out
     }
 
     private val seasonOrdinals = mapOf(
@@ -196,7 +249,7 @@ class BrestjProvider : MainAPI() {
         val plot = document.selectFirst("meta[name=\"description\"]")?.attr("content")
             ?.trim()?.ifBlank { null }
 
-        // A watch page lists its series' episodes two ways (both verified on
+        // A video page lists its series' episodes two ways (both verified on
         // هند خانم: the ep46 page carries the complete ordered 1–58 list):
         // a numbered strip of anchors whose whole text is "N حلقة", and
         // titled anchors carrying "الحلقة N" plus the series' core name
@@ -213,7 +266,7 @@ class BrestjProvider : MainAPI() {
             .removePrefix("انمي").trim()
         val episodes = mutableListOf<Episode>()
         val seenEp = HashSet<String>()
-        document.select("a[href*=\"watch.php?vid=\"]").forEach { a ->
+        document.select("a[href*=\"video.php?vid=\"]").forEach { a ->
             val href = fixUrl(a.attr("href"))
             if (!seenEp.add(href)) return@forEach
             val anchorText = a.text().trim().replace(Regex("""\s+"""), " ")
@@ -517,7 +570,7 @@ class BrestjProvider : MainAPI() {
             callback(
                 newExtractorLink(
                     name,
-                    "DEBUG " + diag.joinToString(" | "),
+                    "DEBUG Brestj v6 | " + diag.joinToString(" | "),
                     "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8",
                     ExtractorLinkType.M3U8
                 ) {

@@ -17,6 +17,7 @@ import com.lagradost.cloudstream3.newMovieLoadResponse
 import com.lagradost.cloudstream3.newMovieSearchResponse
 import com.lagradost.cloudstream3.newTvSeriesLoadResponse
 import com.lagradost.cloudstream3.newTvSeriesSearchResponse
+import com.lagradost.cloudstream3.CloudStreamApp
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
@@ -30,7 +31,6 @@ import android.webkit.CookieManager
 import android.webkit.WebResourceRequest
 import android.webkit.WebView
 import android.webkit.WebViewClient
-import com.lagradost.api.getContext
 import java.util.Collections
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
@@ -41,7 +41,7 @@ import org.jsoup.nodes.Element
 import org.jsoup.select.Elements
 
 /**
- * Goojara provider for CloudStream 3 — v5, CATALOG-FIRST.
+ * Goojara provider for CloudStream 3 — v6, CATALOG-FIRST.
  *
  * Site: https://ww1.goojara.to — movies + TV series, English
  * titles, no login needed for browsing. Traced live from the
@@ -420,15 +420,33 @@ class GoojaraProvider : MainAPI() {
     /** Simple class name if a WebView failed to construct. */
     private var wvErr: String? = null
 
+    // v6: v5 proved appContext() died silently inside getContext()
+    // (ctx:- reset value, t=3s). The compiled call resolved to
+    // ContextHelper_jvmKt — a class that exists ONLY in the stub
+    // jar, not in the real Android app — so it threw
+    // NoClassDefFoundError, which runCatching swallowed. Fix:
+    // drop getContext() entirely; take the Context from
+    // CloudStreamApp.context (public getter, verified in the
+    // stub), fall back to ActivityThread.currentApplication(),
+    // and catch Throwable (not just Exception) so no failure is
+    // ever silent again — the error class lands in ctx:err:<name>.
+
     /** Application context for the hidden WebView, with fallback. */
     private fun appContext(): Context? {
-        (getContext() as? Context)?.let { ctxDiag = "ctx:api"; return it }
-        runCatching {
+        var err: String? = null
+        try {
+            CloudStreamApp.context?.let { ctxDiag = "ctx:csa"; return it }
+        } catch (t: Throwable) {
+            err = t.javaClass.simpleName
+        }
+        try {
             val at = Class.forName("android.app.ActivityThread")
             val app = at.getMethod("currentApplication").invoke(null) as? Context
             if (app != null) { ctxDiag = "ctx:at"; return app }
+        } catch (t: Throwable) {
+            err = t.javaClass.simpleName
         }
-        ctxDiag = "ctx:null"
+        ctxDiag = if (err != null) "ctx:err:$err" else "ctx:null"
         return null
     }
 
@@ -654,7 +672,7 @@ class GoojaraProvider : MainAPI() {
         }
         val secs = (System.currentTimeMillis() - t0) / 1000
         val hostsCsv = hosts.joinToString(",").take(80)
-        val debugName = "DEBUG Goojara v5 | hosts=$hostsCsv | srv=$goResolved/$goTotal | ext=$emittedLinks | dig=$digCount | t=${secs}s | $wvDiag | $ctxDiag | wve=${wvErr ?: "-"} | $subDiag"
+        val debugName = "DEBUG Goojara v6 | hosts=$hostsCsv | srv=$goResolved/$goTotal | ext=$emittedLinks | dig=$digCount | t=${secs}s | $wvDiag | $ctxDiag | wve=${wvErr ?: "-"} | $subDiag"
         callback(
             newExtractorLink(
                 "Mux",

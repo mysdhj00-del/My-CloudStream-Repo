@@ -28,7 +28,7 @@ import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 
 /**
- * Goojara provider for CloudStream 3 — v1, CATALOG-FIRST.
+ * Goojara provider for CloudStream 3 — v2, CATALOG-FIRST.
  *
  * Site: https://ww1.goojara.to — movies + TV series, English
  * titles, no login needed for browsing. Traced live from the
@@ -105,12 +105,12 @@ class GoojaraProvider : MainAPI() {
     )
 
     override val mainPage = mainPageOf(
-        "أفلام — Goojara" to "$mainUrl/watch-movies",
-        "الأفلام الرائجة — Goojara" to "$mainUrl/watch-movies-popular",
-        "أحدث الأفلام — Goojara" to "$mainUrl/watch-movies-recent",
-        "مسلسلات — Goojara" to "$mainUrl/watch-series",
-        "المسلسلات الرائجة — Goojara" to "$mainUrl/watch-series-popular",
-        "أحدث المسلسلات — Goojara" to "$mainUrl/watch-series-recent"
+        "$mainUrl/watch-movies" to "أفلام — Goojara",
+        "$mainUrl/watch-movies-popular" to "الأفلام الرائجة — Goojara",
+        "$mainUrl/watch-movies-recent" to "أحدث الأفلام — Goojara",
+        "$mainUrl/watch-series" to "مسلسلات — Goojara",
+        "$mainUrl/watch-series-popular" to "المسلسلات الرائجة — Goojara",
+        "$mainUrl/watch-series-recent" to "أحدث المسلسلات — Goojara"
     )
 
     private val seenBySection = HashMap<String, HashSet<String>>()
@@ -415,7 +415,7 @@ class GoojaraProvider : MainAPI() {
         }
         val secs = (System.currentTimeMillis() - t0) / 1000
         val hostsCsv = hosts.joinToString(",").take(80)
-        val debugName = "DEBUG Goojara v1 | hosts=$hostsCsv | srv=$goResolved/$goTotal | ext=$emittedLinks | dig=$digCount | t=${secs}s | $subDiag"
+        val debugName = "DEBUG Goojara v2 | hosts=$hostsCsv | srv=$goResolved/$goTotal | ext=$emittedLinks | dig=$digCount | t=${secs}s | $subDiag"
         callback(
             newExtractorLink(
                 "Mux",

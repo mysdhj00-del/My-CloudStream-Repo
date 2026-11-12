@@ -28,7 +28,7 @@ import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 
 /**
- * Goojara provider for CloudStream 3 — v2, CATALOG-FIRST.
+ * Goojara provider for CloudStream 3 — v3, CATALOG-FIRST.
  *
  * Site: https://ww1.goojara.to — movies + TV series, English
  * titles, no login needed for browsing. Traced live from the
@@ -104,13 +104,24 @@ class GoojaraProvider : MainAPI() {
         "Referer" to mainUrl
     )
 
+    // Section table, keyed by the DISPLAY name — the single source
+    // of truth. getMainPage resolves the URL from the NAME on
+    // purpose: it must work whichever mainPageOf convention
+    // (url->name or name->url) the running CloudStream build
+    // implements. v1 crashed with the name as URL, v2 (pairs
+    // swapped) still crashed the same way on his phone, so the
+    // pair order alone cannot be trusted across builds.
+    private val sections = listOf(
+        "أفلام — Goojara" to "$mainUrl/watch-movies",
+        "الأفلام الرائجة — Goojara" to "$mainUrl/watch-movies-popular",
+        "أحدث الأفلام — Goojara" to "$mainUrl/watch-movies-recent",
+        "مسلسلات — Goojara" to "$mainUrl/watch-series",
+        "المسلسلات الرائجة — Goojara" to "$mainUrl/watch-series-popular",
+        "أحدث المسلسلات — Goojara" to "$mainUrl/watch-series-recent"
+    )
+
     override val mainPage = mainPageOf(
-        "$mainUrl/watch-movies" to "أفلام — Goojara",
-        "$mainUrl/watch-movies-popular" to "الأفلام الرائجة — Goojara",
-        "$mainUrl/watch-movies-recent" to "أحدث الأفلام — Goojara",
-        "$mainUrl/watch-series" to "مسلسلات — Goojara",
-        "$mainUrl/watch-series-popular" to "المسلسلات الرائجة — Goojara",
-        "$mainUrl/watch-series-recent" to "أحدث المسلسلات — Goojara"
+        *sections.map { (name, url) -> url to name }.toTypedArray()
     )
 
     private val seenBySection = HashMap<String, HashSet<String>>()
@@ -168,11 +179,21 @@ class GoojaraProvider : MainAPI() {
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val url = if (page <= 1) request.data else request.data + "?p=$page"
+        // Resolve the URL by section NAME first: works under either
+        // mainPageOf convention (request.name may hold the name and
+        // request.data the URL, or vice versa). Fall back to
+        // whichever field actually holds an http(s) URL, never a
+        // bare display name — a name can never be fetched.
+        val base = sections.firstOrNull { it.first == request.name }?.second
+            ?: sections.firstOrNull { it.first == request.data }?.second
+            ?: request.data.takeIf { it.startsWith("http") }
+            ?: request.name.takeIf { it.startsWith("http") }
+            ?: sections[0].second
+        val url = if (page <= 1) base else base + "?p=$page"
         val doc = app.get(url, headers = headers).document
         val items = parseCards(doc)
-        val seen = seenBySection.getOrPut(request.data) { HashSet() }
-        val seenSeries = seenSeriesBySection.getOrPut(request.data) { HashSet() }
+        val seen = seenBySection.getOrPut(base) { HashSet() }
+        val seenSeries = seenSeriesBySection.getOrPut(base) { HashSet() }
         if (page <= 1) {
             seen.clear()
             seenSeries.clear()
@@ -415,7 +436,7 @@ class GoojaraProvider : MainAPI() {
         }
         val secs = (System.currentTimeMillis() - t0) / 1000
         val hostsCsv = hosts.joinToString(",").take(80)
-        val debugName = "DEBUG Goojara v2 | hosts=$hostsCsv | srv=$goResolved/$goTotal | ext=$emittedLinks | dig=$digCount | t=${secs}s | $subDiag"
+        val debugName = "DEBUG Goojara v3 | hosts=$hostsCsv | srv=$goResolved/$goTotal | ext=$emittedLinks | dig=$digCount | t=${secs}s | $subDiag"
         callback(
             newExtractorLink(
                 "Mux",

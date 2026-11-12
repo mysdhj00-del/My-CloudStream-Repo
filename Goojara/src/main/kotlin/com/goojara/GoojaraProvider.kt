@@ -41,7 +41,7 @@ import org.jsoup.nodes.Element
 import org.jsoup.select.Elements
 
 /**
- * Goojara provider for CloudStream 3 — v4, CATALOG-FIRST.
+ * Goojara provider for CloudStream 3 — v5, CATALOG-FIRST.
  *
  * Site: https://ww1.goojara.to — movies + TV series, English
  * titles, no login needed for browsing. Traced live from the
@@ -409,6 +409,28 @@ class GoojaraProvider : MainAPI() {
     // javaScriptEnabled + domStorageEnabled, CookieManager for
     // cookies. Plugin code must NOT use coroutine builders (CI
     // law), so main-thread work uses Handler + CountDownLatch.
+    // v5: on-device v4 reported wv:no-ck/int:- in only t=7s, so
+    // the WebView never even started — diagnose the context and
+    // the construction error, and fall back to the Application
+    // object via ActivityThread when the library context is null.
+
+    /** Last context source tried: ctx:api / ctx:at / ctx:null. */
+    private var ctxDiag = "ctx:-"
+
+    /** Simple class name if a WebView failed to construct. */
+    private var wvErr: String? = null
+
+    /** Application context for the hidden WebView, with fallback. */
+    private fun appContext(): Context? {
+        (getContext() as? Context)?.let { ctxDiag = "ctx:api"; return it }
+        runCatching {
+            val at = Class.forName("android.app.ActivityThread")
+            val app = at.getMethod("currentApplication").invoke(null) as? Context
+            if (app != null) { ctxDiag = "ctx:at"; return app }
+        }
+        ctxDiag = "ctx:null"
+        return null
+    }
 
     /** Run [block] on the main thread, wait up to [timeoutMs]. */
     private fun runOnMain(timeoutMs: Long, block: () -> Unit): Boolean {
@@ -440,7 +462,7 @@ class GoojaraProvider : MainAPI() {
      */
     @SuppressLint("SetJavaScriptEnabled")
     private fun webViewCookies(pageUrl: String): String? {
-        val ctx = (getContext() as? Context) ?: return null
+        val ctx = appContext() ?: return null
         val holder = arrayOfNulls<WebView>(1)
         val finished = CountDownLatch(1)
         var created = false
@@ -459,6 +481,7 @@ class GoojaraProvider : MainAPI() {
                 created = true
                 wv.loadUrl(pageUrl)
             } catch (e: Exception) {
+                wvErr = e.javaClass.simpleName
                 finished.countDown()
             }
         }
@@ -487,7 +510,7 @@ class GoojaraProvider : MainAPI() {
      */
     @SuppressLint("SetJavaScriptEnabled")
     private fun webViewIntercept(goUrl: String): String? {
-        val ctx = (getContext() as? Context) ?: return null
+        val ctx = appContext() ?: return null
         val holder = arrayOfNulls<WebView>(1)
         val seen = Collections.synchronizedList(ArrayList<String>())
         val done = CountDownLatch(1)
@@ -514,6 +537,7 @@ class GoojaraProvider : MainAPI() {
                 created = true
                 wv.loadUrl(goUrl)
             } catch (e: Exception) {
+                wvErr = e.javaClass.simpleName
                 done.countDown()
             }
         }
@@ -552,6 +576,8 @@ class GoojaraProvider : MainAPI() {
         var goResolved = 0
         val hosts = ArrayList<String>()
         val t0 = System.currentTimeMillis()
+        ctxDiag = "ctx:-"
+        wvErr = null
         var wvDiag = "wv:-"
         // One resolve pass over the go.php links, optionally carrying
         // a session Cookie header. Returns how many links resolved
@@ -628,7 +654,7 @@ class GoojaraProvider : MainAPI() {
         }
         val secs = (System.currentTimeMillis() - t0) / 1000
         val hostsCsv = hosts.joinToString(",").take(80)
-        val debugName = "DEBUG Goojara v4 | hosts=$hostsCsv | srv=$goResolved/$goTotal | ext=$emittedLinks | dig=$digCount | t=${secs}s | $wvDiag | $subDiag"
+        val debugName = "DEBUG Goojara v5 | hosts=$hostsCsv | srv=$goResolved/$goTotal | ext=$emittedLinks | dig=$digCount | t=${secs}s | $wvDiag | $ctxDiag | wve=${wvErr ?: "-"} | $subDiag"
         callback(
             newExtractorLink(
                 "Mux",

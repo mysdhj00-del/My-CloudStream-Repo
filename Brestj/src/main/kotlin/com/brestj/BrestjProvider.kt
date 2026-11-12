@@ -90,7 +90,21 @@ class BrestjProvider : MainAPI() {
         "$mainUrl/cat03.php?cat=anmei" to "مسلسلات أنمي",
         "$mainUrl/cat03.php?cat=ramdan2026" to "مسلسلات رمضان 2026",
         "$mainUrl/cat03.php?cat=rm42-2022" to "مسلسلات رمضان 2022",
+        "$mainUrl/cat03.php?cat=movies2-2224" to "أحدث الأفلام",
+        "$mainUrl/cat03.php?cat=syy5-2025" to "مسلسلات شامية",
+        "$mainUrl/cat03.php?cat=eg8-2025" to "مسلسلات مصرية",
+        "$mainUrl/cat03.php?cat=rmdan31-2021" to "مسلسلات رمضان 2021",
+        "$mainUrl/cat03.php?cat=ramda1-2023" to "مسلسلات رمضان 2023",
+        "$mainUrl/cat03.php?cat=ramdan1-2024" to "مسلسلات رمضان 2024",
+        "$mainUrl/cat03.php?cat=ramadan2-2025" to "مسلسلات رمضان 2025",
+        "$mainUrl/cat03.php?cat=wait" to "حلقات التجهيز",
     )
+
+    // Per-section set of card URLs already emitted, so sideways scrolling
+    // shows every page exactly once: a past-the-end page that clamps to
+    // the last page adds zero NEW cards and the lane stops instead of
+    // looping on repeats.
+    private val seenBySection = HashMap<String, HashSet<String>>()
 
     // ---------- helpers ----------
 
@@ -231,7 +245,10 @@ class BrestjProvider : MainAPI() {
         else request.data + (if (request.data.contains("?")) "&page=$page" else "?page=$page")
         val document = app.get(url, headers = browserHeaders).document
         val items = document.parseCards()
-        return newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
+        val seen = seenBySection.getOrPut(request.data) { HashSet() }
+        if (page <= 1) seen.clear()
+        val fresh = items.filter { seen.add(it.url) }
+        return newHomePageResponse(request.name, fresh, hasNext = fresh.isNotEmpty())
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
@@ -570,7 +587,7 @@ class BrestjProvider : MainAPI() {
             callback(
                 newExtractorLink(
                     name,
-                    "DEBUG Brestj v6 | " + diag.joinToString(" | "),
+                    "DEBUG Brestj v7 | " + diag.joinToString(" | "),
                     "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8",
                     ExtractorLinkType.M3U8
                 ) {

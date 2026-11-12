@@ -196,7 +196,12 @@ class GoojaraProvider : MainAPI() {
             app.get("$mainUrl/watch-movies", headers = headers).text
         }.getOrNull() ?: return emptyList()
         val token = Regex("""x=([a-z0-9]{6,})&q=""").find(seed)
-            ?.groupValues?.getOrNull(1) ?: return emptyList()
+            ?.groupValues?.getOrNull(1)
+            // Detail pages carry the token in a second form
+            // (&x=<token> with a separate z= rand value).
+            ?: Regex("""&x=([a-z0-9]{6,})""").find(seed)
+                ?.groupValues?.getOrNull(1)
+            ?: return emptyList()
         val res = runCatching {
             app.post(
                 "$mainUrl/xmre.php",

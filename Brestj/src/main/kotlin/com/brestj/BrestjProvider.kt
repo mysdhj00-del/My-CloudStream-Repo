@@ -53,6 +53,11 @@ import org.jsoup.nodes.Element
  * - Season quirk of this site: titles carry the season as a bare number
  *   right before "الحلقة" (مسلسل الخليفة 2 الحلقة 39 = season 2), which
  *   seasonOfOrNull understands alongside the الموسم forms.
+ * - v8: series category pages carry a site-wide "أهم الحلقات" featured
+ *   widget above the real list — parseCards reads only #pm-grid when
+ *   it exists; episode cards merge into ONE card per series (core
+ *   name); load() tracks the season from the most recent "الموسم N"
+ *   heading while walking the page in order.
  * - Every request carries an Android-Chrome header set.
  */
 class BrestjProvider : MainAPI() {
@@ -105,6 +110,11 @@ class BrestjProvider : MainAPI() {
     // the last page adds zero NEW cards and the lane stops instead of
     // looping on repeats.
     private val seenBySection = HashMap<String, HashSet<String>>()
+
+    // Per-section set of series core names already emitted (v8): a later
+    // page may carry the same series under a different episode URL, so
+    // the URL set alone cannot stop series repeats.
+    private val seenSeriesBySection = HashMap<String, HashSet<String>>()
 
     // ---------- helpers ----------
 
@@ -178,6 +188,12 @@ class BrestjProvider : MainAPI() {
         }
         if (title.isNullOrBlank()) return null
         val year = Regex("""(19|20)\d{2}""").find(title)?.value?.toIntOrNull()
+        return buildCard(title, href, poster, year)
+    }
+
+    /** Builds the typed card for a title, shared by toCard and the
+     * series-grouping step (which retitles a card to its series core). */
+    private fun buildCard(title: String, href: String, poster: String?, year: Int?): SearchResponse {
         val isSeries = title.contains("مسلسل") || title.contains("الحلقة") || title.contains("الموسم")
         return when {
             isAnimeTitle(title) ->
@@ -198,18 +214,57 @@ class BrestjProvider : MainAPI() {
         }
     }
 
+    /**
+     * The series a card belongs to, or null when the card is not a series
+     * episode (no "الحلقة" in its title). The key keeps the "مسلسل"/"انمي"
+     * prefix and a bare season number before "الحلقة" ("الخليفة 2"), and
+     * drops the season part, the episode tail and the مترجمة/مدبلجة/HD
+     * tails — so every episode of one series maps to the same key.
+     */
+    private fun seriesCoreKey(title: String): String? {
+        if (!title.contains("الحلقة")) return null
+        var s = title
+        s = s.replace(Regex("""\s*الموسم\s.*$"""), "")
+        s = s.replace(Regex("""\s*الحلقة\s.*$"""), "")
+        s = s.replace(Regex("""\s+((مترجمة|مدبلجة|HD)\s*)+$"""), "")
+        s = s.trim()
+        return s.ifBlank { null }
+    }
+
     private fun Document.parseCards(): List<SearchResponse> {
+        // Series category pages inject a site-wide "أهم الحلقات" featured
+        // widget above the real list — when the real list (#pm-grid)
+        // exists, read ONLY inside it.
+        val scope: Element = selectFirst("#pm-grid") ?: this
         // Group every video.php anchor by its URL, then merge each group
         // into one card (poster + title may live on different anchors).
         val byUrl = LinkedHashMap<String, MutableList<Element>>()
-        select("a[href*=\"video.php?vid=\"]").forEach { a ->
+        scope.select("a[href*=\"video.php?vid=\"]").forEach { a ->
             val href = fixUrl(a.attr("href"))
             byUrl.getOrPut(href) { mutableListOf() } += a
         }
-        val out = ArrayList<SearchResponse>()
+        val merged = ArrayList<SearchResponse>()
         for ((href, anchors) in byUrl) {
             val item = runCatching { anchors.toCard(href) }.getOrNull() ?: continue
-            out += item
+            merged += item
+        }
+        // ONE card per series: episode cards of the same series collapse
+        // into the first (topmost = latest) episode's card, retitled to
+        // the series core name. Movies are never grouped.
+        val out = ArrayList<SearchResponse>()
+        val seenSeries = HashSet<String>()
+        for (item in merged) {
+            val key = seriesCoreKey(item.name)
+            if (key == null) {
+                out += item
+                continue
+            }
+            if (!seenSeries.add(key)) continue
+            // SearchResponse carries no year property — re-read it from
+            // the core title (the year sits before الموسم/الحلقة, so it
+            // survives in the key).
+            val keyYear = Regex("""(19|20)\d{2}""").find(key)?.value?.toIntOrNull()
+            out += buildCard(key, item.url, item.posterUrl, keyYear)
         }
         return out
     }
@@ -246,8 +301,21 @@ class BrestjProvider : MainAPI() {
         val document = app.get(url, headers = browserHeaders).document
         val items = document.parseCards()
         val seen = seenBySection.getOrPut(request.data) { HashSet() }
-        if (page <= 1) seen.clear()
-        val fresh = items.filter { seen.add(it.url) }
+        val seenSeries = seenSeriesBySection.getOrPut(request.data) { HashSet() }
+        if (page <= 1) {
+            seen.clear()
+            seenSeries.clear()
+        }
+        val fresh = items.filter { item ->
+            if (!seen.add(item.url)) return@filter false
+            // A series card counts as new only if its series is new to
+            // this section — a later page may carry the same series
+            // under a different episode URL.
+            if ((item.type == TvType.TvSeries || item.type == TvType.Anime) &&
+                !seenSeries.add(item.name)
+            ) return@filter false
+            true
+        }
         return newHomePageResponse(request.name, fresh, hasNext = fresh.isNotEmpty())
     }
 
@@ -271,10 +339,13 @@ class BrestjProvider : MainAPI() {
         // a numbered strip of anchors whose whole text is "N حلقة", and
         // titled anchors carrying "الحلقة N" plus the series' core name
         // (recommendations on the same page name other series, so the shared
-        // name is the filter there). Episode anchors name no season — the
-        // season lives in the page's own title — so episodes inherit the
-        // page's season unless an anchor overrides it. The core name must
-        // strip the page's own episode tail first, or no sibling matches it.
+        // name is the filter there). Multi-season pages group their strips
+        // under "الموسم N" headings (verified on Game of Thrones, S1–S8),
+        // so the strip season is tracked from the most recent heading.
+        // Episode anchors name no season — the season lives in the page's
+        // own title — so episodes inherit the page's season unless an
+        // anchor overrides it. The core name must strip the page's own
+        // episode tail first, or no sibling matches it.
         val hubSeason = seasonOf(title)
         val core = title
             .removePrefix("مسلسل").trim()
@@ -283,7 +354,19 @@ class BrestjProvider : MainAPI() {
             .removePrefix("انمي").trim()
         val episodes = mutableListOf<Episode>()
         val seenEp = HashSet<String>()
-        document.select("a[href*=\"video.php?vid=\"]").forEach { a ->
+        // (season, episode) pairs already collected — the numbered strip
+        // and the titled anchors can name the same episode under
+        // different URLs.
+        val seenSeasonEp = HashSet<Pair<Int, Int>>()
+        // Walk the page in document order, tracking the season from the
+        // most recent "الموسم N" heading for the numbered strips.
+        var trackedSeason: Int? = null
+        document.select("h1, h2, h3, h4, a[href*=\"video.php?vid=\"]").forEach { el ->
+            if (el.tagName().startsWith("h")) {
+                seasonOfOrNull(el.text().trim())?.let { trackedSeason = it }
+                return@forEach
+            }
+            val a = el
             val href = fixUrl(a.attr("href"))
             if (!seenEp.add(href)) return@forEach
             val anchorText = a.text().trim().replace(Regex("""\s+"""), " ")
@@ -291,9 +374,11 @@ class BrestjProvider : MainAPI() {
             val numbered = Regex("""^(\d{1,4})\s*حلقة$""").find(anchorText)
             if (numbered != null) {
                 val n = numbered.groupValues[1].toIntOrNull() ?: return@forEach
+                val season = trackedSeason ?: hubSeason
+                if (!seenSeasonEp.add(season to n)) return@forEach
                 episodes += newEpisode(href) {
                     this.name = "الحلقة $n"
-                    this.season = hubSeason
+                    this.season = season
                     this.episode = n
                 }
                 return@forEach
@@ -302,9 +387,11 @@ class BrestjProvider : MainAPI() {
             if (!epTitle.contains("الحلقة")) return@forEach
             if (core.isNotBlank() && !epTitle.contains(core, ignoreCase = true)) return@forEach
             val epNum = Regex("""الحلقة\s+(\d{1,4})""").find(epTitle)?.groupValues?.get(1)?.toIntOrNull()
+            val season = seasonOfOrNull(epTitle) ?: hubSeason
+            if (epNum != null && !seenSeasonEp.add(season to epNum)) return@forEach
             episodes += newEpisode(href) {
                 this.name = epNum?.let { "الحلقة $it" } ?: epTitle
-                this.season = seasonOfOrNull(epTitle) ?: hubSeason
+                this.season = season
                 this.episode = epNum
             }
         }
@@ -587,7 +674,7 @@ class BrestjProvider : MainAPI() {
             callback(
                 newExtractorLink(
                     name,
-                    "DEBUG Brestj v7 | " + diag.joinToString(" | "),
+                    "DEBUG Brestj v8 | " + diag.joinToString(" | "),
                     "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8",
                     ExtractorLinkType.M3U8
                 ) {

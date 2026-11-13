@@ -41,7 +41,7 @@ import org.jsoup.nodes.Element
 import org.jsoup.select.Elements
 
 /**
- * Goojara provider for CloudStream 3 — v7, CATALOG-FIRST.
+ * Goojara provider for CloudStream 3 — v8, CATALOG-FIRST.
  *
  * Site: https://ww1.goojara.to — movies + TV series, English
  * titles, no login needed for browsing. Traced live from the
@@ -625,6 +625,7 @@ class GoojaraProvider : MainAPI() {
         wvErr = null
         ckNames = "-"
         var wvDiag = "wv:-"
+        var sessionCookies: String? = null
         // One resolve pass over the go.php links, optionally carrying
         // a session Cookie header. Returns how many links resolved
         // to a different final URL.
@@ -644,7 +645,7 @@ class GoojaraProvider : MainAPI() {
                 resolved++
                 if (!hosts.contains(host)) hosts += host
                 try {
-                    if (tryDirectExtract(finalUrl, goUrl, countingCallback)) {
+                    if (tryDirectExtract(finalUrl, goUrl, countingCallback, cookie)) {
                         digCount++
                         continue
                     }
@@ -671,6 +672,7 @@ class GoojaraProvider : MainAPI() {
             // Phase 1: hidden WebView session (only when plain found nothing).
             if (goResolved == 0) {
                 val cookies = runCatching { webViewCookies(realData) }.getOrNull()
+                sessionCookies = cookies
                 wvDiag = if (cookies != null) "wv:ck${cookies.length}" else "wv:no-ck"
                 if (cookies != null) {
                     goResolved = resolveOnce(list, cookies)
@@ -685,8 +687,9 @@ class GoojaraProvider : MainAPI() {
                     if (intercepted != null) {
                         wvDiag += "/int:" + intercepted.take(60)
                         try {
-                            if (tryDirectExtract(intercepted, firstGo, countingCallback)) {
+                            if (tryDirectExtract(intercepted, firstGo, countingCallback, sessionCookies)) {
                                 digCount++
+                                if (sessionCookies != null) wvDiag += "/hdr"
                             } else {
                                 loadExtractor(intercepted, firstGo, subtitleCallback, countingCallback)
                             }
@@ -700,7 +703,7 @@ class GoojaraProvider : MainAPI() {
         }
         val secs = (System.currentTimeMillis() - t0) / 1000
         val hostsCsv = hosts.joinToString(",").take(80)
-        val debugName = "DEBUG Goojara v7 | hosts=$hostsCsv | srv=$goResolved/$goTotal | ext=$emittedLinks | dig=$digCount | t=${secs}s | $wvDiag | ckn=$ckNames | $ctxDiag | wve=${wvErr ?: "-"} | $subDiag"
+        val debugName = "DEBUG Goojara v8 | hosts=$hostsCsv | srv=$goResolved/$goTotal | ext=$emittedLinks | dig=$digCount | t=${secs}s | $wvDiag | ckn=$ckNames | $ctxDiag | wve=${wvErr ?: "-"} | $subDiag"
         callback(
             newExtractorLink(
                 "Mux",
@@ -725,10 +728,12 @@ class GoojaraProvider : MainAPI() {
     private suspend fun tryDirectExtract(
         embed: String,
         referer: String,
-        callback: (ExtractorLink) -> Unit
+        callback: (ExtractorLink) -> Unit,
+        sessionCookie: String? = null
     ): Boolean {
         return try {
-            val html = app.get(embed, headers = headers, referer = referer).text
+            val reqHeaders = if (sessionCookie != null) headers + ("Cookie" to sessionCookie) else headers
+            val html = app.get(embed, headers = reqHeaders, referer = referer).text
             if (!html.contains("eval(function(p,a,c,k,e")) return false
             val unpacked = GoojaraUnpack.unpackPackedJs(html) ?: return false
             val videoUrl = GoojaraUnpack.extractVideoUrl(unpacked) ?: return false
@@ -739,6 +744,16 @@ class GoojaraProvider : MainAPI() {
                 newExtractorLink(host, host, videoUrl, type) {
                     this.referer = embed
                     this.quality = Qualities.Unknown.value
+                    // v8: the video URL is session-bound — the player
+                    // must send the WebView session with the request,
+                    // or the host answers 403/404 (ExoPlayer 2004).
+                    if (sessionCookie != null) {
+                        this.headers = mapOf(
+                            "User-Agent" to (headers["User-Agent"] ?: "Mozilla/5.0"),
+                            "Cookie" to sessionCookie,
+                            "Referer" to embed
+                        )
+                    }
                 }
             )
             true

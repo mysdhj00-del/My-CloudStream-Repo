@@ -935,7 +935,7 @@ class GoojaraProvider : MainAPI() {
         }
         val secs = (System.currentTimeMillis() - t0) / 1000
         val hostsCsv = hosts.joinToString(",").take(80)
-        val debugName = "DEBUG Goojara v22 | hosts=$hostsCsv | srv=$goResolved/$goTotal | ext=$emittedLinks | dig=$digCount | ec=$embedCookiesFound | vc=$lastVideoCode | ch=$lastChain | $phDiag | $wootlyDiag | t=${secs}s | $wvDiag | ckn=$ckNames | $ctxDiag | wve=${wvErr ?: "-"} | $subDiag" +
+        val debugName = "DEBUG Goojara v23 | hosts=$hostsCsv | srv=$goResolved/$goTotal | ext=$emittedLinks | dig=$digCount | ec=$embedCookiesFound | vc=$lastVideoCode | ch=$lastChain | $phDiag | $wootlyDiag | t=${secs}s | $wvDiag | ckn=$ckNames | $ctxDiag | wve=${wvErr ?: "-"} | $subDiag" +
             (if (GoojaraTranslate.gtx429) " | sub:gtx429" else "")
         callback(
             newExtractorLink(
@@ -1062,8 +1062,12 @@ class GoojaraProvider : MainAPI() {
 
     /** Best OpenSubtitles file for one language, sync-first ranking. */
     private fun bestSubFor(arr: org.json.JSONArray, lang: String): String? {
-        var bestUrl = ""
-        var bestScore = -1
+        return rankedSubsFor(arr, lang).firstOrNull()
+    }
+
+    /** All OpenSubtitles files for one language, best score first. */
+    private fun rankedSubsFor(arr: org.json.JSONArray, lang: String): List<String> {
+        val scored = ArrayList<Pair<Int, String>>()
         for (i in 0 until arr.length()) {
             val o = arr.optJSONObject(i) ?: continue
             if (o.optString("lang") != lang) continue
@@ -1074,12 +1078,9 @@ class GoojaraProvider : MainAPI() {
             val fmt = o.optString("releaseFormat")
             if (fmt == "BluRay" || fmt == "WEB") score += 2
             if (o.optString("SubEncoding") == "UTF-8") score += 1
-            if (score > bestScore) {
-                bestScore = score
-                bestUrl = u
-            }
+            scored.add(score to u)
         }
-        return bestUrl.ifBlank { null }
+        return scored.sortedByDescending { it.first }.map { it.second }
     }
 
     private suspend fun emitSubs(
@@ -1111,6 +1112,7 @@ class GoojaraProvider : MainAPI() {
         }.getOrNull() ?: return "sub:no-match"
         val ara = bestSubFor(arr, "ara")
         val eng = bestSubFor(arr, "eng")
+        val engUrls = rankedSubsFor(arr, "eng")
         return when (mode) {
             "ar" -> {
                 if (ara != null) {
@@ -1118,7 +1120,7 @@ class GoojaraProvider : MainAPI() {
                     "sub:ar"
                 } else if (eng != null) {
                     // v21: no ready Arabic — translate the English file.
-                    val tr = GoojaraTranslate.translateOsEng(eng)
+                    val tr = GoojaraTranslate.translateOsEng(engUrls, headers)
                     if (tr.arUrl != null) {
                         subtitleCallback(SubtitleFile("العربية", tr.arUrl))
                         "sub:tr"
@@ -1151,7 +1153,7 @@ class GoojaraProvider : MainAPI() {
                     "sub:ar-only"
                 } else if (eng != null) {
                     // v21: no ready Arabic — translate the English file.
-                    val tr = GoojaraTranslate.translateOsEng(eng)
+                    val tr = GoojaraTranslate.translateOsEng(engUrls, headers)
                     if (tr.arUrl != null) {
                         subtitleCallback(SubtitleFile("العربية", tr.arUrl))
                         val dualUrl = tr.dualUrl

@@ -41,7 +41,7 @@ import org.jsoup.nodes.Element
 import org.jsoup.select.Elements
 
 /**
- * Goojara provider for CloudStream 3 — v12 (phisher flow).
+ * Goojara provider for CloudStream 3 — v13 (genre sections).
  *
  * Site: https://ww1.goojara.to — movies + TV series, English
  * titles, no login needed for browsing. Traced live from the
@@ -81,6 +81,23 @@ import org.jsoup.select.Elements
  * - Direct Links: the detail page lists ~25 links labelled
  *   "<Host> DVD" (hosts seen: Wootly, luluvdo, dood,
  *   streamplay), each href = go.php?url=<encrypted token>.
+ *
+ * v13 — GENRE SECTIONS (user order 2026-11-13): five genre
+ * sections first on home — أفلام أكشن / أفلام سرقة / أفلام
+ * رعب / مسلسلات أكشن / مسلسلات رعب — from the site's real
+ * genre URLs (/watch-movies-genre-Action, -Crime, -Horror;
+ * /watch-series-genre-Action, -Horror), verified live 2026-11-13.
+ * NOTE: the site has NO "Heist" genre — «سرقة» maps to Crime,
+ * where heist films live. Sideways scroll: the existing
+ * getMainPage already shows ALL pages (per-section seen-set,
+ * hasNext = page added ≥1 NEW card) — the genre sections
+ * inherit it. CAVEAT (sandbox, 2026-11-13): every list/genre
+ * page now serves only the same 7 featured cards in its static
+ * HTML (?p=2 returns the same 7), where the v1 study (2026-11-12)
+ * saw 35 cards p1 — the full list/genre filtering now loads via
+ * JS (xhrr.php; POST 403 from the sandbox). The phone test
+ * decides: if a genre section shows the same 7 titles as «أفلام»,
+ * the app session is getting only the featured strip too.
  *
  * v12 — PHISHER FLOW (traced from phisher98's public Goojara
  * v5 plugin, decompiled from its published .cs3, then verified
@@ -149,6 +166,11 @@ class GoojaraProvider : MainAPI() {
     // swapped) still crashed the same way on his phone, so the
     // pair order alone cannot be trusted across builds.
     private val sections = listOf(
+        "أفلام أكشن — Goojara" to "$mainUrl/watch-movies-genre-Action",
+        "أفلام سرقة — Goojara" to "$mainUrl/watch-movies-genre-Crime",
+        "أفلام رعب — Goojara" to "$mainUrl/watch-movies-genre-Horror",
+        "مسلسلات أكشن — Goojara" to "$mainUrl/watch-series-genre-Action",
+        "مسلسلات رعب — Goojara" to "$mainUrl/watch-series-genre-Horror",
         "أفلام — Goojara" to "$mainUrl/watch-movies",
         "الأفلام الرائجة — Goojara" to "$mainUrl/watch-movies-popular",
         "أحدث الأفلام — Goojara" to "$mainUrl/watch-movies-recent",
@@ -847,7 +869,7 @@ class GoojaraProvider : MainAPI() {
         }
         val secs = (System.currentTimeMillis() - t0) / 1000
         val hostsCsv = hosts.joinToString(",").take(80)
-        val debugName = "DEBUG Goojara v12 | hosts=$hostsCsv | srv=$goResolved/$goTotal | ext=$emittedLinks | dig=$digCount | ec=$embedCookiesFound | vc=$lastVideoCode | ch=$lastChain | $phDiag | $wootlyDiag | t=${secs}s | $wvDiag | ckn=$ckNames | $ctxDiag | wve=${wvErr ?: "-"} | $subDiag"
+        val debugName = "DEBUG Goojara v13 | hosts=$hostsCsv | srv=$goResolved/$goTotal | ext=$emittedLinks | dig=$digCount | ec=$embedCookiesFound | vc=$lastVideoCode | ch=$lastChain | $phDiag | $wootlyDiag | t=${secs}s | $wvDiag | ckn=$ckNames | $ctxDiag | wve=${wvErr ?: "-"} | $subDiag"
         callback(
             newExtractorLink(
                 "Mux",

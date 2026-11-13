@@ -20,8 +20,8 @@ object ReAnimeGear {
     const val PREFS = "reanime_prefs"
     const val KEY = "sub_mode"
 
-    val MODES = arrayOf("ar", "en", "dual")
-    val LABELS = arrayOf("العربية", "الإنجليزية", "العربية + الإنجليزية")
+    val MODES = arrayOf("ar", "dual")
+    val LABELS = arrayOf("العربية", "العربية + الإنجليزية")
 
     fun loadFrom(prefs: SharedPreferences) {
         val saved = prefs.getString(KEY, "dual") ?: "dual"
@@ -38,7 +38,7 @@ object ReAnimeGear {
 object ReAnimeGearUi {
     fun show(ctx: Context, prefs: SharedPreferences) {
         runCatching {
-            val current = ReAnimeGear.MODES.indexOf(ReAnimeGear.mode).takeIf { it >= 0 } ?: 2
+            val current = ReAnimeGear.MODES.indexOf(ReAnimeGear.mode).takeIf { it >= 0 } ?: 1
             var selected = current
             AlertDialog.Builder(ctx)
                 .setTitle("إعدادات ReAnime — الترجمة")

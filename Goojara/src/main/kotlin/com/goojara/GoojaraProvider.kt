@@ -41,7 +41,7 @@ import org.jsoup.nodes.Element
 import org.jsoup.select.Elements
 
 /**
- * Goojara provider for CloudStream 3 — v9, CATALOG-FIRST.
+ * Goojara provider for CloudStream 3 — v10, CATALOG-FIRST.
  *
  * Site: https://ww1.goojara.to — movies + TV series, English
  * titles, no login needed for browsing. Traced live from the
@@ -513,16 +513,30 @@ class GoojaraProvider : MainAPI() {
         finished.await(15000, TimeUnit.MILLISECONDS)
         // Poll for the session cookie: the site's JS may set it
         // seconds after the page finishes (challenge / XHR).
+        // v10: wait for the cookie to STABILISE — the JS may write
+        // a placeholder first and rewrite it once its check
+        // completes; a first-seen value can be dead on arrival.
         var cookies: String? = null
+        var lastSeen: String? = null
+        var stablePolls = 0
         val pollEnd = System.currentTimeMillis() + 12000
         while (System.currentTimeMillis() < pollEnd) {
             runOnMain(5000) {
                 cookies = runCatching { CookieManager.getInstance().getCookie(pageUrl) }.getOrNull()
                     ?: runCatching { CookieManager.getInstance().getCookie(mainUrl) }.getOrNull()
             }
-            if (!cookies.isNullOrBlank()) break
+            if (!cookies.isNullOrBlank()) {
+                if (cookies == lastSeen) {
+                    stablePolls++
+                    if (stablePolls >= 2) break
+                } else {
+                    stablePolls = 0
+                }
+                lastSeen = cookies
+            }
             Thread.sleep(1000)
         }
+        if (!cookies.isNullOrBlank()) Thread.sleep(2000)
         runOnMain(5000) {
             runCatching { CookieManager.getInstance().flush() }
         }
@@ -662,7 +676,7 @@ class GoojaraProvider : MainAPI() {
         }
         var links: Elements? = null
         try {
-            val doc = app.get(realData, headers = headers).document
+            val doc = app.get(realData, headers = headers + ("Cache-Control" to "no-cache")).document
             val found = doc.select("a[href*=go.php?url=]")
             goTotal = found.size
             links = found
@@ -680,6 +694,17 @@ class GoojaraProvider : MainAPI() {
                 wvDiag = if (cookies != null) "wv:ck${cookies.length}" else "wv:no-ck"
                 if (cookies != null) {
                     goResolved = resolveOnce(list, cookies)
+                }
+                // v10: one fresh-cookie retry — the first session can
+                // be a dead placeholder (or the gate throttles the
+                // first burst); a second warm session sometimes opens it.
+                if (goResolved == 0) {
+                    val cookies2 = runCatching { webViewCookies(realData) }.getOrNull()
+                    if (cookies2 != null) {
+                        sessionCookies = cookies2
+                        wvDiag += "/r2:ck${cookies2.length}"
+                        goResolved = resolveOnce(list, cookies2)
+                    }
                 }
             }
             // Phase 2: intercept the first go.php link inside the WebView.
@@ -707,7 +732,7 @@ class GoojaraProvider : MainAPI() {
         }
         val secs = (System.currentTimeMillis() - t0) / 1000
         val hostsCsv = hosts.joinToString(",").take(80)
-        val debugName = "DEBUG Goojara v9 | hosts=$hostsCsv | srv=$goResolved/$goTotal | ext=$emittedLinks | dig=$digCount | ec=$embedCookiesFound | t=${secs}s | $wvDiag | ckn=$ckNames | $ctxDiag | wve=${wvErr ?: "-"} | $subDiag"
+        val debugName = "DEBUG Goojara v10 | hosts=$hostsCsv | srv=$goResolved/$goTotal | ext=$emittedLinks | dig=$digCount | ec=$embedCookiesFound | t=${secs}s | $wvDiag | ckn=$ckNames | $ctxDiag | wve=${wvErr ?: "-"} | $subDiag"
         callback(
             newExtractorLink(
                 "Mux",

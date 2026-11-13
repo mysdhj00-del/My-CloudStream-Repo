@@ -671,11 +671,11 @@ class FiveTVProvider : MainAPI() {
         fun elapsed() = System.currentTimeMillis() - t0
         val doc = getDoc(data, referer = "$mainUrl/")
         if (doc == null) {
-            emitDebug(listOf("FiveTV v3", "page-fail", "gate?"), callback)
+            emitDebug(listOf("FiveTV v4", "page-fail", "gate?"), callback)
             return true
         }
         val pageText = doc.text()
-        val vip = pageText.contains("لأعضاء VIP فقط") || pageText.contains("VIP")
+        val vip = pageText.contains("لأعضاء VIP فقط")
         val embeds = extractEmbeds(doc, doc.html())
         val hosts = embeds.map { hostOf(it) }.joinToString(",").take(80)
         val extra = (if (vip) listOf("vip") else emptyList()) +
@@ -691,7 +691,13 @@ class FiveTVProvider : MainAPI() {
      * captured, so v1 collects embeds three ways: the player
      * iframe(s), data-* attributes on server buttons, and a raw
      * HTML scan for the four documented hosts + generic embed
-     * URLs. The DEBUG line (hosts=) shows what was really found. */
+     * URLs. v4: some titles (Reawakened Man 2026) list NO static
+     * watch embeds at all — the servers load via AJAX on tab
+     * click (Panel #9). The same detail page DOES list download
+     * links for the same files, and the file IDs convert to
+     * playable embeds (verified in a real browser 2026-11-13:
+     * both converted URLs played the film). The DEBUG line
+     * (hosts=) shows what was really found. */
     private fun extractEmbeds(doc: Document, html: String): List<String> {
         val out = LinkedHashSet<String>()
         for (f in doc.select("iframe[src]")) {
@@ -729,6 +735,17 @@ class FiveTVProvider : MainAPI() {
                 if (!isSiteUrl(u) && !u.contains("google") &&
                     !u.contains("facebook")
                 ) out += u
+            }
+        // v4: download links -> watch embeds (Panel #9 fallback).
+        // Only the two mappings verified in a real browser are
+        // converted; dsvplay/morencius/hgcloud patterns are unknown.
+        Regex("""https?://71stream\.one/download/([A-Za-z0-9_-]+)""")
+            .findAll(clean).forEach {
+                out += "https://71stream.one/embed/${it.groupValues[1]}"
+            }
+        Regex("""https?://ult4vid\.one/en/([A-Za-z0-9_-]+)/(?:watch|download)""")
+            .findAll(clean).forEach {
+                out += "https://ult4vid.one/embed/${it.groupValues[1]}"
             }
         return out.toList()
     }
@@ -783,7 +800,7 @@ class FiveTVProvider : MainAPI() {
         // must be visible on the next failure as well.
         if (allowDebug) {
             emitDebug(
-                listOf("FiveTV v3") + diagExtra +
+                listOf("FiveTV v4") + diagExtra +
                     listOf("srv=${embeds.size}", "ext=$extOk",
                         "dig=$digOk", "relay=$relayOk", "t=${elapsed() / 1000}s"),
                 callback

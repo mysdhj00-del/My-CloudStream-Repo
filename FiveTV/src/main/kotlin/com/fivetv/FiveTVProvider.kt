@@ -29,6 +29,20 @@ import org.jsoup.nodes.Document
 /**
  * FiveTV (فايف تي في) v2 — CATALOG-FIRST.
  *
+ * v3 — PLAYBACK FIX (2026-11-13, Extra Geography 2026 fails
+ * with ExoPlayer 2004): (a) the site moved — new61.5tv.lol now
+ * 301-redirects to 5tv.rest (WordPress frontend) — so site-internal
+ * URLs (download pages = plain HTML) must be excluded from embeds
+ * on BOTH domains, or one reaches the player and 2004s; (b) the
+ * embed session cookie is attached to dug links — the video URL is
+ * session-bound (both embed hosts are Cloudflare-gated; the player
+ * sends no cookies of its own); (c) the DEBUG line is emitted
+ * ALWAYS now, not only when nothing was found — a BAD link emits
+ * too, so the numbers must be visible on the next failure.
+ * Traced live 2026-11-13: only 2 servers for this title (71Stream,
+ * Ultra4Vid — both PLAY in a real browser); no direct .m3u8/.mp4
+ * is visible anywhere; no stock extractor exists for either host.
+ *
  * Site: https://new61.5tv.lol — Arabic RTL dark UI, movies + TV series,
  * heavy Asian drama (Korean, Chinese, Japanese, Thai, Taiwanese,
  * Turkish) + foreign movies/series. No live TV. No login needed for
@@ -210,6 +224,13 @@ class FiveTVProvider : MainAPI() {
     private fun hostOf(url: String): String =
         Regex("""^[a-z]+://([^/]+)""").find(url)?.groupValues?.get(1)
             ?.lowercase() ?: ""
+
+    // v3: the site's own domain(s) — new61.5tv.lol 301-redirects to
+    // 5tv.rest now (verified 2026-11-13, WordPress frontend). Any URL
+    // on either host is the SITE itself, never an embed: the download
+    // pages are plain HTML, and handing one to the player is exactly
+    // a 2004 (bad HTTP status).
+    private fun isSiteUrl(u: String) = u.contains("5tv.lol") || u.contains("5tv.rest")
 
     private fun og(doc: Document, prop: String): String? =
         doc.selectFirst("meta[property=og:$prop]")?.attr("content")
@@ -542,14 +563,20 @@ class FiveTVProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val h = browserHeaders + ("Referer" to asciiSafe(data))
-        val text = runCatching {
-            app.get(embed, headers = h, interceptor = cloudflareKiller).text
+        val resp = runCatching {
+            app.get(embed, headers = h, interceptor = cloudflareKiller)
         }.getOrNull() ?: return false
+        val text = resp.text
         val direct = extractDirect(text)
             ?: unpackPackedJs(text).firstNotNullOfOrNull { extractDirect(it) }
             ?: return false
         if (direct.isBlank()) return false
-        emitDirect(direct, embed, callback)
+        // v3: the video URL is session-bound (the embed page is
+        // Cloudflare-gated and sets its own session cookie) — the
+        // player sends no cookies of its own, so attach the embed
+        // session here, or the player gets a 403/404 (ExoPlayer 2004).
+        val cookieParts = resp.cookies.map { (k, v) -> "$k=$v" }
+        emitDirect(direct, embed, callback, cookieParts.joinToString("; ").ifEmpty { null })
         return true
     }
 
@@ -586,7 +613,8 @@ class FiveTVProvider : MainAPI() {
     private suspend fun emitDirect(
         url: String,
         referer: String,
-        callback: (ExtractorLink) -> Unit
+        callback: (ExtractorLink) -> Unit,
+        sessionCookie: String? = null
     ) {
         runCatching {
             callback(
@@ -597,6 +625,13 @@ class FiveTVProvider : MainAPI() {
                 ) {
                     this.referer = referer
                     this.quality = Qualities.Unknown.value
+                    if (sessionCookie != null) {
+                        this.headers = mapOf(
+                            "User-Agent" to browserUA,
+                            "Cookie" to sessionCookie,
+                            "Referer" to referer
+                        )
+                    }
                 }
             )
         }
@@ -636,7 +671,7 @@ class FiveTVProvider : MainAPI() {
         fun elapsed() = System.currentTimeMillis() - t0
         val doc = getDoc(data, referer = "$mainUrl/")
         if (doc == null) {
-            emitDebug(listOf("FiveTV v2", "page-fail", "gate?"), callback)
+            emitDebug(listOf("FiveTV v3", "page-fail", "gate?"), callback)
             return true
         }
         val pageText = doc.text()
@@ -661,7 +696,7 @@ class FiveTVProvider : MainAPI() {
         val out = LinkedHashSet<String>()
         for (f in doc.select("iframe[src]")) {
             val src = f.attr("abs:src").ifBlank { f.attr("src") }.trim()
-            if (src.startsWith("http") && !src.contains("5tv.lol")) {
+            if (src.startsWith("http") && !isSiteUrl(src)) {
                 out += resolveUrl(src)
             }
         }
@@ -674,7 +709,7 @@ class FiveTVProvider : MainAPI() {
                 "data-iframe", "data-video", "data-link"
             )) {
                 val v = el.attr(attr).trim()
-                if (v.startsWith("http") && !v.contains("5tv.lol")) {
+                if (v.startsWith("http") && !isSiteUrl(v)) {
                     out += resolveUrl(v)
                 }
             }
@@ -685,13 +720,13 @@ class FiveTVProvider : MainAPI() {
                 """https?://[^\s"'<>]*""" + Regex.escape(host) + """[^\s"'<>]*"""
             ).findAll(clean).forEach {
                 val u = it.value.trimEnd('\\')
-                if (!u.contains("5tv.lol")) out += u
+                if (!isSiteUrl(u)) out += u
             }
         }
         Regex("""https?://[^\s"'<>]+/(e|embed|v)/[A-Za-z0-9_-]+[^\s"'<>]*""")
             .findAll(clean).forEach {
                 val u = it.value.trimEnd('\\')
-                if (!u.contains("5tv.lol") && !u.contains("google") &&
+                if (!isSiteUrl(u) && !u.contains("google") &&
                     !u.contains("facebook")
                 ) out += u
             }
@@ -743,9 +778,12 @@ class FiveTVProvider : MainAPI() {
                 relayOk += resolveViaRelay(embed, referer, counting)
             }
         }
-        if (emitted == 0 && allowDebug) {
+        // v3: DEBUG always, not only when nothing was emitted — a
+        // BAD link emits too (and 2004s in the player), so the numbers
+        // must be visible on the next failure as well.
+        if (allowDebug) {
             emitDebug(
-                listOf("FiveTV v2") + diagExtra +
+                listOf("FiveTV v3") + diagExtra +
                     listOf("srv=${embeds.size}", "ext=$extOk",
                         "dig=$digOk", "relay=$relayOk", "t=${elapsed() / 1000}s"),
                 callback

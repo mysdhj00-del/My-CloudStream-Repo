@@ -337,9 +337,11 @@ class ReAnimeProvider : MainAPI() {
                 val arUrl = ReAnimeSubs.storeSub(ReAnimeSubs.buildSubVTT(cues, translated))
                     ?: return "fail"
                 subtitleCallback(SubtitleFile("العربية", arUrl))
-                val dualUrl = ReAnimeSubs.storeSub(ReAnimeSubs.buildDualVTT(cues, translated))
-                if (dualUrl != null) {
-                    subtitleCallback(SubtitleFile("العربية + الإنجليزية", dualUrl))
+                if (ReAnimeGear.mode == "dual") {
+                    val dualUrl = ReAnimeSubs.storeSub(ReAnimeSubs.buildDualVTT(cues, translated))
+                    if (dualUrl != null) {
+                        subtitleCallback(SubtitleFile("العربية + الإنجليزية", dualUrl))
+                    }
                 }
                 return "tr"
             }
@@ -381,6 +383,22 @@ class ReAnimeProvider : MainAPI() {
         }
 
         // ---- subtitle gear: every English track -> EN alone / AR alone / AR+EN dual ----
+        // Mode comes from the gear (ReAnimeGear): "ar" | "en" | "dual" (default).
+        val mode = ReAnimeGear.mode
+        val wantEn = mode != "ar"
+        val wantAr = mode != "en"
+        val wantDual = mode == "dual"
+        fun emitEn(label: String, url: String) {
+            if (wantEn) subtitleCallback(SubtitleFile(label, url))
+        }
+        fun emitAr(short: String, url: String) {
+            if (wantAr) subtitleCallback(SubtitleFile("العربية ($short)", url))
+        }
+        fun emitDual(short: String, url: String?) {
+            if (wantDual && url != null) {
+                subtitleCallback(SubtitleFile("العربية + الإنجليزية ($short)", url))
+            }
+        }
         var enTotal = 0
         var arCount = 0
         var subEmb = 0
@@ -401,17 +419,20 @@ class ReAnimeProvider : MainAPI() {
             val embedUrl = "${ReAnimeApi.FLIX_EMBED_BASE}/e/$subEmbedId?v=1"
             for (track in enTracks) {
                 val short = shortArLabel(track.label)
+                // English-only mode: no fetch, no translate, no store.
+                if (!wantAr) {
+                    emitEn(track.label, track.url)
+                    continue
+                }
                 val fileId = fileIdRe.find(track.url)?.value ?: track.url.hashCode().toString()
                 val fileName = track.url.substringAfterLast("/")
                 val cacheKey = "$fileId|$fileName"
                 val cachedAr = ReAnimeSubs.cachedAr(cacheKey)
                 val cachedDual = ReAnimeSubs.cachedDual(cacheKey)
                 if (cachedAr != null) {
-                    subtitleCallback(SubtitleFile(track.label, track.url))
-                    subtitleCallback(SubtitleFile("العربية ($short)", cachedAr))
-                    if (cachedDual != null) {
-                        subtitleCallback(SubtitleFile("العربية + الإنجليزية ($short)", cachedDual))
-                    }
+                    emitEn(track.label, track.url)
+                    emitAr(short, cachedAr)
+                    emitDual(short, cachedDual)
                     arCount++
                     continue
                 }
@@ -423,42 +444,41 @@ class ReAnimeProvider : MainAPI() {
                 }
                 if (cues.isEmpty()) {
                     failLabels.add(short)
-                    subtitleCallback(SubtitleFile(track.label, track.url))
+                    emitEn(track.label, track.url)
                     continue
                 }
                 val translated = ReAnimeSubs.translateSubCues(cues)
                 if (translated == null) {
                     failLabels.add(short)
-                    subtitleCallback(SubtitleFile(track.label, track.url))
+                    emitEn(track.label, track.url)
                     continue
                 }
                 val arVtt = ReAnimeSubs.buildSubVTT(cues, translated)
                 val arUrl = ReAnimeSubs.storeSub(arVtt)
                 if (arUrl == null) {
                     failLabels.add(short)
-                    subtitleCallback(SubtitleFile(track.label, track.url))
+                    emitEn(track.label, track.url)
                     continue
                 }
                 val dualVtt = ReAnimeSubs.buildDualVTT(cues, translated)
                 val dualUrl = ReAnimeSubs.storeSub(dualVtt)
                 ReAnimeSubs.putCache(cacheKey, arUrl, dualUrl)
-                subtitleCallback(SubtitleFile(track.label, track.url))
-                subtitleCallback(SubtitleFile("العربية ($short)", arUrl))
-                if (dualUrl != null) {
-                    subtitleCallback(SubtitleFile("العربية + الإنجليزية ($short)", dualUrl))
-                }
+                emitEn(track.label, track.url)
+                emitAr(short, arUrl)
+                emitDual(short, dualUrl)
                 arCount++
             }
         }
 
         // ---- fallback: no Arabic from the embed array -> OpenSubtitles by title ----
+        // English-only mode never runs the fallback.
         var subOs = "-"
-        if (arCount == 0) {
+        if (arCount == 0 && mode != "en") {
             subOs = runOsFallback(ref, subtitleCallback)
         }
 
         val secs = (System.currentTimeMillis() - t0) / 1000
-        val debugName = "DEBUG ReAnime v3 | srv=${servers.size} | ext=$videoLinks | sub:emb=$subEmb | sub:pg=$subPg | sub:tr=$subTr | sub:ar=$arCount/$enTotal" +
+        val debugName = "DEBUG ReAnime v4 | mode=$mode | srv=${servers.size} | ext=$videoLinks | sub:emb=$subEmb | sub:pg=$subPg | sub:tr=$subTr | sub:ar=$arCount/$enTotal" +
             " | sub:os=$subOs" +
             (if (failLabels.isNotEmpty()) " | sub:fail=${failLabels.joinToString(",")}" else "") +
             (if (ReAnimeSubs.gtx429) " | sub:gtx429" else "") +

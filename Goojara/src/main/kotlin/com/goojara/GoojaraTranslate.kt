@@ -30,6 +30,12 @@ object GoojaraTranslate {
     @Volatile
     var gtxParseFail: Boolean = false
 
+    /** Simple name of the exception thrown by a gtx request
+     * (UnknownHost, SSLHandshake, SocketTimeout, JSONException...).
+     * Empty when the failure was an HTTP status instead. */
+    @Volatile
+    var gtxExc: String = ""
+
     /** Browser headers for the gtx call: Google rejects the bare
      * OkHttp user-agent with 403 on some networks. */
     private val gtxHeaders = mapOf(
@@ -208,6 +214,7 @@ object GoojaraTranslate {
     suspend fun translateSubCues(cues: List<SubCue>): List<String>? {
         gtxCode = 0
         gtxParseFail = false
+        gtxExc = ""
         val out = ArrayList<String>()
         var batch = ArrayList<String>()
         var batchChars = 0
@@ -272,7 +279,8 @@ object GoojaraTranslate {
                 }
                 Thread.sleep(600)
                 return true
-            } catch (_: Exception) {
+            } catch (e: Exception) {
+                gtxExc = e.javaClass.simpleName
                 if (attempt < 2) {
                     Thread.sleep(2000)
                     continue

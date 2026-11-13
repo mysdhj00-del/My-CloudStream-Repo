@@ -41,7 +41,7 @@ import org.jsoup.nodes.Element
 import org.jsoup.select.Elements
 
 /**
- * Goojara provider for CloudStream 3 — v6, CATALOG-FIRST.
+ * Goojara provider for CloudStream 3 — v7, CATALOG-FIRST.
  *
  * Site: https://ww1.goojara.to — movies + TV series, English
  * titles, no login needed for browsing. Traced live from the
@@ -420,6 +420,9 @@ class GoojaraProvider : MainAPI() {
     /** Simple class name if a WebView failed to construct. */
     private var wvErr: String? = null
 
+    /** Cookie NAMES from the WebView (never values), for the diag. */
+    private var ckNames = "-"
+
     // v6: v5 proved appContext() died silently inside getContext()
     // (ctx:- reset value, t=3s). The compiled call resolved to
     // ContextHelper_jvmKt — a class that exists ONLY in the stub
@@ -505,14 +508,23 @@ class GoojaraProvider : MainAPI() {
         }
         if (!created) return null
         finished.await(15000, TimeUnit.MILLISECONDS)
-        // Let the site's JS challenge finish and set its cookie.
-        Thread.sleep(4000)
+        // Poll for the session cookie: the site's JS may set it
+        // seconds after the page finishes (challenge / XHR).
         var cookies: String? = null
+        val pollEnd = System.currentTimeMillis() + 12000
+        while (System.currentTimeMillis() < pollEnd) {
+            runOnMain(5000) {
+                cookies = runCatching { CookieManager.getInstance().getCookie(pageUrl) }.getOrNull()
+                    ?: runCatching { CookieManager.getInstance().getCookie(mainUrl) }.getOrNull()
+            }
+            if (!cookies.isNullOrBlank()) break
+            Thread.sleep(1000)
+        }
         runOnMain(5000) {
-            cookies = runCatching { CookieManager.getInstance().getCookie(pageUrl) }.getOrNull()
-                ?: runCatching { CookieManager.getInstance().getCookie(mainUrl) }.getOrNull()
             runCatching { CookieManager.getInstance().flush() }
         }
+        // Record cookie NAMES only (never values) for the diag.
+        ckNames = cookies?.split(";")?.mapNotNull { it.substringBefore("=").trim().takeIf { n -> n.isNotEmpty() } }?.joinToString(",")?.take(60) ?: "-"
         runOnMain(5000) {
             runCatching { holder[0]?.stopLoading() }
             runCatching { holder[0]?.destroy() }
@@ -522,15 +534,20 @@ class GoojaraProvider : MainAPI() {
     }
 
     /**
-     * Load [goUrl] in a hidden WebView and return the first URL
-     * outside goojara.to the WebView navigates to (the video host
-     * the site redirects to), or null. Fail-soft, time-boxed.
+     * v7: navigate to [goUrl] FROM the detail page, inside the
+     * WebView — window.location.href after the page + its JS
+     * session are live — and return the first URL outside
+     * goojara.to the WebView lands on. This is the faithful
+     * browser flow (detail-page referer, WebView cookie jar,
+     * Sec-Fetch headers); a bare loadUrl(go.php) is not.
+     * Fail-soft, time-boxed.
      */
     @SuppressLint("SetJavaScriptEnabled")
-    private fun webViewIntercept(goUrl: String): String? {
+    private fun webViewJsNav(pageUrl: String, goUrl: String): String? {
         val ctx = appContext() ?: return null
         val holder = arrayOfNulls<WebView>(1)
         val seen = Collections.synchronizedList(ArrayList<String>())
+        val finished = CountDownLatch(1)
         val done = CountDownLatch(1)
         var created = false
         runOnMain(5000) {
@@ -548,18 +565,28 @@ class GoojaraProvider : MainAPI() {
 
                     override fun onPageFinished(view: WebView, url: String) {
                         seen.add(url)
+                        finished.countDown()
                         if (isOutsideGoojara(url)) done.countDown()
                     }
                 }
                 holder[0] = wv
                 created = true
-                wv.loadUrl(goUrl)
+                wv.loadUrl(pageUrl)
             } catch (e: Exception) {
                 wvErr = e.javaClass.simpleName
+                finished.countDown()
                 done.countDown()
             }
         }
         if (!created) return null
+        finished.await(15000, TimeUnit.MILLISECONDS)
+        // Let the JS session settle, then navigate as the site does.
+        Thread.sleep(3000)
+        runOnMain(5000) {
+            runCatching {
+                holder[0]?.evaluateJavascript("window.location.href='$goUrl'", null)
+            }
+        }
         done.await(12000, TimeUnit.MILLISECONDS)
         Thread.sleep(1500)
         val found = synchronized(seen) { seen.firstOrNull { isOutsideGoojara(it) } }
@@ -596,6 +623,7 @@ class GoojaraProvider : MainAPI() {
         val t0 = System.currentTimeMillis()
         ctxDiag = "ctx:-"
         wvErr = null
+        ckNames = "-"
         var wvDiag = "wv:-"
         // One resolve pass over the go.php links, optionally carrying
         // a session Cookie header. Returns how many links resolved
@@ -653,7 +681,7 @@ class GoojaraProvider : MainAPI() {
                 val firstGo = runCatching { normUrl(list.first()?.attr("href") ?: "") }.getOrNull()
                     ?.takeIf { it.isNotBlank() }
                 if (firstGo != null) {
-                    val intercepted = runCatching { webViewIntercept(firstGo) }.getOrNull()
+                    val intercepted = runCatching { webViewJsNav(realData, firstGo) }.getOrNull()
                     if (intercepted != null) {
                         wvDiag += "/int:" + intercepted.take(60)
                         try {
@@ -672,7 +700,7 @@ class GoojaraProvider : MainAPI() {
         }
         val secs = (System.currentTimeMillis() - t0) / 1000
         val hostsCsv = hosts.joinToString(",").take(80)
-        val debugName = "DEBUG Goojara v6 | hosts=$hostsCsv | srv=$goResolved/$goTotal | ext=$emittedLinks | dig=$digCount | t=${secs}s | $wvDiag | $ctxDiag | wve=${wvErr ?: "-"} | $subDiag"
+        val debugName = "DEBUG Goojara v7 | hosts=$hostsCsv | srv=$goResolved/$goTotal | ext=$emittedLinks | dig=$digCount | t=${secs}s | $wvDiag | ckn=$ckNames | $ctxDiag | wve=${wvErr ?: "-"} | $subDiag"
         callback(
             newExtractorLink(
                 "Mux",

@@ -6,6 +6,7 @@ import com.lagradost.cloudstream3.LoadResponse
 import com.lagradost.cloudstream3.MainAPI
 import com.lagradost.cloudstream3.MainPageRequest
 import com.lagradost.cloudstream3.SearchResponse
+import com.lagradost.cloudstream3.TvSeriesSearchResponse
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.TvType
 import com.lagradost.cloudstream3.app
@@ -41,7 +42,7 @@ import org.jsoup.nodes.Element
 import org.jsoup.select.Elements
 
 /**
- * Goojara provider for CloudStream 3 — v13 (genre sections).
+ * Goojara provider for CloudStream 3 — v14 (real genre classification).
  *
  * Site: https://ww1.goojara.to — movies + TV series, English
  * titles, no login needed for browsing. Traced live from the
@@ -81,6 +82,32 @@ import org.jsoup.select.Elements
  * - Direct Links: the detail page lists ~25 links labelled
  *   "<Host> DVD" (hosts seen: Wootly, luluvdo, dood,
  *   streamplay), each href = go.php?url=<encrypted token>.
+ *
+ * v14 — REAL CLASSIFICATION (user order 2026-11-13: «العناوين
+ * ليست مرتبة… صنفها من Rotten Tomatoes… تصنيفك عشوائي»).
+ * Two real causes found: (1) EVERY list/genre page tops with
+ * the same #ftr featured strip (7 titles) — so every section
+ * opened with the same 7, looking random. parseCards now
+ * skips #ftr descendants. (2) The site's series-genre pages
+ * carry ONLY that strip (7 episodes, identical for every
+ * genre) — no real list behind it. Series genres are now
+ * classified per title: /watch-series pool → IMDb suggest
+ * (existing helper) → Cinemeta series meta → genres, kept
+ * only on a match (bounded 15 matches / 12 new lookups /
+ * 20 s per call, cursor + cache persist per genre).
+ * Rotten Tomatoes, checked live 2026-11-13: its pages DO open
+ * and DO carry genres (JSON-LD), but its search results load
+ * by JS (no usable links in the page) and title slugs collide
+ * (RT's /m/matchbox is a different 2017 film, not the 2026
+ * Matchbox the Movie) — per-title RT scraping would mislabel.
+ * The classifier uses Cinemeta, which carries the SAME genre
+ * taxonomy from IMDb (Action/Crime/Horror…) that RT lists.
+ * SPOT-CHECKED 2026-11-13, 8/8: the site's movie genre lists
+ * are accurate (Action: Uprising/Runner/Batman Knightfall/
+ * Matchbox all Action; Horror: Ice Cream Man/Buddy/Evil Dead
+ * Burn/The Mummy all Horror) — movies need no per-title
+ * classification once #ftr is excluded. Series chain verified:
+ * MobLand → tt31510819 → Crime/Drama; Squid Game → Action.
  *
  * v13 — GENRE SECTIONS (user order 2026-11-13): five genre
  * sections first on home — أفلام أكشن / أفلام سرقة / أفلام
@@ -208,6 +235,12 @@ class GoojaraProvider : MainAPI() {
         val out = ArrayList<SearchResponse>()
         val seenUrl = HashSet<String>()
         doc.select("a[href]").forEach { a ->
+            // v14: skip the featured strip (#ftr) — the same 7
+            // titles top every list/genre page. The real list
+            // follows it; a title that is also in the list is
+            // kept at its list position (only the #ftr occurrence
+            // is skipped).
+            if (a.parents().any { it.id() == "ftr" }) return@forEach
             val raw = a.attr("href").trim()
             val m = codeLinkRegex.find(raw) ?: return@forEach
             val kind = m.groupValues[1]
@@ -237,7 +270,119 @@ class GoojaraProvider : MainAPI() {
         return out
     }
 
+    // v14: series-genre classification state. The site's
+    // series-genre pages carry only the #ftr strip, so Action/
+    // Horror series are built by classifying the /watch-series
+    // pool per title (IMDb suggest -> Cinemeta genres). The
+    // genre cache persists for the app session; the per-genre
+    // scan cursor persists until the section reloads (page 1).
+    private val seriesGenreCache = HashMap<String, List<String>>()
+
+    private class SeriesGenreState {
+        val emitted = HashSet<String>()
+        val scanned = HashSet<String>()
+        var poolPage = 1
+    }
+
+    private val seriesGenreStates = HashMap<String, SeriesGenreState>()
+
+    /** Real genres of one series, via IMDb suggest + Cinemeta. Cached. */
+    private fun cinemetaSeriesGenres(name: String, year: Int?): List<String> {
+        seriesGenreCache[name]?.let { return it }
+        var result: List<String> = emptyList()
+        for (cand in latinTitleCandidates(name)) {
+            val tt = resolveImdbId(cand, year, true) ?: continue
+            val json = httpGetText("https://v3-cinemeta.strem.io/meta/series/$tt.json", 8000) ?: continue
+            val genres = runCatching {
+                val arr = JSONObject(json).optJSONObject("meta")?.optJSONArray("genres")
+                (0 until (arr?.length() ?: 0)).map { arr!!.optString(it) }
+            }.getOrDefault(emptyList())
+            if (genres.isNotEmpty()) { result = genres; break }
+        }
+        seriesGenreCache[name] = result
+        return result
+    }
+
+    /**
+     * A series-genre section, classified per title. Scans the
+     * /watch-series pool page by page (latest episode per series),
+     * keeps only series whose Cinemeta genres carry [genre].
+     * Bounded per call (15 matches, 12 new lookups, 20 s) — the
+     * cursor persists per genre, so later pages continue where
+     * the last call stopped. Page 1 resets the section.
+     */
+    private suspend fun seriesGenrePage(
+        genre: String,
+        page: Int,
+        requestName: String
+    ): HomePageResponse {
+        val state = seriesGenreStates.getOrPut(genre) { SeriesGenreState() }
+        if (page <= 1) {
+            state.emitted.clear()
+            state.scanned.clear()
+            state.poolPage = 1
+        }
+        val out = ArrayList<SearchResponse>()
+        val t0 = System.currentTimeMillis()
+        var newClassified = 0
+        var exhausted = false
+        while (out.size < 15 && System.currentTimeMillis() - t0 < 20000) {
+            val poolUrl = if (state.poolPage <= 1) "$mainUrl/watch-series"
+                else "$mainUrl/watch-series?p=${state.poolPage}"
+            val items = runCatching {
+                parseCards(app.get(poolUrl, headers = headers).document)
+            }.getOrNull()
+            if (items == null) {
+                if (out.isEmpty()) exhausted = true
+                break
+            }
+            val bySeries = LinkedHashMap<String, SearchResponse>()
+            for (item in items) {
+                if (item.type != TvType.TvSeries) continue
+                bySeries.putIfAbsent(item.name, item)
+            }
+            val fresh = bySeries.keys.filter { it !in state.emitted && it !in state.scanned }
+            if (fresh.isEmpty()) { exhausted = true; break }
+            var pageDone = true
+            for (name in fresh) {
+                if (out.size >= 15 || System.currentTimeMillis() - t0 >= 20000) {
+                    pageDone = false
+                    break
+                }
+                if (!seriesGenreCache.containsKey(name) && newClassified >= 12) {
+                    pageDone = false
+                    break
+                }
+                val genres = if (seriesGenreCache.containsKey(name)) {
+                    seriesGenreCache[name]!!
+                } else {
+                    newClassified++
+                    val cardYear = (bySeries[name] as? TvSeriesSearchResponse)?.year
+                    cinemetaSeriesGenres(name, cardYear)
+                }
+                state.scanned += name
+                if (genres.any { it.equals(genre, ignoreCase = true) }) {
+                    out += bySeries[name]!!
+                    state.emitted += name
+                }
+            }
+            if (pageDone) state.poolPage++
+        }
+        return newHomePageResponse(requestName, out, hasNext = !exhausted)
+    }
+
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
+        // v14: series-genre sections are classified per title
+        // (the site's series-genre pages carry only the featured
+        // strip) — they do not use the genre URL at all.
+        val seriesGenre = when {
+            request.name == "مسلسلات أكشن — Goojara" ||
+                request.data == "مسلسلات أكشن — Goojara" -> "Action"
+            request.name == "مسلسلات رعب — Goojara" ||
+                request.data == "مسلسلات رعب — Goojara" -> "Horror"
+            else -> null
+        }
+        if (seriesGenre != null) return seriesGenrePage(seriesGenre, page, request.name)
         // Resolve the URL by section NAME first: works under either
         // mainPageOf convention (request.name may hold the name and
         // request.data the URL, or vice versa). Fall back to
@@ -869,7 +1014,7 @@ class GoojaraProvider : MainAPI() {
         }
         val secs = (System.currentTimeMillis() - t0) / 1000
         val hostsCsv = hosts.joinToString(",").take(80)
-        val debugName = "DEBUG Goojara v13 | hosts=$hostsCsv | srv=$goResolved/$goTotal | ext=$emittedLinks | dig=$digCount | ec=$embedCookiesFound | vc=$lastVideoCode | ch=$lastChain | $phDiag | $wootlyDiag | t=${secs}s | $wvDiag | ckn=$ckNames | $ctxDiag | wve=${wvErr ?: "-"} | $subDiag"
+        val debugName = "DEBUG Goojara v14 | hosts=$hostsCsv | srv=$goResolved/$goTotal | ext=$emittedLinks | dig=$digCount | ec=$embedCookiesFound | vc=$lastVideoCode | ch=$lastChain | $phDiag | $wootlyDiag | t=${secs}s | $wvDiag | ckn=$ckNames | $ctxDiag | wve=${wvErr ?: "-"} | $subDiag"
         callback(
             newExtractorLink(
                 "Mux",

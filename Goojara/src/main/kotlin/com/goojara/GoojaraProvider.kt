@@ -41,7 +41,7 @@ import org.jsoup.nodes.Element
 import org.jsoup.select.Elements
 
 /**
- * Goojara provider for CloudStream 3 — v10, CATALOG-FIRST.
+ * Goojara provider for CloudStream 3 — v11, CATALOG-FIRST.
  *
  * Site: https://ww1.goojara.to — movies + TV series, English
  * titles, no login needed for browsing. Traced live from the
@@ -426,6 +426,10 @@ class GoojaraProvider : MainAPI() {
     // v9: how many Set-Cookie entries the embed pages set (per loadLinks).
     private var embedCookiesFound = 0
 
+    // v11: last video-URL resolve outcome (per loadLinks).
+    private var lastVideoCode = 0
+    private var lastChain = "-"
+
     // v6: v5 proved appContext() died silently inside getContext()
     // (ctx:- reset value, t=3s). The compiled call resolved to
     // ContextHelper_jvmKt — a class that exists ONLY in the stub
@@ -631,6 +635,8 @@ class GoojaraProvider : MainAPI() {
         var emittedLinks = 0
         var digCount = 0
         embedCookiesFound = 0
+        lastVideoCode = 0
+        lastChain = "-"
         val countingCallback: (ExtractorLink) -> Unit = { link ->
             emittedLinks++
             callback(link)
@@ -732,7 +738,7 @@ class GoojaraProvider : MainAPI() {
         }
         val secs = (System.currentTimeMillis() - t0) / 1000
         val hostsCsv = hosts.joinToString(",").take(80)
-        val debugName = "DEBUG Goojara v10 | hosts=$hostsCsv | srv=$goResolved/$goTotal | ext=$emittedLinks | dig=$digCount | ec=$embedCookiesFound | t=${secs}s | $wvDiag | ckn=$ckNames | $ctxDiag | wve=${wvErr ?: "-"} | $subDiag"
+        val debugName = "DEBUG Goojara v11 | hosts=$hostsCsv | srv=$goResolved/$goTotal | ext=$emittedLinks | dig=$digCount | ec=$embedCookiesFound | vc=$lastVideoCode | ch=$lastChain | t=${secs}s | $wvDiag | ckn=$ckNames | $ctxDiag | wve=${wvErr ?: "-"} | $subDiag"
         callback(
             newExtractorLink(
                 "Mux",
@@ -764,12 +770,41 @@ class GoojaraProvider : MainAPI() {
             val reqHeaders = if (sessionCookie != null) headers + ("Cookie" to sessionCookie) else headers
             val resp = app.get(embed, headers = reqHeaders, referer = referer)
             val html = resp.text
-            if (!html.contains("eval(function(p,a,c,k,e")) return false
-            val unpacked = GoojaraUnpack.unpackPackedJs(html) ?: return false
+            // v11: fall back to a plain video URL in the raw page when
+            // there is no packed-JS block (some hosts render it plain).
+            val unpacked = if (html.contains("eval(function(p,a,c,k,e")) {
+                GoojaraUnpack.unpackPackedJs(html) ?: return false
+            } else {
+                html
+            }
             val videoUrl = GoojaraUnpack.extractVideoUrl(unpacked) ?: return false
             val host = embed.substringAfter("://").substringBefore("/")
                 .removePrefix("www.").substringBefore(".")
-            val type = if (videoUrl.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+            // v11: resolve the video URL through OkHttp FIRST and hand
+            // the player the FINAL url. The player's HttpURLConnection
+            // path drops Set-Cookie across a 302 hop (freecode: the
+            // most likely cause of ExoPlayer 2004 with identical
+            // headers), while OkHttp carries the cookie into hop 2.
+            // Record the redirect chain in the diag.
+            var finalUrl = videoUrl
+            try {
+                val vresp = app.get(videoUrl, headers = reqHeaders, referer = referer)
+                lastVideoCode = vresp.code
+                val hops = mutableListOf<Int>()
+                var nr = vresp.okhttpResponse.networkResponse
+                while (nr != null) {
+                    hops += nr.code
+                    nr = nr.priorResponse
+                }
+                lastChain = hops.reversed().joinToString(">")
+                runCatching { vresp.body.close() }
+                if (vresp.code !in 200..299) return false
+                finalUrl = vresp.url
+            } catch (e: Exception) {
+                lastVideoCode = -1
+                return false
+            }
+            val type = if (finalUrl.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
             // v9: the video host may set its own session cookie on the
             // embed page — merge it with the goojara session cookie so
             // the player sends the host's own session with the request.
@@ -781,7 +816,7 @@ class GoojaraProvider : MainAPI() {
             embedCookies.forEach { (k, v) -> if (k !in seenNames) cookieParts += "$k=$v" }
             val cookieHeader = cookieParts.joinToString("; ").ifEmpty { null }
             callback(
-                newExtractorLink(host, host, videoUrl, type) {
+                newExtractorLink(host, host, finalUrl, type) {
                     this.referer = embed
                     this.quality = Qualities.Unknown.value
                     if (cookieHeader != null) {

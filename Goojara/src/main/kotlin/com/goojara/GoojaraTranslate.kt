@@ -6,14 +6,16 @@ import com.lagradost.cloudstream3.app
 import java.net.URLEncoder
 
 /**
- * EN->AR subtitle translation for Goojara (v21): when OpenSubtitles has
- * an English file but no Arabic one, translate it on the phone with free
- * Google Translate (gtx, no key, batched + paced) and emit Arabic alone
- * plus an Arabic+English dual. Same engine as ReAnime's gear.
- * Timestamps are never touched: buildSubVTT reuses the ORIGINAL start/end
- * strings and substitutes only the text lines. Translated files are
- * cached in SharedPreferences (OS URL -> stored URLs) so repeat plays
- * skip translation.
+ * EN->AR subtitle translation for Goojara (v21 gtx, v26 +MyMemory):
+ * when OpenSubtitles has an English file but no Arabic one, translate
+ * it on the phone — first with free Google Translate (gtx, no key),
+ * and when gtx fails (Panel #10: carrier-level block of googleapis
+ * on the phone's network) with MyMemory (free, no key, different
+ * domain, GET api.mymemory.translated.net/get). Timestamps are never
+ * touched: buildSubVTT reuses the ORIGINAL start/end strings and
+ * substitutes only the text lines. Translated files are cached in
+ * SharedPreferences (OS URL -> stored URLs) so repeat plays skip
+ * translation.
  */
 object GoojaraTranslate {
     const val relayBase = "https://anime-subs-relay.mysdhj00-del.deno.net"
@@ -35,6 +37,18 @@ object GoojaraTranslate {
      * Empty when the failure was an HTTP status instead. */
     @Volatile
     var gtxExc: String = ""
+
+    /** Set when a translation succeeded via the MyMemory fallback. */
+    @Volatile
+    var mmUsed: Boolean = false
+
+    /** Set when MyMemory failed for a non-limit reason. */
+    @Volatile
+    var mmFailed: Boolean = false
+
+    /** Set when MyMemory's daily quota is exhausted. */
+    @Volatile
+    var mmLimit: Boolean = false
 
     /** Browser headers for the gtx call: Google rejects the bare
      * OkHttp user-agent with 403 on some networks. */
@@ -206,12 +220,24 @@ object GoojaraTranslate {
     }
 
     /**
-     * Translates cue texts via public gtx (free, no key), char-budgeted
-     * batches, paced between batches. Null on total failure. Runs on the
-     * PHONE's network (its residential/mobile IP is a normal-user network);
-     * never from a datacenter relay (gtx 429s/302s those).
+     * Translates cue texts: gtx first, MyMemory fallback when gtx fails.
+     * Null only when both engines fail. Runs on the PHONE's network.
      */
     suspend fun translateSubCues(cues: List<SubCue>): List<String>? {
+        mmUsed = false
+        mmFailed = false
+        mmLimit = false
+        translateGtx(cues)?.let { return it }
+        val mm = translateMm(cues)
+        if (mm != null) mmUsed = true
+        return mm
+    }
+
+    /**
+     * Translates cue texts via public gtx (free, no key), char-budgeted
+     * batches, paced between batches. Null on total failure.
+     */
+    suspend fun translateGtx(cues: List<SubCue>): List<String>? {
         gtxCode = 0
         gtxParseFail = false
         gtxExc = ""
@@ -291,6 +317,132 @@ object GoojaraTranslate {
         return false
     }
 
+    // ---------- MyMemory fallback (Panel #10, v26) ----------
+
+    /** Anonymous daily quota, chars. MyMemory's documented cap is
+     * ~5,000/day; we stop at 4,500 so a file never dies mid-way. */
+    private const val MM_DAILY_BUDGET = 4500
+
+    private fun mmToday(): String {
+        return try {
+            java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US)
+                .format(java.util.Date())
+        } catch (_: Exception) {
+            ""
+        }
+    }
+
+    /** Chars left of today's MyMemory budget. */
+    private fun mmLeft(): Int {
+        val p = prefs() ?: return MM_DAILY_BUDGET
+        return try {
+            val today = mmToday()
+            if (p.getString("mm_day", "") != today) return MM_DAILY_BUDGET
+            (MM_DAILY_BUDGET - p.getInt("mm_chars", 0)).coerceAtLeast(0)
+        } catch (_: Exception) {
+            MM_DAILY_BUDGET
+        }
+    }
+
+    private fun mmSpend(n: Int) {
+        try {
+            val p = prefs() ?: return
+            val today = mmToday()
+            val used = if (p.getString("mm_day", "") == today) p.getInt("mm_chars", 0) else 0
+            p.edit().putString("mm_day", today).putInt("mm_chars", used + n).apply()
+        } catch (_: Exception) {
+        }
+    }
+
+    /** One MyMemory request. Null on failure; sets mmLimit when the
+     * daily quota is exhausted (429 / quotaFinished). */
+    private suspend fun mmRequest(text: String): String? {
+        return try {
+            val url = "https://api.mymemory.translated.net/get?q=" +
+                URLEncoder.encode(text, "UTF-8") + "&langpair=en|ar"
+            val resp = app.get(url)
+            val json = org.json.JSONObject(resp.text)
+            val statusStr = json.opt("responseStatus")?.toString() ?: ""
+            if (json.optBoolean("quotaFinished", false) || statusStr == "429") {
+                mmLimit = true
+                return null
+            }
+            if (statusStr != "200") return null
+            val tr = json.optJSONObject("responseData")
+                ?.optString("translatedText")?.ifEmpty { null } ?: return null
+            mmSpend(text.length)
+            tr
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /** Translates a small batch cue-by-cue (used when the joined
+     * request fails or its line count mismatches). Over-long cues
+     * keep their English text so the file stays aligned. */
+    private suspend fun mmSingles(texts: List<String>, out: ArrayList<String>): Boolean {
+        for (t in texts) {
+            if (t.length > 450) {
+                out.add(t)
+                continue
+            }
+            if (t.length > mmLeft()) {
+                mmLimit = true
+                return false
+            }
+            val one = mmRequest(t)
+            if (one == null) {
+                if (!mmLimit) mmFailed = true
+                return false
+            }
+            out.add(one)
+            Thread.sleep(1000)
+        }
+        return true
+    }
+
+    /**
+     * Translates cue texts via MyMemory (free, no key). Batches of
+     * <=5 cues / <=450 chars (the per-request cap is 500, verified),
+     * newlines preserved in the reply, 1 s pacing. Null on failure.
+     */
+    suspend fun translateMm(cues: List<SubCue>): List<String>? {
+        val out = ArrayList<String>()
+        var batch = ArrayList<String>()
+        var batchChars = 0
+        suspend fun flushBatch(): Boolean {
+            if (batch.isEmpty()) return true
+            val texts = batch.toList()
+            batch = ArrayList()
+            batchChars = 0
+            val joined = texts.joinToString("\n")
+            if (joined.length > mmLeft()) {
+                mmLimit = true
+                return false
+            }
+            val tr = mmRequest(joined)
+            if (tr == null) {
+                if (mmLimit) return false
+                return mmSingles(texts, out)
+            }
+            val lines = tr.split("\n")
+            if (lines.size != texts.size) return mmSingles(texts, out)
+            out.addAll(lines)
+            Thread.sleep(1000)
+            return true
+        }
+        for (c in cues) {
+            val t = c.text.replace("\n", " ")
+            if (batch.isNotEmpty() && (batchChars + t.length + 1 > 450 || batch.size >= 5)) {
+                if (!flushBatch()) return null
+            }
+            batch.add(t)
+            batchChars += t.length + 1
+        }
+        if (!flushBatch()) return null
+        return out
+    }
+
     /** Result of a translation attempt: urls on success, or the failing stage. */
     data class TrResult(val arUrl: String?, val dualUrl: String?, val failStage: String?)
 
@@ -324,7 +476,14 @@ object GoojaraTranslate {
                 lastStage = "cues"
                 continue
             }
-            val translated = translateSubCues(cues) ?: return TrResult(null, null, "gtx")
+            val translated = translateSubCues(cues) ?: return TrResult(
+                null, null,
+                when {
+                    mmLimit -> "mm-limit"
+                    mmFailed -> "mm"
+                    else -> "gtx"
+                }
+            )
             val arUrl = storeSub(buildSubVTT(cues, translated)) ?: return TrResult(null, null, "store")
             val dualUrl = storeSub(buildDualVTT(cues, translated))
             putCache(engUrl, arUrl, dualUrl)

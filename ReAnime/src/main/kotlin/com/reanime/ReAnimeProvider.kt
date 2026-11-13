@@ -321,6 +321,16 @@ class ReAnimeProvider : MainAPI() {
             val eng = ReAnimeSubs.bestOsSub(arr, "eng")
             if (ara != null) {
                 subtitleCallback(SubtitleFile("العربية", ara))
+                // Dual mode: a ready Arabic file alone gives no dual track —
+                // merge it with the English file via the relay so
+                // «العربية + الإنجليزية» appears too.
+                if (ReAnimeGear.mode == "dual" && eng != null) {
+                    val mergeUrl = "${ReAnimeSubs.relayBase}/relay/mergesubs?eng=" +
+                        java.net.URLEncoder.encode(eng, "UTF-8") +
+                        "&ara=" + java.net.URLEncoder.encode(ara, "UTF-8")
+                    subtitleCallback(SubtitleFile("العربية + الإنجليزية", mergeUrl))
+                    return "ar+dual"
+                }
                 return "ar"
             }
             if (eng != null) {
@@ -478,7 +488,7 @@ class ReAnimeProvider : MainAPI() {
         }
 
         val secs = (System.currentTimeMillis() - t0) / 1000
-        val debugName = "DEBUG ReAnime v5 | mode=$mode | srv=${servers.size} | ext=$videoLinks | sub:emb=$subEmb | sub:pg=$subPg | sub:tr=$subTr | sub:ar=$arCount/$enTotal" +
+        val debugName = "DEBUG ReAnime v6 | mode=$mode | srv=${servers.size} | ext=$videoLinks | sub:emb=$subEmb | sub:pg=$subPg | sub:tr=$subTr | sub:ar=$arCount/$enTotal" +
             " | sub:os=$subOs" +
             (if (failLabels.isNotEmpty()) " | sub:fail=${failLabels.joinToString(",")}" else "") +
             (if (ReAnimeSubs.gtx429) " | sub:gtx429" else "") +

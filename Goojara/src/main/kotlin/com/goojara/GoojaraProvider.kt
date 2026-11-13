@@ -935,8 +935,10 @@ class GoojaraProvider : MainAPI() {
         }
         val secs = (System.currentTimeMillis() - t0) / 1000
         val hostsCsv = hosts.joinToString(",").take(80)
-        val debugName = "DEBUG Goojara v23 | hosts=$hostsCsv | srv=$goResolved/$goTotal | ext=$emittedLinks | dig=$digCount | ec=$embedCookiesFound | vc=$lastVideoCode | ch=$lastChain | $phDiag | $wootlyDiag | t=${secs}s | $wvDiag | ckn=$ckNames | $ctxDiag | wve=${wvErr ?: "-"} | $subDiag" +
-            (if (GoojaraTranslate.gtx429) " | sub:gtx429" else "")
+        val debugName = "DEBUG Goojara v24 | hosts=$hostsCsv | srv=$goResolved/$goTotal | ext=$emittedLinks | dig=$digCount | ec=$embedCookiesFound | vc=$lastVideoCode | ch=$lastChain | $phDiag | $wootlyDiag | t=${secs}s | $wvDiag | ckn=$ckNames | $ctxDiag | wve=${wvErr ?: "-"} | $subDiag" +
+            (if (GoojaraTranslate.gtx429) " | sub:gtx429" else "") +
+            (if (GoojaraTranslate.gtxCode != 0) " | sub:gtx${GoojaraTranslate.gtxCode}" else "") +
+            (if (GoojaraTranslate.gtxParseFail) " | sub:gtx-parse" else "")
         callback(
             newExtractorLink(
                 "Mux",
@@ -1092,6 +1094,8 @@ class GoojaraProvider : MainAPI() {
     ): String {
         val mode = GoojaraSubs.mode
         GoojaraTranslate.gtx429 = false
+        GoojaraTranslate.gtxCode = 0
+        GoojaraTranslate.gtxParseFail = false
         val year = yearRegex.find(title)?.value?.toIntOrNull()
         val wantSeries = season != null && ep != null
         var tt = ttDirect

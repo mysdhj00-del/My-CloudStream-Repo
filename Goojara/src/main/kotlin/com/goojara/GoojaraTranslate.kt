@@ -231,25 +231,29 @@ object GoojaraTranslate {
         return out
     }
 
+    /** Result of a translation attempt: urls on success, or the failing stage. */
+    data class TrResult(val arUrl: String?, val dualUrl: String?, val failStage: String?)
+
     /**
      * Translates an OpenSubtitles English file to Arabic (cached).
-     * Returns (arabicUrl, dualUrl?) or null on failure.
+     * Returns TrResult with (arabicUrl, dualUrl?) on success, or failStage
+     * ("fetch" | "cues" | "gtx" | "store") on failure.
      */
-    suspend fun translateOsEng(engUrl: String): Pair<String, String?>? {
+    suspend fun translateOsEng(engUrl: String): TrResult {
         val cached = cachedAr(engUrl)
-        if (cached != null) return cached to cachedDual(engUrl)
+        if (cached != null) return TrResult(cached, cachedDual(engUrl), null)
         val raw = try {
             val res = app.get(engUrl)
             if (res.isSuccessful) res.text.takeIf { it.isNotBlank() } else null
         } catch (_: Exception) {
             null
-        } ?: return null
+        } ?: return TrResult(null, null, "fetch")
         val cues = parseSubCues(raw)
-        if (cues.isEmpty()) return null
-        val translated = translateSubCues(cues) ?: return null
-        val arUrl = storeSub(buildSubVTT(cues, translated)) ?: return null
+        if (cues.isEmpty()) return TrResult(null, null, "cues")
+        val translated = translateSubCues(cues) ?: return TrResult(null, null, "gtx")
+        val arUrl = storeSub(buildSubVTT(cues, translated)) ?: return TrResult(null, null, "store")
         val dualUrl = storeSub(buildDualVTT(cues, translated))
         putCache(engUrl, arUrl, dualUrl)
-        return arUrl to dualUrl
+        return TrResult(arUrl, dualUrl, null)
     }
 }

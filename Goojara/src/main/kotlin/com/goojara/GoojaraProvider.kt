@@ -42,7 +42,7 @@ import org.jsoup.nodes.Element
 import org.jsoup.select.Elements
 
 /**
- * Goojara provider for CloudStream 3 — v14 (real genre classification).
+ * Goojara provider for CloudStream 3 — v15 (main sections first).
  *
  * Site: https://ww1.goojara.to — movies + TV series, English
  * titles, no login needed for browsing. Traced live from the
@@ -82,6 +82,14 @@ import org.jsoup.select.Elements
  * - Direct Links: the detail page lists ~25 links labelled
  *   "<Host> DVD" (hosts seen: Wootly, luluvdo, dood,
  *   streamplay), each href = go.php?url=<encrypted token>.
+ *
+ * v15 — MAIN SECTIONS FIRST (user order 2026-11-13: «ارجع
+ * القسم الرئيسي العادي أفلام ومسلسلات الذي يظهر كل أفلام
+ * ومسلسلات الموقع»). Home order restored: «أفلام» then
+ * «مسلسلات» (the full catalog lists) FIRST, then the five
+ * genre sections, then the popular/recent lanes. Nothing else
+ * changed — the v14 #ftr exclusion and the series-genre
+ * classification stay as they are.
  *
  * v14 — REAL CLASSIFICATION (user order 2026-11-13: «العناوين
  * ليست مرتبة… صنفها من Rotten Tomatoes… تصنيفك عشوائي»).
@@ -193,15 +201,15 @@ class GoojaraProvider : MainAPI() {
     // swapped) still crashed the same way on his phone, so the
     // pair order alone cannot be trusted across builds.
     private val sections = listOf(
+        "أفلام — Goojara" to "$mainUrl/watch-movies",
+        "مسلسلات — Goojara" to "$mainUrl/watch-series",
         "أفلام أكشن — Goojara" to "$mainUrl/watch-movies-genre-Action",
         "أفلام سرقة — Goojara" to "$mainUrl/watch-movies-genre-Crime",
         "أفلام رعب — Goojara" to "$mainUrl/watch-movies-genre-Horror",
         "مسلسلات أكشن — Goojara" to "$mainUrl/watch-series-genre-Action",
         "مسلسلات رعب — Goojara" to "$mainUrl/watch-series-genre-Horror",
-        "أفلام — Goojara" to "$mainUrl/watch-movies",
         "الأفلام الرائجة — Goojara" to "$mainUrl/watch-movies-popular",
         "أحدث الأفلام — Goojara" to "$mainUrl/watch-movies-recent",
-        "مسلسلات — Goojara" to "$mainUrl/watch-series",
         "المسلسلات الرائجة — Goojara" to "$mainUrl/watch-series-popular",
         "أحدث المسلسلات — Goojara" to "$mainUrl/watch-series-recent"
     )
@@ -1014,7 +1022,7 @@ class GoojaraProvider : MainAPI() {
         }
         val secs = (System.currentTimeMillis() - t0) / 1000
         val hostsCsv = hosts.joinToString(",").take(80)
-        val debugName = "DEBUG Goojara v14 | hosts=$hostsCsv | srv=$goResolved/$goTotal | ext=$emittedLinks | dig=$digCount | ec=$embedCookiesFound | vc=$lastVideoCode | ch=$lastChain | $phDiag | $wootlyDiag | t=${secs}s | $wvDiag | ckn=$ckNames | $ctxDiag | wve=${wvErr ?: "-"} | $subDiag"
+        val debugName = "DEBUG Goojara v15 | hosts=$hostsCsv | srv=$goResolved/$goTotal | ext=$emittedLinks | dig=$digCount | ec=$embedCookiesFound | vc=$lastVideoCode | ch=$lastChain | $phDiag | $wootlyDiag | t=${secs}s | $wvDiag | ckn=$ckNames | $ctxDiag | wve=${wvErr ?: "-"} | $subDiag"
         callback(
             newExtractorLink(
                 "Mux",

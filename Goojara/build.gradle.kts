@@ -1,5 +1,5 @@
 // Goojara CloudStream plugin module.
-version = 17
+version = 18
 
 android {
     namespace = "com.goojara"

@@ -21,7 +21,6 @@ import com.lagradost.cloudstream3.CloudStreamApp
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
-import com.lagradost.cloudstream3.utils.loadExtractor
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import android.annotation.SuppressLint
 import android.content.Context
@@ -81,6 +80,17 @@ import org.jsoup.select.Elements
  * - Direct Links: the detail page lists ~25 links labelled
  *   "<Host> DVD" (hosts seen: Wootly, luluvdo, dood,
  *   streamplay), each href = go.php?url=<encrypted token>.
+ *
+ * v18 — WOOTLY ONLY (user order 2026-11-13: «لايوجد الا
+ * مصدر واحد يعمل وهو wootly احذف الباقي»). Every resolve
+ * path now emits ONLY the Wootly grabm link: resolvePhisher
+ * skips non-wootly Locations, resolveOnce and the WebView
+ * JS-nav intercept resolve wootly embeds only. All
+ * loadExtractor calls are gone, and tryDirectExtract (the
+ * packed-JS dig path that fed luluvdo/doodstream/…) is
+ * deleted — GoojaraUnpack.kt is now unused but kept. The
+ * DEBUG Mux link stays: it is the diagnostic carrier, not a
+ * video source. Subtitle gear unchanged.
  *
  * v17 — CLASSIFICATION REMOVED (user order 2026-11-13:
  * «اغلى التصنيف واعادة الأقسام كماهي»). The five genre
@@ -795,11 +805,10 @@ class GoojaraProvider : MainAPI() {
                 resolved++
                 if (!hosts.contains(host)) hosts += host
                 try {
-                    if (tryDirectExtract(finalUrl, goUrl, countingCallback, cookie)) {
-                        digCount++
-                        continue
+                    // v18: wootly only — every other host is skipped.
+                    if (finalUrl.contains("wootly")) {
+                        if (resolveWootly(finalUrl, goUrl, countingCallback)) digCount++
                     }
-                    loadExtractor(finalUrl, goUrl, subtitleCallback, countingCallback)
                 } catch (e: Exception) {
                     // One dead host must not kill the rest.
                 }
@@ -830,17 +839,10 @@ class GoojaraProvider : MainAPI() {
                 resolved++
                 if (!hosts.contains(host)) hosts += host
                 try {
+                    // v18: wootly only — non-wootly embeds are skipped.
                     if (loc.contains("wootly")) {
-                        if (resolveWootly(loc, goUrl, countingCallback)) {
-                            digCount++
-                            continue
-                        }
+                        if (resolveWootly(loc, goUrl, countingCallback)) digCount++
                     }
-                    if (tryDirectExtract(loc, goUrl, countingCallback, cookie)) {
-                        digCount++
-                        continue
-                    }
-                    loadExtractor(loc, goUrl, subtitleCallback, countingCallback)
                 } catch (e: Exception) {
                     // One dead host must not kill the rest.
                 }
@@ -919,11 +921,9 @@ class GoojaraProvider : MainAPI() {
                     if (intercepted != null) {
                         wvDiag += "/int:" + intercepted.take(60)
                         try {
-                            if (tryDirectExtract(intercepted, firstGo, countingCallback, sessionCookies)) {
-                                digCount++
-                                if (sessionCookies != null) wvDiag += "/hdr"
-                            } else {
-                                loadExtractor(intercepted, firstGo, subtitleCallback, countingCallback)
+                            // v18: wootly only.
+                            if (intercepted.contains("wootly")) {
+                                if (resolveWootly(intercepted, firstGo, countingCallback)) digCount++
                             }
                         } catch (e: Exception) {
                         }
@@ -935,7 +935,7 @@ class GoojaraProvider : MainAPI() {
         }
         val secs = (System.currentTimeMillis() - t0) / 1000
         val hostsCsv = hosts.joinToString(",").take(80)
-        val debugName = "DEBUG Goojara v17 | hosts=$hostsCsv | srv=$goResolved/$goTotal | ext=$emittedLinks | dig=$digCount | ec=$embedCookiesFound | vc=$lastVideoCode | ch=$lastChain | $phDiag | $wootlyDiag | t=${secs}s | $wvDiag | ckn=$ckNames | $ctxDiag | wve=${wvErr ?: "-"} | $subDiag"
+        val debugName = "DEBUG Goojara v18 | hosts=$hostsCsv | srv=$goResolved/$goTotal | ext=$emittedLinks | dig=$digCount | ec=$embedCookiesFound | vc=$lastVideoCode | ch=$lastChain | $phDiag | $wootlyDiag | t=${secs}s | $wvDiag | ckn=$ckNames | $ctxDiag | wve=${wvErr ?: "-"} | $subDiag"
         callback(
             newExtractorLink(
                 "Mux",
@@ -998,87 +998,6 @@ class GoojaraProvider : MainAPI() {
             true
         } catch (e: Exception) {
             wootlyDiag = "wt:err"
-            false
-        }
-    }
-
-    /**
-     * Direct packed-JS extraction: fetch an embed page, unpack
-     * a P.A.C.K.E.R. block if present, and emit the video URL
-     * it hides. Returns true when a link was emitted (the
-     * caller then skips loadExtractor for this embed).
-     * Fail-soft: any miss returns false.
-     */
-    private suspend fun tryDirectExtract(
-        embed: String,
-        referer: String,
-        callback: (ExtractorLink) -> Unit,
-        sessionCookie: String? = null
-    ): Boolean {
-        return try {
-            val reqHeaders = if (sessionCookie != null) headers + ("Cookie" to sessionCookie) else headers
-            val resp = app.get(embed, headers = reqHeaders, referer = referer)
-            val html = resp.text
-            // v11: fall back to a plain video URL in the raw page when
-            // there is no packed-JS block (some hosts render it plain).
-            val unpacked = if (html.contains("eval(function(p,a,c,k,e")) {
-                GoojaraUnpack.unpackPackedJs(html) ?: return false
-            } else {
-                html
-            }
-            val videoUrl = GoojaraUnpack.extractVideoUrl(unpacked) ?: return false
-            val host = embed.substringAfter("://").substringBefore("/")
-                .removePrefix("www.").substringBefore(".")
-            // v11: resolve the video URL through OkHttp FIRST and hand
-            // the player the FINAL url. The player's HttpURLConnection
-            // path drops Set-Cookie across a 302 hop (freecode: the
-            // most likely cause of ExoPlayer 2004 with identical
-            // headers), while OkHttp carries the cookie into hop 2.
-            // Record the redirect chain in the diag.
-            var finalUrl = videoUrl
-            try {
-                val vresp = app.get(videoUrl, headers = reqHeaders, referer = referer)
-                lastVideoCode = vresp.code
-                val hops = mutableListOf<Int>()
-                var nr = vresp.okhttpResponse.networkResponse
-                while (nr != null) {
-                    hops += nr.code
-                    nr = nr.priorResponse
-                }
-                lastChain = hops.reversed().joinToString(">")
-                runCatching { vresp.body.close() }
-                if (vresp.code !in 200..299) return false
-                finalUrl = vresp.url
-            } catch (e: Exception) {
-                lastVideoCode = -1
-                return false
-            }
-            val type = if (finalUrl.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
-            // v9: the video host may set its own session cookie on the
-            // embed page — merge it with the goojara session cookie so
-            // the player sends the host's own session with the request.
-            val embedCookies = resp.cookies
-            embedCookiesFound += embedCookies.size
-            val cookieParts = mutableListOf<String>()
-            if (sessionCookie != null) cookieParts += sessionCookie
-            val seenNames = sessionCookie?.split(";")?.map { it.substringBefore("=").trim() }?.toSet() ?: emptySet()
-            embedCookies.forEach { (k, v) -> if (k !in seenNames) cookieParts += "$k=$v" }
-            val cookieHeader = cookieParts.joinToString("; ").ifEmpty { null }
-            callback(
-                newExtractorLink(host, host, finalUrl, type) {
-                    this.referer = embed
-                    this.quality = Qualities.Unknown.value
-                    if (cookieHeader != null) {
-                        this.headers = mapOf(
-                            "User-Agent" to (headers["User-Agent"] ?: "Mozilla/5.0"),
-                            "Cookie" to cookieHeader,
-                            "Referer" to embed
-                        )
-                    }
-                }
-            )
-            true
-        } catch (e: Exception) {
             false
         }
     }

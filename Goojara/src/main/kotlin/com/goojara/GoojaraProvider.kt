@@ -41,7 +41,7 @@ import org.jsoup.nodes.Element
 import org.jsoup.select.Elements
 
 /**
- * Goojara provider for CloudStream 3 — v8, CATALOG-FIRST.
+ * Goojara provider for CloudStream 3 — v9, CATALOG-FIRST.
  *
  * Site: https://ww1.goojara.to — movies + TV series, English
  * titles, no login needed for browsing. Traced live from the
@@ -423,6 +423,9 @@ class GoojaraProvider : MainAPI() {
     /** Cookie NAMES from the WebView (never values), for the diag. */
     private var ckNames = "-"
 
+    // v9: how many Set-Cookie entries the embed pages set (per loadLinks).
+    private var embedCookiesFound = 0
+
     // v6: v5 proved appContext() died silently inside getContext()
     // (ctx:- reset value, t=3s). The compiled call resolved to
     // ContextHelper_jvmKt — a class that exists ONLY in the stub
@@ -613,6 +616,7 @@ class GoojaraProvider : MainAPI() {
         }
         var emittedLinks = 0
         var digCount = 0
+        embedCookiesFound = 0
         val countingCallback: (ExtractorLink) -> Unit = { link ->
             emittedLinks++
             callback(link)
@@ -703,7 +707,7 @@ class GoojaraProvider : MainAPI() {
         }
         val secs = (System.currentTimeMillis() - t0) / 1000
         val hostsCsv = hosts.joinToString(",").take(80)
-        val debugName = "DEBUG Goojara v8 | hosts=$hostsCsv | srv=$goResolved/$goTotal | ext=$emittedLinks | dig=$digCount | t=${secs}s | $wvDiag | ckn=$ckNames | $ctxDiag | wve=${wvErr ?: "-"} | $subDiag"
+        val debugName = "DEBUG Goojara v9 | hosts=$hostsCsv | srv=$goResolved/$goTotal | ext=$emittedLinks | dig=$digCount | ec=$embedCookiesFound | t=${secs}s | $wvDiag | ckn=$ckNames | $ctxDiag | wve=${wvErr ?: "-"} | $subDiag"
         callback(
             newExtractorLink(
                 "Mux",
@@ -733,24 +737,32 @@ class GoojaraProvider : MainAPI() {
     ): Boolean {
         return try {
             val reqHeaders = if (sessionCookie != null) headers + ("Cookie" to sessionCookie) else headers
-            val html = app.get(embed, headers = reqHeaders, referer = referer).text
+            val resp = app.get(embed, headers = reqHeaders, referer = referer)
+            val html = resp.text
             if (!html.contains("eval(function(p,a,c,k,e")) return false
             val unpacked = GoojaraUnpack.unpackPackedJs(html) ?: return false
             val videoUrl = GoojaraUnpack.extractVideoUrl(unpacked) ?: return false
             val host = embed.substringAfter("://").substringBefore("/")
                 .removePrefix("www.").substringBefore(".")
             val type = if (videoUrl.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+            // v9: the video host may set its own session cookie on the
+            // embed page — merge it with the goojara session cookie so
+            // the player sends the host's own session with the request.
+            val embedCookies = resp.cookies
+            embedCookiesFound += embedCookies.size
+            val cookieParts = mutableListOf<String>()
+            if (sessionCookie != null) cookieParts += sessionCookie
+            val seenNames = sessionCookie?.split(";")?.map { it.substringBefore("=").trim() }?.toSet() ?: emptySet()
+            embedCookies.forEach { (k, v) -> if (k !in seenNames) cookieParts += "$k=$v" }
+            val cookieHeader = cookieParts.joinToString("; ").ifEmpty { null }
             callback(
                 newExtractorLink(host, host, videoUrl, type) {
                     this.referer = embed
                     this.quality = Qualities.Unknown.value
-                    // v8: the video URL is session-bound — the player
-                    // must send the WebView session with the request,
-                    // or the host answers 403/404 (ExoPlayer 2004).
-                    if (sessionCookie != null) {
+                    if (cookieHeader != null) {
                         this.headers = mapOf(
                             "User-Agent" to (headers["User-Agent"] ?: "Mozilla/5.0"),
-                            "Cookie" to sessionCookie,
+                            "Cookie" to cookieHeader,
                             "Referer" to embed
                         )
                     }

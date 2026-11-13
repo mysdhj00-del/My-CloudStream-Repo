@@ -22,6 +22,22 @@ object GoojaraTranslate {
     @Volatile
     var gtx429: Boolean = false
 
+    /** Last gtx HTTP code on failure (0 = request threw). Reset per episode. */
+    @Volatile
+    var gtxCode: Int = 0
+
+    /** Set when gtx answered 200 but the JSON did not parse as expected. */
+    @Volatile
+    var gtxParseFail: Boolean = false
+
+    /** Browser headers for the gtx call: Google rejects the bare
+     * OkHttp user-agent with 403 on some networks. */
+    private val gtxHeaders = mapOf(
+        "User-Agent" to "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
+        "Accept-Language" to "en-US,en;q=0.9",
+        "Referer" to "https://translate.google.com"
+    )
+
     private const val PREFS = "goojara_subs"
 
     private fun prefs(): android.content.SharedPreferences? {
@@ -190,34 +206,20 @@ object GoojaraTranslate {
      * never from a datacenter relay (gtx 429s/302s those).
      */
     suspend fun translateSubCues(cues: List<SubCue>): List<String>? {
+        gtxCode = 0
+        gtxParseFail = false
         val out = ArrayList<String>()
         var batch = ArrayList<String>()
         var batchChars = 0
         suspend fun flush(): Boolean {
             if (batch.isEmpty()) return true
-            return try {
-                val params = StringBuilder("client=gtx&sl=en&tl=ar&dt=t")
-                for (t in batch) params.append("&q=").append(URLEncoder.encode(t, "UTF-8"))
-                val resp = app.get("https://translate.googleapis.com/translate_a/single?$params")
-                if (!resp.isSuccessful) {
-                    if (resp.code == 429) gtx429 = true
-                    return false
-                }
-                val arr = org.json.JSONArray(resp.text).optJSONArray(0) ?: return false
-                if (arr.length() != batch.size) return false
-                for (i in 0 until arr.length()) {
-                    val entry = arr.optJSONArray(i)
-                    val tr = entry?.optString(0)?.ifEmpty { null }
-                    out.add(tr ?: batch[i])
-                }
-                Thread.sleep(600)
-                true
-            } catch (e: Exception) {
-                false
-            } finally {
-                batch = ArrayList()
-                batchChars = 0
-            }
+            val params = StringBuilder("client=gtx&sl=en&tl=ar&dt=t")
+            for (t in batch) params.append("&q=").append(URLEncoder.encode(t, "UTF-8"))
+            val texts = batch.toList()
+            val ok = translateBatch(params.toString(), texts, out)
+            batch = ArrayList()
+            batchChars = 0
+            return ok
         }
         for (c in cues) {
             val t = c.text.replace("\n", " ")
@@ -229,6 +231,56 @@ object GoojaraTranslate {
         }
         if (!flush()) return null
         return out
+    }
+
+    /** One gtx batch: browser headers + a single retry after 2 s. */
+    private suspend fun translateBatch(
+        params: String,
+        texts: List<String>,
+        out: ArrayList<String>
+    ): Boolean {
+        var attempt = 0
+        while (attempt < 2) {
+            attempt++
+            try {
+                val resp = app.get(
+                    "https://translate.googleapis.com/translate_a/single?$params",
+                    headers = gtxHeaders
+                )
+                if (!resp.isSuccessful) {
+                    gtxCode = resp.code
+                    if (resp.code == 429) gtx429 = true
+                    if (attempt < 2) {
+                        Thread.sleep(2000)
+                        continue
+                    }
+                    return false
+                }
+                val arr = org.json.JSONArray(resp.text).optJSONArray(0)
+                if (arr == null || arr.length() != texts.size) {
+                    gtxParseFail = true
+                    if (attempt < 2) {
+                        Thread.sleep(2000)
+                        continue
+                    }
+                    return false
+                }
+                for (i in 0 until arr.length()) {
+                    val entry = arr.optJSONArray(i)
+                    val tr = entry?.optString(0)?.ifEmpty { null }
+                    out.add(tr ?: texts[i])
+                }
+                Thread.sleep(600)
+                return true
+            } catch (_: Exception) {
+                if (attempt < 2) {
+                    Thread.sleep(2000)
+                    continue
+                }
+                return false
+            }
+        }
+        return false
     }
 
     /** Result of a translation attempt: urls on success, or the failing stage. */

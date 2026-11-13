@@ -935,7 +935,7 @@ class GoojaraProvider : MainAPI() {
         }
         val secs = (System.currentTimeMillis() - t0) / 1000
         val hostsCsv = hosts.joinToString(",").take(80)
-        val debugName = "DEBUG Goojara v20 | hosts=$hostsCsv | srv=$goResolved/$goTotal | ext=$emittedLinks | dig=$digCount | ec=$embedCookiesFound | vc=$lastVideoCode | ch=$lastChain | $phDiag | $wootlyDiag | t=${secs}s | $wvDiag | ckn=$ckNames | $ctxDiag | wve=${wvErr ?: "-"} | $subDiag"
+        val debugName = "DEBUG Goojara v21 | hosts=$hostsCsv | srv=$goResolved/$goTotal | ext=$emittedLinks | dig=$digCount | ec=$embedCookiesFound | vc=$lastVideoCode | ch=$lastChain | $phDiag | $wootlyDiag | t=${secs}s | $wvDiag | ckn=$ckNames | $ctxDiag | wve=${wvErr ?: "-"} | $subDiag"
         callback(
             newExtractorLink(
                 "Mux",
@@ -1089,6 +1089,7 @@ class GoojaraProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit
     ): String {
         val mode = GoojaraSubs.mode
+        GoojaraTranslate.gtx429 = false
         val year = yearRegex.find(title)?.value?.toIntOrNull()
         val wantSeries = season != null && ep != null
         var tt = ttDirect
@@ -1114,6 +1115,16 @@ class GoojaraProvider : MainAPI() {
                 if (ara != null) {
                     subtitleCallback(SubtitleFile("العربية", ara))
                     "sub:ar"
+                } else if (eng != null) {
+                    // v21: no ready Arabic — translate the English file.
+                    val tr = GoojaraTranslate.translateOsEng(eng)
+                    if (tr != null) {
+                        subtitleCallback(SubtitleFile("العربية", tr.first))
+                        "sub:tr"
+                    } else {
+                        subtitleCallback(SubtitleFile("English", eng))
+                        "sub:tr-fail"
+                    }
                 } else "sub:no-match"
             }
             "en" -> {
@@ -1138,8 +1149,19 @@ class GoojaraProvider : MainAPI() {
                     subtitleCallback(SubtitleFile("العربية", ara))
                     "sub:ar-only"
                 } else if (eng != null) {
-                    subtitleCallback(SubtitleFile("English", eng))
-                    "sub:en-only"
+                    // v21: no ready Arabic — translate the English file.
+                    val tr = GoojaraTranslate.translateOsEng(eng)
+                    if (tr != null) {
+                        subtitleCallback(SubtitleFile("العربية", tr.first))
+                        val dualUrl = tr.second
+                        if (dualUrl != null) {
+                            subtitleCallback(SubtitleFile("العربية + الإنجليزية", dualUrl))
+                        }
+                        "sub:tr"
+                    } else {
+                        subtitleCallback(SubtitleFile("English", eng))
+                        "sub:tr-fail"
+                    }
                 } else "sub:no-match"
             }
         }

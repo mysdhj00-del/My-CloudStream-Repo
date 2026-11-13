@@ -236,24 +236,40 @@ object GoojaraTranslate {
 
     /**
      * Translates an OpenSubtitles English file to Arabic (cached).
-     * Returns TrResult with (arabicUrl, dualUrl?) on success, or failStage
-     * ("fetch" | "cues" | "gtx" | "store") on failure.
+     * Tries each candidate URL in order (best first): a dead file no
+     * longer kills the whole translation. Returns TrResult with
+     * (arabicUrl, dualUrl?) on success, or failStage ("fetch" | "cues" |
+     * "gtx" | "store") on failure.
      */
-    suspend fun translateOsEng(engUrl: String): TrResult {
-        val cached = cachedAr(engUrl)
-        if (cached != null) return TrResult(cached, cachedDual(engUrl), null)
-        val raw = try {
-            val res = app.get(engUrl)
-            if (res.isSuccessful) res.text.takeIf { it.isNotBlank() } else null
-        } catch (_: Exception) {
-            null
-        } ?: return TrResult(null, null, "fetch")
-        val cues = parseSubCues(raw)
-        if (cues.isEmpty()) return TrResult(null, null, "cues")
-        val translated = translateSubCues(cues) ?: return TrResult(null, null, "gtx")
-        val arUrl = storeSub(buildSubVTT(cues, translated)) ?: return TrResult(null, null, "store")
-        val dualUrl = storeSub(buildDualVTT(cues, translated))
-        putCache(engUrl, arUrl, dualUrl)
-        return TrResult(arUrl, dualUrl, null)
+    suspend fun translateOsEng(
+        engUrls: List<String>,
+        headers: Map<String, String>
+    ): TrResult {
+        var lastStage: String? = null
+        for (engUrl in engUrls) {
+            val cached = cachedAr(engUrl)
+            if (cached != null) return TrResult(cached, cachedDual(engUrl), null)
+            val raw = try {
+                val res = app.get(engUrl, headers = headers)
+                if (res.isSuccessful) res.text.takeIf { it.isNotBlank() } else null
+            } catch (_: Exception) {
+                null
+            }
+            if (raw == null) {
+                lastStage = "fetch"
+                continue
+            }
+            val cues = parseSubCues(raw)
+            if (cues.isEmpty()) {
+                lastStage = "cues"
+                continue
+            }
+            val translated = translateSubCues(cues) ?: return TrResult(null, null, "gtx")
+            val arUrl = storeSub(buildSubVTT(cues, translated)) ?: return TrResult(null, null, "store")
+            val dualUrl = storeSub(buildDualVTT(cues, translated))
+            putCache(engUrl, arUrl, dualUrl)
+            return TrResult(arUrl, dualUrl, null)
+        }
+        return TrResult(null, null, lastStage ?: "fetch")
     }
 }

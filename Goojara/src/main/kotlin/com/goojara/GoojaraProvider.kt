@@ -935,7 +935,8 @@ class GoojaraProvider : MainAPI() {
         }
         val secs = (System.currentTimeMillis() - t0) / 1000
         val hostsCsv = hosts.joinToString(",").take(80)
-        val debugName = "DEBUG Goojara v21 | hosts=$hostsCsv | srv=$goResolved/$goTotal | ext=$emittedLinks | dig=$digCount | ec=$embedCookiesFound | vc=$lastVideoCode | ch=$lastChain | $phDiag | $wootlyDiag | t=${secs}s | $wvDiag | ckn=$ckNames | $ctxDiag | wve=${wvErr ?: "-"} | $subDiag"
+        val debugName = "DEBUG Goojara v22 | hosts=$hostsCsv | srv=$goResolved/$goTotal | ext=$emittedLinks | dig=$digCount | ec=$embedCookiesFound | vc=$lastVideoCode | ch=$lastChain | $phDiag | $wootlyDiag | t=${secs}s | $wvDiag | ckn=$ckNames | $ctxDiag | wve=${wvErr ?: "-"} | $subDiag" +
+            (if (GoojaraTranslate.gtx429) " | sub:gtx429" else "")
         callback(
             newExtractorLink(
                 "Mux",
@@ -1118,12 +1119,12 @@ class GoojaraProvider : MainAPI() {
                 } else if (eng != null) {
                     // v21: no ready Arabic — translate the English file.
                     val tr = GoojaraTranslate.translateOsEng(eng)
-                    if (tr != null) {
-                        subtitleCallback(SubtitleFile("العربية", tr.first))
+                    if (tr.arUrl != null) {
+                        subtitleCallback(SubtitleFile("العربية", tr.arUrl))
                         "sub:tr"
                     } else {
                         subtitleCallback(SubtitleFile("English", eng))
-                        "sub:tr-fail"
+                        "sub:tr-fail-${tr.failStage ?: "?"}"
                     }
                 } else "sub:no-match"
             }
@@ -1151,16 +1152,16 @@ class GoojaraProvider : MainAPI() {
                 } else if (eng != null) {
                     // v21: no ready Arabic — translate the English file.
                     val tr = GoojaraTranslate.translateOsEng(eng)
-                    if (tr != null) {
-                        subtitleCallback(SubtitleFile("العربية", tr.first))
-                        val dualUrl = tr.second
+                    if (tr.arUrl != null) {
+                        subtitleCallback(SubtitleFile("العربية", tr.arUrl))
+                        val dualUrl = tr.dualUrl
                         if (dualUrl != null) {
                             subtitleCallback(SubtitleFile("العربية + الإنجليزية", dualUrl))
                         }
                         "sub:tr"
                     } else {
                         subtitleCallback(SubtitleFile("English", eng))
-                        "sub:tr-fail"
+                        "sub:tr-fail-${tr.failStage ?: "?"}"
                     }
                 } else "sub:no-match"
             }

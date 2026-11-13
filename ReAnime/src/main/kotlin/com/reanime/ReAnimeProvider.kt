@@ -478,7 +478,7 @@ class ReAnimeProvider : MainAPI() {
         }
 
         val secs = (System.currentTimeMillis() - t0) / 1000
-        val debugName = "DEBUG ReAnime v4 | mode=$mode | srv=${servers.size} | ext=$videoLinks | sub:emb=$subEmb | sub:pg=$subPg | sub:tr=$subTr | sub:ar=$arCount/$enTotal" +
+        val debugName = "DEBUG ReAnime v5 | mode=$mode | srv=${servers.size} | ext=$videoLinks | sub:emb=$subEmb | sub:pg=$subPg | sub:tr=$subTr | sub:ar=$arCount/$enTotal" +
             " | sub:os=$subOs" +
             (if (failLabels.isNotEmpty()) " | sub:fail=${failLabels.joinToString(",")}" else "") +
             (if (ReAnimeSubs.gtx429) " | sub:gtx429" else "") +

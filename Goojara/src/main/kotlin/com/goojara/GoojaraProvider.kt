@@ -41,7 +41,7 @@ import org.jsoup.nodes.Element
 import org.jsoup.select.Elements
 
 /**
- * Goojara provider for CloudStream 3 — v11, CATALOG-FIRST.
+ * Goojara provider for CloudStream 3 — v12 (phisher flow).
  *
  * Site: https://ww1.goojara.to — movies + TV series, English
  * titles, no login needed for browsing. Traced live from the
@@ -81,6 +81,30 @@ import org.jsoup.select.Elements
  * - Direct Links: the detail page lists ~25 links labelled
  *   "<Host> DVD" (hosts seen: Wootly, luluvdo, dood,
  *   streamplay), each href = go.php?url=<encrypted token>.
+ *
+ * v12 — PHISHER FLOW (traced from phisher98's public Goojara
+ * v5 plugin, decompiled from its published .cs3, then verified
+ * live from the sandbox on Matchbox /m76rXj):
+ * - The detail page's OWN Set-Cookie response header carries
+ *   aGooz (server-set, plain HTTP — no JS, no WebView), and
+ *   the page HTML carries a literal _3chk('NAME','VALUE')
+ *   call. The go.php cookie is "aGooz=V; NAME=V".
+ * - With that cookie, go.php answers 302 with the embed URL
+ *   in the Location header (Matchbox: 302 ->
+ *   https://www.wootly.ch/?v=KMGFEEE4). The old resolveOnce
+ *   only watched res.url, which never changes on a 302 —
+ *   that is why it scored 0/21 most runs.
+ * - Wootly embed: GET the page -> iframe src -> POST the
+ *   iframe with qdfx=1 -> regex var vd="..." + tk="..." ->
+ *   GET https://web.wootly.ch/grabm?t=<tk>&id=<vd> -> the
+ *   response text IS the direct video URL, emitted as one
+ *   "Wootly" link, quality 720p, referer = iframe src.
+ *   (From the sandbox the iframe URL itself 404s — datacenter
+ *   IP / no shared session — but the plugin runs the same
+ *   calls in the phone's app session, where phisher's addon
+ *   plays wootly 720p.)
+ * - The old phases (plain, WebView cookie, JS nav) stay as
+ *   fallback and only run when the phisher phase finds 0.
  *
  * PLAYBACK — NOT VERIFIED, and v1 does not pretend otherwise:
  * - go.php tokens are encrypted and session-bound: from the
@@ -430,6 +454,18 @@ class GoojaraProvider : MainAPI() {
     private var lastVideoCode = 0
     private var lastChain = "-"
 
+    // v12 (phisher flow): regexes for the _3chk pair in the
+    // detail HTML and the wootly vd/tk in the iframe POST.
+    private val chkRegex = Regex("""_3chk\(\s*'([^']+)'\s*,\s*'([^']+)'""")
+    private val vdRegex = Regex("""var\s+vd\s*=\s*["']([^"']+)["']""")
+    private val tkRegex = Regex("""tk\s*=\s*["']([^"']+)["']""")
+
+    /** v12 diag: aGooz + _3chk presence on the detail page. */
+    private var phDiag = "ph:-"
+
+    /** v12 diag: last wootly grabm outcome. */
+    private var wootlyDiag = "wt:-"
+
     // v6: v5 proved appContext() died silently inside getContext()
     // (ctx:- reset value, t=3s). The compiled call resolved to
     // ContextHelper_jvmKt — a class that exists ONLY in the stub
@@ -637,6 +673,8 @@ class GoojaraProvider : MainAPI() {
         embedCookiesFound = 0
         lastVideoCode = 0
         lastChain = "-"
+        phDiag = "ph:-"
+        wootlyDiag = "wt:-"
         val countingCallback: (ExtractorLink) -> Unit = { link ->
             emittedLinks++
             callback(link)
@@ -680,10 +718,72 @@ class GoojaraProvider : MainAPI() {
             }
             return resolved
         }
+        // v12 (phisher flow): one pass over the go.php links with
+        // the detail-page cookie. go.php answers 302 with the
+        // embed URL in the Location header — read it first, fall
+        // back to a changed final URL. Wootly embeds go through
+        // the grabm chain; the rest use the old dig/extractor
+        // path. Returns how many links resolved.
+        suspend fun resolvePhisher(links: Elements, cookie: String): Int {
+            var resolved = 0
+            val reqHeaders = headers + ("Cookie" to cookie)
+            for (a in links) {
+                if (System.currentTimeMillis() - t0 > 25000) break
+                val goUrl = normUrl(a.attr("href"))
+                if (goUrl.isBlank()) continue
+                val host = a.text().trim().split(" ").firstOrNull()
+                    ?.lowercase()?.ifBlank { null } ?: "go"
+                val res = runCatching {
+                    app.get(goUrl, headers = reqHeaders, referer = mainUrl)
+                }.getOrNull() ?: continue
+                val loc = res.headers["Location"] ?: res.headers["location"]
+                    ?: if (res.code in 200..299 && res.url != goUrl) res.url else null
+                if (loc == null) continue
+                resolved++
+                if (!hosts.contains(host)) hosts += host
+                try {
+                    if (loc.contains("wootly")) {
+                        if (resolveWootly(loc, goUrl, countingCallback)) {
+                            digCount++
+                            continue
+                        }
+                    }
+                    if (tryDirectExtract(loc, goUrl, countingCallback, cookie)) {
+                        digCount++
+                        continue
+                    }
+                    loadExtractor(loc, goUrl, subtitleCallback, countingCallback)
+                } catch (e: Exception) {
+                    // One dead host must not kill the rest.
+                }
+            }
+            return resolved
+        }
         var links: Elements? = null
+        var phCookie: String? = null
         try {
-            val doc = app.get(realData, headers = headers + ("Cache-Control" to "no-cache")).document
-            val found = doc.select("a[href*=go.php?url=]")
+            // v12 (phisher flow): the detail page's OWN Set-Cookie
+            // header carries aGooz, and the page HTML carries a
+            // literal _3chk('NAME','VALUE') call. The go.php
+            // cookie is "aGooz=V; NAME=V" — built here, used
+            // in Phase P below.
+            val detailResp = app.get(
+                realData,
+                headers = headers + ("Referer" to "https://www.goojara.to") +
+                    ("Cookie" to "") + ("Cache-Control" to "no-cache")
+            )
+            val doc = detailResp.document
+            val setCookie = detailResp.headers["Set-Cookie"]
+                ?: detailResp.headers["set-cookie"] ?: ""
+            val aGooz = Regex("""aGooz=([^;\r\n]+)""").find(setCookie)
+                ?.groupValues?.getOrNull(1)
+            val chk = chkRegex.find(doc.outerHtml())?.groupValues
+            val parts = ArrayList<String>()
+            if (!aGooz.isNullOrBlank()) parts += "aGooz=$aGooz"
+            if (chk != null && chk.size > 2) parts += "${chk[1]}=${chk[2]}"
+            phCookie = parts.joinToString("; ").ifEmpty { null }
+            phDiag = "ph:aGooz=${if (aGooz != null) 1 else 0}+chk=${if (chk != null) 1 else 0}"
+            val found = doc.select("#drl a").ifEmpty { doc.select("a[href*=go.php?url=]") }
             goTotal = found.size
             links = found
         } catch (e: Exception) {
@@ -691,8 +791,17 @@ class GoojaraProvider : MainAPI() {
         }
         val list = links
         if (list != null && list.isNotEmpty()) {
+            // Phase P (v12, phisher flow): the go.php cookie from
+            // the detail page, Location-header resolve, wootly
+            // grabm first. The old phases only run when it
+            // finds nothing.
+            if (phCookie != null) {
+                goResolved = resolvePhisher(list, phCookie)
+            }
             // Phase 0: plain HTTP, exactly as v3.
-            goResolved = resolveOnce(list, null)
+            if (goResolved == 0) {
+                goResolved = resolveOnce(list, null)
+            }
             // Phase 1: hidden WebView session (only when plain found nothing).
             if (goResolved == 0) {
                 val cookies = runCatching { webViewCookies(realData) }.getOrNull()
@@ -738,7 +847,7 @@ class GoojaraProvider : MainAPI() {
         }
         val secs = (System.currentTimeMillis() - t0) / 1000
         val hostsCsv = hosts.joinToString(",").take(80)
-        val debugName = "DEBUG Goojara v11 | hosts=$hostsCsv | srv=$goResolved/$goTotal | ext=$emittedLinks | dig=$digCount | ec=$embedCookiesFound | vc=$lastVideoCode | ch=$lastChain | t=${secs}s | $wvDiag | ckn=$ckNames | $ctxDiag | wve=${wvErr ?: "-"} | $subDiag"
+        val debugName = "DEBUG Goojara v12 | hosts=$hostsCsv | srv=$goResolved/$goTotal | ext=$emittedLinks | dig=$digCount | ec=$embedCookiesFound | vc=$lastVideoCode | ch=$lastChain | $phDiag | $wootlyDiag | t=${secs}s | $wvDiag | ckn=$ckNames | $ctxDiag | wve=${wvErr ?: "-"} | $subDiag"
         callback(
             newExtractorLink(
                 "Mux",
@@ -751,6 +860,58 @@ class GoojaraProvider : MainAPI() {
             }
         )
         return true
+    }
+
+    /**
+     * v12 (phisher flow): resolve a wootly embed to its direct
+     * video URL. GET the embed page -> iframe src -> POST the
+     * iframe with qdfx=1 -> regex var vd="..." + tk="..." ->
+     * GET https://web.wootly.ch/grabm?t=<tk>&id=<vd> -> the
+     * response text IS the video URL. Emitted as one "Wootly"
+     * link, quality 720p, referer = iframe src — exactly the
+     * single source phisher's addon plays. Returns true when
+     * a link was emitted. Fail-soft: any miss returns false.
+     */
+    private suspend fun resolveWootly(
+        embed: String,
+        referer: String,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        return try {
+            val page = app.get(embed, headers = headers, referer = referer)
+            val iframe = page.document.select("iframe").attr("src")
+                .takeIf { it.isNotBlank() } ?: return false
+            val post = app.post(
+                iframe,
+                data = mapOf("qdfx" to "1"),
+                referer = embed,
+                headers = headers
+            )
+            val text = post.text
+            val vd = vdRegex.find(text)?.groupValues?.getOrNull(1)
+                ?.takeIf { it.isNotBlank() } ?: return false
+            val tk = tkRegex.find(text)?.groupValues?.getOrNull(1)
+                ?.takeIf { it.isNotBlank() } ?: return false
+            val grab = app.get(
+                "https://web.wootly.ch/grabm?t=$tk&id=$vd",
+                headers = headers,
+                referer = iframe
+            )
+            wootlyDiag = "wt:${grab.code}"
+            val videoUrl = grab.text.trim()
+                .takeIf { it.startsWith("http") } ?: return false
+            val type = if (videoUrl.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+            callback(
+                newExtractorLink("Wootly", "Wootly", videoUrl, type) {
+                    this.referer = iframe
+                    this.quality = Qualities.P720.value
+                }
+            )
+            true
+        } catch (e: Exception) {
+            wootlyDiag = "wt:err"
+            false
+        }
     }
 
     /**

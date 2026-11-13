@@ -935,7 +935,7 @@ class GoojaraProvider : MainAPI() {
         }
         val secs = (System.currentTimeMillis() - t0) / 1000
         val hostsCsv = hosts.joinToString(",").take(80)
-        val debugName = "DEBUG Goojara v18 | hosts=$hostsCsv | srv=$goResolved/$goTotal | ext=$emittedLinks | dig=$digCount | ec=$embedCookiesFound | vc=$lastVideoCode | ch=$lastChain | $phDiag | $wootlyDiag | t=${secs}s | $wvDiag | ckn=$ckNames | $ctxDiag | wve=${wvErr ?: "-"} | $subDiag"
+        val debugName = "DEBUG Goojara v19 | hosts=$hostsCsv | srv=$goResolved/$goTotal | ext=$emittedLinks | dig=$digCount | ec=$embedCookiesFound | vc=$lastVideoCode | ch=$lastChain | $phDiag | $wootlyDiag | t=${secs}s | $wvDiag | ckn=$ckNames | $ctxDiag | wve=${wvErr ?: "-"} | $subDiag"
         callback(
             newExtractorLink(
                 "Mux",
@@ -1006,21 +1006,16 @@ class GoojaraProvider : MainAPI() {
 
     private val relayBase = "https://anime-subs-relay.mysdhj00-del.deno.net"
 
-    private fun httpGetText(url: String, timeoutMs: Int): String? {
+    /** v19: subtitle lookups go through the app's HTTP client
+     * (app.get) instead of a raw HttpURLConnection. The raw
+     * connection failed fast on the phone for Jujutsu Kaisen
+     * (sub:no-match while the files exist and score perfectly),
+     * while the same code worked for Prison Break — the app
+     * client shares the app's network stack and is the robust
+     * path. Returns null on any failure, same contract. */
+    private suspend fun httpGetText(url: String): String? {
         return runCatching {
-            val conn = java.net.URL(url).openConnection()
-                as java.net.HttpURLConnection
-            conn.requestMethod = "GET"
-            conn.connectTimeout = timeoutMs
-            conn.readTimeout = timeoutMs
-            conn.setRequestProperty("User-Agent", headers["User-Agent"] ?: "Mozilla/5.0")
-            conn.setRequestProperty("Accept", "application/json, text/plain, */*")
-            val stream = if (conn.responseCode in 200..299) {
-                conn.inputStream
-            } else {
-                return@runCatching null
-            }
-            stream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+            app.get(url, headers = headers).text.takeIf { it.isNotBlank() }
         }.getOrNull()
     }
 
@@ -1039,11 +1034,11 @@ class GoojaraProvider : MainAPI() {
         return out
     }
 
-    private fun resolveImdbId(latinTitle: String, year: Int?, wantSeries: Boolean): String? {
+    private suspend fun resolveImdbId(latinTitle: String, year: Int?, wantSeries: Boolean): String? {
         val bucket = latinTitle.firstOrNull()?.lowercaseChar() ?: return null
         val q = java.net.URLEncoder.encode(latinTitle, "UTF-8")
         val json = httpGetText(
-            "https://v2.sg.media-imdb.com/suggestion/$bucket/$q.json", 8000
+            "https://v2.sg.media-imdb.com/suggestion/$bucket/$q.json"
         ) ?: return null
         val arr = runCatching {
             JSONObject(json).optJSONArray("d")
@@ -1086,7 +1081,7 @@ class GoojaraProvider : MainAPI() {
         return bestUrl.ifBlank { null }
     }
 
-    private fun emitSubs(
+    private suspend fun emitSubs(
         title: String,
         season: Int?,
         ep: Int?,
@@ -1103,12 +1098,12 @@ class GoojaraProvider : MainAPI() {
                 if (!tt.isNullOrBlank()) break
             }
         }
-        if (tt.isNullOrBlank()) return "sub:no-match"
+        if (tt.isNullOrBlank()) return "sub:no-tt"
         val osUrl = if (wantSeries)
             "https://opensubtitles-v3.strem.io/subtitles/series/$tt:$season:$ep.json"
         else
             "https://opensubtitles-v3.strem.io/subtitles/movie/$tt.json"
-        val json = httpGetText(osUrl, 8000) ?: return "sub:no-match"
+        val json = httpGetText(osUrl) ?: return "sub:no-os"
         val arr = runCatching {
             JSONObject(json).optJSONArray("subtitles")
         }.getOrNull() ?: return "sub:no-match"

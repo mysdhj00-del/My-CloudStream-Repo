@@ -62,7 +62,8 @@ class ReAnimeProvider : MainAPI() {
         val lang: String,
         val anilistId: Int?,
         val tmdbId: Int?,
-        val season: Int?
+        val season: Int?,
+        val title: String?
     ) {
         fun toJson(): String {
             val o = JSONObject()
@@ -72,6 +73,7 @@ class ReAnimeProvider : MainAPI() {
             if (anilistId != null) o.put("anilistId", anilistId)
             if (tmdbId != null) o.put("tmdbId", tmdbId)
             if (season != null) o.put("season", season)
+            if (title != null) o.put("title", title)
             return o.toString()
         }
 
@@ -85,7 +87,8 @@ class ReAnimeProvider : MainAPI() {
                         o.optString("lang"),
                         if (o.has("anilistId") && !o.isNull("anilistId")) o.optInt("anilistId") else null,
                         if (o.has("tmdbId") && !o.isNull("tmdbId")) o.optInt("tmdbId") else null,
-                        if (o.has("season") && !o.isNull("season")) o.optInt("season") else null
+                        if (o.has("season") && !o.isNull("season")) o.optInt("season") else null,
+                        o.optString("title").ifEmpty { null }
                     )
                 } catch (_: Exception) {
                     null
@@ -204,7 +207,8 @@ class ReAnimeProvider : MainAPI() {
             lang = lang,
             anilistId = anime.anilistId,
             tmdbId = anime.themoviedbId,
-            season = anime.externalTmdbSeason
+            season = anime.externalTmdbSeason,
+            title = anime.title?.display()
         )
         return newEpisode(ref.toJson()) {
             this.name = title?.takeIf { it.isNotBlank() && !it.startsWith("Episode ") }
@@ -287,6 +291,61 @@ class ReAnimeProvider : MainAPI() {
         } catch (_: Exception) {
             null
         }
+    }
+
+    /**
+     * Fallback when the embed array produced no Arabic: look the episode up
+     * on OpenSubtitles by title (IMDb suggest, no key). If a ready Arabic
+     * file exists, emit it directly; else translate the English file with
+     * free gtx (phone-side) and emit AR + AR+EN dual. Returns a short
+     * marker for the DEBUG line.
+     */
+    private suspend fun runOsFallback(
+        ref: EpisodeRef,
+        subtitleCallback: (SubtitleFile) -> Unit
+    ): String {
+        val title = ref.title ?: return "no-title"
+        val tt = ReAnimeSubs.suggestImdbId(title, true) ?: return "no-tt"
+        val season = ref.season ?: 1
+        val seasonsToTry = if (season == 1) listOf(1) else listOf(season, 1)
+        for (s in seasonsToTry) {
+            val osUrl = "https://opensubtitles-v3.strem.io/subtitles/series/$tt:$s:${ref.ep}.json"
+            val arr = try {
+                val res = app.get(osUrl)
+                if (!res.isSuccessful) continue
+                org.json.JSONObject(res.text).optJSONArray("subtitles")
+            } catch (_: Exception) {
+                null
+            } ?: continue
+            val ara = ReAnimeSubs.bestOsSub(arr, "ara")
+            val eng = ReAnimeSubs.bestOsSub(arr, "eng")
+            if (ara != null) {
+                subtitleCallback(SubtitleFile("العربية", ara))
+                return "ar"
+            }
+            if (eng != null) {
+                if (ReAnimeSubs.gtx429) return "gtx429"
+                val raw = try {
+                    val res = app.get(eng)
+                    if (res.isSuccessful) res.text.takeIf { it.isNotBlank() } else null
+                } catch (_: Exception) {
+                    null
+                }
+                val cues = if (raw == null) emptyList() else ReAnimeSubs.parseSubCues(raw)
+                if (cues.isEmpty()) return "no-cues"
+                val translated = ReAnimeSubs.translateSubCues(cues) ?: return "fail"
+                val arUrl = ReAnimeSubs.storeSub(ReAnimeSubs.buildSubVTT(cues, translated))
+                    ?: return "fail"
+                subtitleCallback(SubtitleFile("العربية", arUrl))
+                val dualUrl = ReAnimeSubs.storeSub(ReAnimeSubs.buildDualVTT(cues, translated))
+                if (dualUrl != null) {
+                    subtitleCallback(SubtitleFile("العربية + الإنجليزية", dualUrl))
+                }
+                return "tr"
+            }
+            return "no-match"
+        }
+        return "no-os"
     }
 
     override suspend fun loadLinks(
@@ -392,8 +451,15 @@ class ReAnimeProvider : MainAPI() {
             }
         }
 
+        // ---- fallback: no Arabic from the embed array -> OpenSubtitles by title ----
+        var subOs = "-"
+        if (arCount == 0) {
+            subOs = runOsFallback(ref, subtitleCallback)
+        }
+
         val secs = (System.currentTimeMillis() - t0) / 1000
-        val debugName = "DEBUG ReAnime v2 | srv=${servers.size} | ext=$videoLinks | sub:emb=$subEmb | sub:pg=$subPg | sub:tr=$subTr | sub:ar=$arCount/$enTotal" +
+        val debugName = "DEBUG ReAnime v3 | srv=${servers.size} | ext=$videoLinks | sub:emb=$subEmb | sub:pg=$subPg | sub:tr=$subTr | sub:ar=$arCount/$enTotal" +
+            " | sub:os=$subOs" +
             (if (failLabels.isNotEmpty()) " | sub:fail=${failLabels.joinToString(",")}" else "") +
             (if (ReAnimeSubs.gtx429) " | sub:gtx429" else "") +
             " | t=${secs}s"

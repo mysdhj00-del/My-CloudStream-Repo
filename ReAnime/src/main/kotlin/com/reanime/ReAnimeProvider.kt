@@ -250,25 +250,29 @@ class ReAnimeProvider : MainAPI() {
         }
     }
 
-    private suspend fun fetchSubTracks(embedId: String): List<SubTrack> {
+    private data class SubFetch(val tracks: List<SubTrack>, val embOk: Int, val pageCode: Int)
+
+    private suspend fun fetchSubTracks(embedId: String): SubFetch {
         val headers = mapOf(
             "User-Agent" to (ReAnimeApi.BROWSER_HEADERS["User-Agent"] ?: "Mozilla/5.0"),
             "Referer" to "${ReAnimeApi.FLIX_EMBED_BASE}/",
             "Accept" to "*/*"
         )
+        var lastCode = 0
         for (v in listOf("1", "2")) {
             try {
                 val page = app.get("${ReAnimeApi.FLIX_EMBED_BASE}/e/$embedId?v=$v", headers = headers)
+                lastCode = page.code
                 if (!page.isSuccessful) continue
                 val arr = subArrayRe.find(page.text)?.groupValues?.get(1) ?: continue
                 val tracks = subEntryRe.findAll(arr).map {
                     SubTrack(it.groupValues[1], it.groupValues[2], it.groupValues[3], it.groupValues[4] == "true")
                 }.toList()
-                if (tracks.isNotEmpty()) return tracks
+                if (tracks.isNotEmpty()) return SubFetch(tracks, 1, lastCode)
             } catch (_: Exception) {
             }
         }
-        return emptyList()
+        return SubFetch(emptyList(), 1, lastCode)
     }
 
     private suspend fun fetchTrackText(url: String, embedUrl: String): String? {
@@ -320,12 +324,19 @@ class ReAnimeProvider : MainAPI() {
         // ---- subtitle gear: every English track -> EN alone / AR alone / AR+EN dual ----
         var enTotal = 0
         var arCount = 0
+        var subEmb = 0
+        var subPg = 0
+        var subTr = 0
         val failLabels = ArrayList<String>()
         ReAnimeSubs.gtx429 = false
         val subEmbedId = servers.firstOrNull { it.hardsub != true }
             ?.dataLink?.let { FlixDownload.embedId(it) }
         if (subEmbedId != null) {
-            val tracks = fetchSubTracks(subEmbedId)
+            subEmb = 1
+            val fetched = fetchSubTracks(subEmbedId)
+            subPg = fetched.pageCode
+            subTr = fetched.tracks.size
+            val tracks = fetched.tracks
             val enTracks = tracks.filter { it.label.startsWith("English", ignoreCase = true) }
             enTotal = enTracks.size
             val embedUrl = "${ReAnimeApi.FLIX_EMBED_BASE}/e/$subEmbedId?v=1"
@@ -382,7 +393,7 @@ class ReAnimeProvider : MainAPI() {
         }
 
         val secs = (System.currentTimeMillis() - t0) / 1000
-        val debugName = "DEBUG ReAnime v1 | srv=${servers.size} | ext=$videoLinks | sub:ar=$arCount/$enTotal" +
+        val debugName = "DEBUG ReAnime v2 | srv=${servers.size} | ext=$videoLinks | sub:emb=$subEmb | sub:pg=$subPg | sub:tr=$subTr | sub:ar=$arCount/$enTotal" +
             (if (failLabels.isNotEmpty()) " | sub:fail=${failLabels.joinToString(",")}" else "") +
             (if (ReAnimeSubs.gtx429) " | sub:gtx429" else "") +
             " | t=${secs}s"

@@ -196,6 +196,51 @@ object ReAnimeSubs {
         ).trim()
     }
 
+    /** IMDb suggest (no key): title -> tt id. */
+    suspend fun suggestImdbId(query: String, wantSeries: Boolean): String? {
+        return try {
+            val bucket = query.firstOrNull()?.lowercaseChar() ?: return null
+            val q = URLEncoder.encode(query, "UTF-8")
+            val text = app.get("https://v2.sg.media-imdb.com/suggestion/$bucket/$q.json").text
+            val arr = org.json.JSONObject(text).optJSONArray("d") ?: return null
+            var fallback: String? = null
+            for (i in 0 until arr.length()) {
+                val o = arr.optJSONObject(i) ?: continue
+                val id = o.optString("id")
+                if (!id.startsWith("tt")) continue
+                if (fallback == null) fallback = id
+                val kind = o.optString("q")
+                if (wantSeries && kind == "TV series") return id
+                if (!wantSeries && kind == "feature") return id
+            }
+            fallback
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    /** Best OpenSubtitles file for one language: fps 23.976 + UTF-8 first. */
+    fun bestOsSub(arr: org.json.JSONArray, lang: String): String? {
+        var bestUrl = ""
+        var bestScore = -1
+        for (i in 0 until arr.length()) {
+            val o = arr.optJSONObject(i) ?: continue
+            if (o.optString("lang") != lang) continue
+            val u = o.optString("url")
+            if (u.isBlank()) continue
+            var score = 0
+            if (o.optInt("fpsMilli", 0) == 23976) score += 3
+            val fmt = o.optString("releaseFormat")
+            if (fmt == "BluRay" || fmt == "WEB") score += 2
+            if (o.optString("SubEncoding") == "UTF-8") score += 1
+            if (score > bestScore) {
+                bestScore = score
+                bestUrl = u
+            }
+        }
+        return bestUrl.ifBlank { null }
+    }
+
     /** Hosts a finished VTT on the relay and returns its https URL. */
     suspend fun storeSub(vtt: String): String? {
         return try {

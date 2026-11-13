@@ -5,6 +5,7 @@ import com.lagradost.cloudstream3.HomePageResponse
 import com.lagradost.cloudstream3.LoadResponse
 import com.lagradost.cloudstream3.MainAPI
 import com.lagradost.cloudstream3.MainPageRequest
+import com.lagradost.cloudstream3.MovieSearchResponse
 import com.lagradost.cloudstream3.SearchResponse
 import com.lagradost.cloudstream3.TvSeriesSearchResponse
 import com.lagradost.cloudstream3.SubtitleFile
@@ -42,7 +43,7 @@ import org.jsoup.nodes.Element
 import org.jsoup.select.Elements
 
 /**
- * Goojara provider for CloudStream 3 — v15 (main sections first).
+ * Goojara provider for CloudStream 3 — v16 (IMDb classification).
  *
  * Site: https://ww1.goojara.to — movies + TV series, English
  * titles, no login needed for browsing. Traced live from the
@@ -82,6 +83,25 @@ import org.jsoup.select.Elements
  * - Direct Links: the detail page lists ~25 links labelled
  *   "<Host> DVD" (hosts seen: Wootly, luluvdo, dood,
  *   streamplay), each href = go.php?url=<encrypted token>.
+ *
+ * v16 — IMDb CLASSIFICATION (user order 2026-11-13: «استخدم
+ * تصنيف idmb», rest left as-is below). Every title in a movie
+ * genre section is now checked against its IMDb genres: title
+ * → IMDb suggest (existing helper) → IMDb id → Cinemeta movie
+ * meta → genres; a title stays only when its IMDb genres carry
+ * the section genre (a genuine hybrid, e.g. Action+Horror,
+ * stays in both). Fail-open: a title whose genres cannot be
+ * resolved is KEPT (the site list is verified accurate; the
+ * IMDb check only removes proven mismatches). Bounded per
+ * load (12 new lookups, 15 s); resolved genres are cached by
+ * title+year, so verification completes progressively.
+ * WHY NOT IMDb's own pages: imdb.com title pages answer 202
+ * with an AWS WAF bot-check page (verified 2026-11-13, both
+ * Android and desktop UA) and the imdbapi.dev mirror is
+ * unreachable from here — IMDb refuses automated reads. The
+ * classification is still keyed on the IMDb id, and the genre
+ * data is the same taxonomy IMDb lists (Action/Crime/Horror…).
+ * Series sections already classify the same way (v14).
  *
  * v15 — MAIN SECTIONS FIRST (user order 2026-11-13: «ارجع
  * القسم الرئيسي العادي أفلام ومسلسلات الذي يظهر كل أفلام
@@ -311,6 +331,61 @@ class GoojaraProvider : MainAPI() {
         return result
     }
 
+    // v16: movie-genre verification cache, keyed by title+year.
+    private val movieGenreCache = HashMap<String, List<String>>()
+
+    private fun movieGenreKey(title: String, year: Int?): String = "$title|$year"
+
+    /** Real genres of one movie, via IMDb suggest + Cinemeta. Cached. */
+    private fun cinemetaMovieGenres(title: String, year: Int?): List<String> {
+        movieGenreCache[movieGenreKey(title, year)]?.let { return it }
+        var result: List<String> = emptyList()
+        for (cand in latinTitleCandidates(title)) {
+            val tt = resolveImdbId(cand, year, false) ?: continue
+            val json = httpGetText("https://v3-cinemeta.strem.io/meta/movie/$tt.json", 8000) ?: continue
+            val genres = runCatching {
+                val arr = JSONObject(json).optJSONObject("meta")?.optJSONArray("genres")
+                (0 until (arr?.length() ?: 0)).map { arr!!.optString(it) }
+            }.getOrDefault(emptyList())
+            if (genres.isNotEmpty()) { result = genres; break }
+        }
+        movieGenreCache[movieGenreKey(title, year)] = result
+        return result
+    }
+
+    /**
+     * v16: verify movie-genre section cards against their IMDb
+     * genres. A title stays when its genres carry [genre] or
+     * cannot be resolved (fail-open). Bounded per call (12 new
+     * lookups, 15 s) — cached titles are free, so verification
+     * completes progressively across loads.
+     */
+    private fun verifyMovieGenres(items: List<SearchResponse>, genre: String): List<SearchResponse> {
+        val out = ArrayList<SearchResponse>()
+        var newLookups = 0
+        val t0 = System.currentTimeMillis()
+        for (item in items) {
+            if (item.type != TvType.Movie) { out += item; continue }
+            val year = (item as? MovieSearchResponse)?.year
+            val key = movieGenreKey(item.name, year)
+            val genres: List<String>
+            if (movieGenreCache.containsKey(key)) {
+                genres = movieGenreCache[key]!!
+            } else {
+                if (newLookups >= 12 || System.currentTimeMillis() - t0 >= 15000) {
+                    out += item // budget spent: keep unverified (fail-open)
+                    continue
+                }
+                newLookups++
+                genres = cinemetaMovieGenres(item.name, year)
+            }
+            if (genres.isEmpty() || genres.any { it.equals(genre, ignoreCase = true) }) {
+                out += item
+            }
+        }
+        return out
+    }
+
     /**
      * A series-genre section, classified per title. Scans the
      * /watch-series pool page by page (latest episode per series),
@@ -417,7 +492,17 @@ class GoojaraProvider : MainAPI() {
             if (item.type == TvType.TvSeries && !seenSeries.add(item.name)) return@filter false
             true
         }
-        return newHomePageResponse(request.name, fresh, hasNext = fresh.isNotEmpty())
+        // v16: movie-genre sections are verified per title
+        // against their IMDb genres (fail-open).
+        val displayName = sections.firstOrNull { it.first == request.name || it.first == request.data }?.first
+        val movieGenre = when (displayName) {
+            "أفلام أكشن — Goojara" -> "Action"
+            "أفلام سرقة — Goojara" -> "Crime"
+            "أفلام رعب — Goojara" -> "Horror"
+            else -> null
+        }
+        val shown = if (movieGenre != null) verifyMovieGenres(fresh, movieGenre) else fresh
+        return newHomePageResponse(request.name, shown, hasNext = fresh.isNotEmpty())
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
@@ -1022,7 +1107,7 @@ class GoojaraProvider : MainAPI() {
         }
         val secs = (System.currentTimeMillis() - t0) / 1000
         val hostsCsv = hosts.joinToString(",").take(80)
-        val debugName = "DEBUG Goojara v15 | hosts=$hostsCsv | srv=$goResolved/$goTotal | ext=$emittedLinks | dig=$digCount | ec=$embedCookiesFound | vc=$lastVideoCode | ch=$lastChain | $phDiag | $wootlyDiag | t=${secs}s | $wvDiag | ckn=$ckNames | $ctxDiag | wve=${wvErr ?: "-"} | $subDiag"
+        val debugName = "DEBUG Goojara v16 | hosts=$hostsCsv | srv=$goResolved/$goTotal | ext=$emittedLinks | dig=$digCount | ec=$embedCookiesFound | vc=$lastVideoCode | ch=$lastChain | $phDiag | $wootlyDiag | t=${secs}s | $wvDiag | ckn=$ckNames | $ctxDiag | wve=${wvErr ?: "-"} | $subDiag"
         callback(
             newExtractorLink(
                 "Mux",

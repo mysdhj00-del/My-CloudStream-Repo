@@ -317,7 +317,13 @@ class FiveTVProvider : MainAPI() {
         // A lane ends ONLY when a page brings zero NEW cards —
         // never a fixed page cap, never after page 1. A clamped
         // past-the-end page yields zero new cards via this dedupe.
+        // v5: page 1 is a FRESH home load — clear the lane's seen
+        // set first. Without this, reloading home after the
+        // section was browsed (or after an in-place plugin update)
+        // returns zero "new" cards and the row shows its title
+        // with no posters at all.
         val seen = laneSeen.getOrPut(request.data) { LinkedHashSet() }
+        if (page <= 1) seen.clear()
         val fresh = cards.filter { seen.add(it.url) }
         return newHomePageResponse(
             listOf(HomePageList(request.name, fresh, isHorizontalImages = true)),
@@ -671,7 +677,7 @@ class FiveTVProvider : MainAPI() {
         fun elapsed() = System.currentTimeMillis() - t0
         val doc = getDoc(data, referer = "$mainUrl/")
         if (doc == null) {
-            emitDebug(listOf("FiveTV v4", "page-fail", "gate?"), callback)
+            emitDebug(listOf("FiveTV v5", "page-fail", "gate?"), callback)
             return true
         }
         val pageText = doc.text()
@@ -800,7 +806,7 @@ class FiveTVProvider : MainAPI() {
         // must be visible on the next failure as well.
         if (allowDebug) {
             emitDebug(
-                listOf("FiveTV v4") + diagExtra +
+                listOf("FiveTV v5") + diagExtra +
                     listOf("srv=${embeds.size}", "ext=$extOk",
                         "dig=$digOk", "relay=$relayOk", "t=${elapsed() / 1000}s"),
                 callback

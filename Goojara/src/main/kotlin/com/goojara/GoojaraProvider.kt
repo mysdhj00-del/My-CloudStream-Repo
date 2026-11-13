@@ -935,7 +935,7 @@ class GoojaraProvider : MainAPI() {
         }
         val secs = (System.currentTimeMillis() - t0) / 1000
         val hostsCsv = hosts.joinToString(",").take(80)
-        val debugName = "DEBUG Goojara v19 | hosts=$hostsCsv | srv=$goResolved/$goTotal | ext=$emittedLinks | dig=$digCount | ec=$embedCookiesFound | vc=$lastVideoCode | ch=$lastChain | $phDiag | $wootlyDiag | t=${secs}s | $wvDiag | ckn=$ckNames | $ctxDiag | wve=${wvErr ?: "-"} | $subDiag"
+        val debugName = "DEBUG Goojara v20 | hosts=$hostsCsv | srv=$goResolved/$goTotal | ext=$emittedLinks | dig=$digCount | ec=$embedCookiesFound | vc=$lastVideoCode | ch=$lastChain | $phDiag | $wootlyDiag | t=${secs}s | $wvDiag | ckn=$ckNames | $ctxDiag | wve=${wvErr ?: "-"} | $subDiag"
         callback(
             newExtractorLink(
                 "Mux",
@@ -1129,6 +1129,9 @@ class GoojaraProvider : MainAPI() {
                         .append("&ara=")
                         .append(java.net.URLEncoder.encode(ara, "UTF-8"))
                         .toString()
+                    // v20: emit BOTH tracks (same as ReAnime v6) — Arabic alone
+                    // plus the merged Arabic+English, instead of the merged one only.
+                    subtitleCallback(SubtitleFile("العربية", ara))
                     subtitleCallback(SubtitleFile("العربية + الإنجليزية", mergeUrl))
                     "sub:dual"
                 } else if (ara != null) {

@@ -91,14 +91,44 @@ class FasselHDProvider : MainAPI() {
         "Accept-Language" to "ar-EG,ar;q=0.9,en-US;q=0.8,en;q=0.7"
     )
 
+    // v7: full section list — every network the site itself
+    // lists in its Movies / Series / Dubbed dropdowns, each
+    // verified live against the API (total > 0). Two site
+    // entries are genuinely empty on this API host and are
+    // left out: 7885 (انمي مدبلج) and 8008 (مسلسلات شورت).
+    // Movie and dubbed networks need the "{id}-vide-vide-
+    // vide-{kind}" slug form (plain numeric id returns 0);
+    // series networks answer to the plain numeric id.
     override val mainPage = mainPageOf(
         "home" to "المميزة والرائجة",
+        // --- أفلام ---
         "net:vide-vide-created-vide-movie" to "أفلام",
+        "net:7093-vide-vide-vide-movie" to "أفلام أجنبية",
+        "net:7462-vide-vide-vide-movie" to "أفلام عربية",
+        "net:7094-vide-vide-vide-movie" to "أفلام أنمي",
+        "net:7095-vide-vide-vide-movie" to "أفلام آسيوية",
+        "net:7096-vide-vide-vide-movie" to "أفلام هندية",
+        "net:7097-vide-vide-vide-movie" to "أفلام تركية",
+        "net:7098-vide-vide-vide-movie" to "أفلام وثائقية",
+        // --- مسلسلات ---
         "net:vide-vide-created-vide-serie" to "مسلسلات",
-        "net:vide-vide-vide-vide-modablej" to "مدبلج",
-        "neta:7869" to "أنمي",
+        "net:7865" to "مسلسلات أجنبية",
+        "net:7007" to "مسلسلات عربية",
+        "net:7866" to "مسلسلات آسيوية مترجمة",
+        "net:7867" to "مسلسلات تركية مترجمة",
+        "net:7868" to "مسلسلات هندية مترجمة",
         "net:213" to "مسلسلات نتفلكس",
-        "net:8618" to "مسلسلات رمضان 2026"
+        "net:6394" to "مسلسلات رمضان 2023",
+        "net:7270" to "مسلسلات رمضان 2024",
+        "net:8006" to "مسلسلات رمضان 2025",
+        "net:8618" to "مسلسلات رمضان 2026",
+        // --- مدبلج ---
+        "net:vide-vide-vide-vide-modablej" to "مدبلج",
+        "net:7870-vide-vide-vide-modablej" to "مسلسلات تركية مدبلجة",
+        "net:7875-vide-vide-vide-modablej" to "مسلسلات هندية مدبلجة",
+        "net:7884-vide-vide-vide-modablej" to "كرتون مدبلج",
+        // --- أنمي ---
+        "neta:7869" to "أنمي"
     )
 
     // ---------- small JSON helpers (the API mixes nulls, "None" strings,

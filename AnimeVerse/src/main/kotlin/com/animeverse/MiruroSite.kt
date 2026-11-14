@@ -3,6 +3,7 @@ package com.animeverse
 import com.lagradost.cloudstream3.LoadResponse
 import com.lagradost.cloudstream3.SearchResponse
 import com.lagradost.cloudstream3.SubtitleFile
+import com.lagradost.cloudstream3.TrailerData
 import com.lagradost.cloudstream3.TvType
 import com.lagradost.cloudstream3.MainAPI
 import com.lagradost.cloudstream3.app
@@ -441,6 +442,7 @@ object MiruroSite : AnimeSite {
             return api.newMovieLoadResponse(cleanTitle(title), canonical, TvType.AnimeMovie, watchUrl) {
                 this.posterUrl = poster
                 this.plot = plot
+                this.trailers = AnimeSubs.trailerFor(cleanTitle(title), isSeries = false, acceptPv = true)
             }
         }
         val epCount = Regex("""episodes:(\d+)""").find(html)?.groupValues?.get(1)?.toIntOrNull() ?: 1
@@ -453,6 +455,7 @@ object MiruroSite : AnimeSite {
         return api.newTvSeriesLoadResponse(cleanTitle(title), canonical, TvType.Anime, episodes) {
             this.posterUrl = poster
             this.plot = plot
+            this.trailers = AnimeSubs.trailerFor(cleanTitle(title), isSeries = true, acceptPv = true)
         }
     }
 

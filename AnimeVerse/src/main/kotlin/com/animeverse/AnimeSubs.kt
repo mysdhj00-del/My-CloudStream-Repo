@@ -16,7 +16,9 @@ import java.net.URLEncoder
  * /subtitles/movie/<tt>.json (films). Arabic = first ara file,
  * UTF-8 preferred. The merged AR+EN file is built by the relay
  * (GET /relay/mergesubs) from the resolved public URLs; the
- * auto-translate fallback (phone-IP gtx + store) stays phone-side.
+ * auto-translate fallback lives in AnimeTranslate (phone-side
+ * gtx + MyMemory, cached) — the old gtx-only translateSubCues
+ * was deleted in v21 (it threw on the phone, Panel #10).
  * MiruroSite still carries its own copies (v12 verified) — it
  * migrates to this object in a later cleanup, not in v13.
  */
@@ -227,7 +229,10 @@ object AnimeSubs {
 
     fun cleanSubText(t: String): String {
         return fixSubEncoding(
-            t.replace(Regex("<[^>]+>"), "")
+            t.replace(Regex("""\{[^}]*\}"""), "")
+                .replace("\\N", " ")
+                .replace("\\n", " ")
+                .replace(Regex("<[^>]+>"), "")
                 .replace("&amp;", "&")
                 .replace("&lt;", "<")
                 .replace("&gt;", ">")
@@ -269,41 +274,4 @@ object AnimeSubs {
         }
     }
 
-    /** Translates cue texts via public gtx, char-budgeted batches. Null on total failure. */
-    suspend fun translateSubCues(cues: List<SubCue>): List<String>? {
-        val out = ArrayList<String>()
-        var batch = ArrayList<String>()
-        var batchChars = 0
-        suspend fun flush(): Boolean {
-            if (batch.isEmpty()) return true
-            return try {
-                val params = StringBuilder("client=gtx&sl=en&tl=ar&dt=t")
-                for (t in batch) params.append("&q=").append(URLEncoder.encode(t, "UTF-8"))
-                val text = app.get("https://translate.googleapis.com/translate_a/single?$params").text
-                val arr = org.json.JSONArray(text).optJSONArray(0) ?: return false
-                if (arr.length() != batch.size) return false
-                for (i in 0 until arr.length()) {
-                    val entry = arr.optJSONArray(i)
-                    val tr = entry?.optString(0)?.ifEmpty { null }
-                    out.add(tr ?: batch[i])
-                }
-                true
-            } catch (e: Exception) {
-                false
-            } finally {
-                batch = ArrayList()
-                batchChars = 0
-            }
-        }
-        for (c in cues) {
-            val t = c.text.replace("\n", " ")
-            if (batch.isNotEmpty() && (batchChars + t.length > 4000 || batch.size >= 50)) {
-                if (!flush()) return null
-            }
-            batch.add(t)
-            batchChars += t.length
-        }
-        if (!flush()) return null
-        return out
-    }
 }

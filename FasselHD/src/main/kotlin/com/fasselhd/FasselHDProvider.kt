@@ -184,6 +184,33 @@ class FasselHDProvider : MainAPI() {
         return runCatching { JSONObject(text) }.getOrNull()
     }
 
+    /**
+     * v8: single status probe, used ONLY on the load-failure
+     * path to tell a server-broken record apart from a network
+     * failure. A scattered set of OLD records (series AND
+     * movies, e.g. serie 3142 and its neighbours 3135-3150)
+     * makes the operator's own detail endpoints answer HTTP
+     * 500 "Server Error" — verified live 2026-11-14, persistent,
+     * identical on the sister host (shared DB). The catalog
+     * lists them fine (different endpoint); only the detail
+     * controller is broken, and no alternate endpoint lists
+     * their seasons/episodes, so those titles cannot be
+     * recovered client-side — the message says so plainly.
+     */
+    private suspend fun apiStatus(path: String): Int? {
+        val base = liveBase ?: primaryApi
+        return runCatching {
+            app.get("$base/$path", headers = browserHeaders).code
+        }.getOrNull()
+    }
+
+    private suspend fun brokenDetailMessage(path: String, kind: String): String {
+        return if (apiStatus(path) == 500)
+            "تفاصيل هذا $kind معطّلة من خادم الموقع (خطأ 500) — الحلقات غير متاحة"
+        else
+            "No detail"
+    }
+
     // ---------- cards ----------
 
     private fun rowToCard(row: JSONObject, forceAnime: Boolean = false): SearchResponse? {
@@ -305,7 +332,9 @@ class FasselHDProvider : MainAPI() {
     }
 
     private suspend fun loadMovie(id: String, url: String): LoadResponse {
-        val root = apiJson("media/detail/$id/1") ?: throw ErrorLoadingException("No detail")
+        val detailPath = "media/detail/$id/1"
+        val root = apiJson(detailPath)
+            ?: throw ErrorLoadingException(brokenDetailMessage(detailPath, "الفيلم"))
         val title = s(root, "title").ifBlank { s(root, "original_name") }
         if (title.isBlank()) throw ErrorLoadingException("No title")
         val year = yearOf(s(root, "release_date"))
@@ -320,7 +349,9 @@ class FasselHDProvider : MainAPI() {
     }
 
     private suspend fun loadSeries(id: String, url: String, anime: Boolean): LoadResponse {
-        val root = apiJson("series/show/$id/1") ?: throw ErrorLoadingException("No detail")
+        val showPath = "series/show/$id/1"
+        val root = apiJson(showPath)
+            ?: throw ErrorLoadingException(brokenDetailMessage(showPath, "المسلسل"))
         val title = s(root, "name").ifBlank { s(root, "original_name") }
         if (title.isBlank()) throw ErrorLoadingException("No title")
         val year = yearOf(s(root, "first_air_date"))

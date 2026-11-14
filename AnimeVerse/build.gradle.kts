@@ -1,9 +1,10 @@
 // AnimeVerse CloudStream plugin module — multi-site anime addon.
-// v21: Goojara v26 translation engine ported in as
-// AnimeTranslate (gtx + MyMemory fallback, cached) — replaces
-// the gtx-only translate in all three sites (Miruro, GogoAnime,
-// Aniwatch); DEBUG tags v21 on every member.
-version = 21
+// v22: settings gear (openSettings) — v21 shipped WITHOUT one,
+// so the repo list showed no gear next to AnimeVerse. Same three
+// subtitle-mode options as Goojara; emissions in all three sites
+// gated by the mode (default "dual" = v21 behaviour); DEBUG gains
+// mode:<ar|en|dual>.
+version = 22
 
 android {
     namespace = "com.animeverse"

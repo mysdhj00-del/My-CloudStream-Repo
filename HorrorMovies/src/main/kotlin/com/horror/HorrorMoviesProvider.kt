@@ -7,6 +7,7 @@ import com.lagradost.cloudstream3.MainAPI
 import com.lagradost.cloudstream3.MainPageRequest
 import com.lagradost.cloudstream3.SearchResponse
 import com.lagradost.cloudstream3.SubtitleFile
+import com.lagradost.cloudstream3.TrailerData
 import com.lagradost.cloudstream3.TvType
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.mainPageOf
@@ -436,6 +437,87 @@ class HorrorMoviesProvider : MainAPI() {
         doc.selectFirst("meta[property=og:$prop]")?.attr("content")
             ?.trim()?.ifBlank { null }
 
+    // ---------------------------------------------------------------
+    // Trailer (v11, user order 2026-11-14 — applies to EVERY title
+    // in the addon, on the detail page)
+    // ---------------------------------------------------------------
+    /**
+     * Trailer lookup: YouTube search (free, no key) with the desktop
+     * UA — the mobile search page returns no parseable results, the
+     * desktop page carries ytInitialData with videoId + title runs.
+     * Verified live 2026-11-14 on 4 titles (Insidious Possession
+     * 2026, Shark Lake, Apocalypse Z, The Nun): the first result
+     * whose title contains "trailer" is the official trailer every
+     * time, and oEmbed confirms the video is public. IMDb's own title
+     * page is 202-blocked from datacenter IPs, so IMDb is the title
+     * resolver only (the subtitle gear's resolveImdbId) — not the
+     * video host. The app shows its trailer button from
+     * LoadResponse.trailers; a missing button means the search found
+     * nothing for that title. Returns emptyList() on any failure —
+     * a missing trailer must never break the detail page.
+     */
+    private suspend fun trailerFor(title: String): List<TrailerData> {
+        return try {
+            val year = Regex("""(19|20)\d\d""").find(title)?.value
+            val queries = ArrayList<String>()
+            for (cand in latinTitleCandidates(title)) {
+                queries += "$cand ${year ?: ""} official trailer".trim()
+            }
+            if (queries.isEmpty()) {
+                val clean = cleanMovieTitle(title)
+                if (clean.isNotBlank()) queries += "$clean ${year ?: ""} trailer".trim()
+            }
+            for (q in queries) {
+                val id = youtubeTrailerId(q) ?: continue
+                return listOf(
+                    TrailerData(
+                        "https://www.youtube.com/watch?v=$id",
+                        "https://www.youtube.com/",
+                        false
+                    )
+                )
+            }
+            emptyList()
+        } catch (_: Exception) {
+            emptyList()
+        }
+    }
+
+    /**
+     * One YouTube search: the first videoId whose nearby title
+     * contains "trailer", else the first videoId seen. Null when
+     * the page carries no videoId at all. Each videoId is paired
+     * with the title run that follows it in the same renderer
+     * (within 800 chars), not by zipping two global lists — the
+     * page repeats ids across sections, so global zipping can
+     * misalign.
+     */
+    private suspend fun youtubeTrailerId(query: String): String? {
+        return try {
+            val url = "https://www.youtube.com/results?search_query=" +
+                java.net.URLEncoder.encode(query, "UTF-8")
+            val html = app.get(url, headers = browserHeaders).text
+            if (html.isBlank()) return null
+            val idRe = Regex(""""videoId":"([A-Za-z0-9_-]{11})"""")
+            val titleRe =
+                Regex(""""title":\{"runs":\[\{"text":"([^"]{3,120})"""")
+            var firstId: String? = null
+            val seen = HashSet<String>()
+            for (m in idRe.findAll(html)) {
+                val id = m.groupValues[1]
+                if (!seen.add(id)) continue
+                if (firstId == null) firstId = id
+                val end = minOf(html.length, m.range.last + 800)
+                val window = html.substring(m.range.last, end)
+                val t = titleRe.find(window)?.groupValues?.get(1) ?: continue
+                if (t.contains("trailer", ignoreCase = true)) return id
+            }
+            firstId
+        } catch (_: Exception) {
+            null
+        }
+    }
+
     override suspend fun load(url: String): LoadResponse {
         return when {
             url.contains("moviz.land") -> {
@@ -455,10 +537,12 @@ class HorrorMoviesProvider : MainAPI() {
                     if (rating != null) append("★ التقييم: $rating/10\n")
                     if (!desc.isNullOrBlank()) append(desc)
                 }.ifBlank { null }
+                val trailers = trailerFor(title)
                 newMovieLoadResponse(title.ifBlank { "MovizLand" }, url, TvType.Movie, subData(url, title)) {
                     this.posterUrl = poster
                     this.backgroundPosterUrl = poster
                     this.plot = plot
+                    this.trailers = trailers
                 }
             }
             url.contains("egibest") -> {
@@ -468,10 +552,12 @@ class HorrorMoviesProvider : MainAPI() {
                 val title = cleanMovieTitle(og(doc ?: return movieFallback(url), "title") ?: "")
                 val poster = doc?.let { og(it, "image") }
                 val desc = doc?.let { og(it, "description") }
+                val trailers = trailerFor(title)
                 newMovieLoadResponse(title.ifBlank { "EgyBest" }, url, TvType.Movie, subData(url, title)) {
                     this.posterUrl = poster
                     this.backgroundPosterUrl = poster
                     this.plot = desc
+                    this.trailers = trailers
                 }
             }
             url.contains("mycima") -> {
@@ -482,10 +568,12 @@ class HorrorMoviesProvider : MainAPI() {
                 val poster = doc?.let { og(it, "image") }
                     ?: doc?.selectFirst("img[src*=uploads]")?.attr("src")
                 val desc = doc?.let { og(it, "description") }
+                val trailers = trailerFor(title)
                 newMovieLoadResponse(title.ifBlank { "MyCima" }, url, TvType.Movie, subData(url, title)) {
                     this.posterUrl = poster
                     this.backgroundPosterUrl = poster
                     this.plot = desc
+                    this.trailers = trailers
                 }
             }
             url.contains("larozatv") -> {
@@ -497,10 +585,12 @@ class HorrorMoviesProvider : MainAPI() {
                 val desc = doc?.let { og(it, "description") }
                 val slug = url.trimEnd('/').substringAfterLast('/')
                 val servers = "https://larozatv.com/watch/$slug/servers"
+                val trailers = trailerFor(title)
                 newMovieLoadResponse(title.ifBlank { "LaRosTV" }, url, TvType.Movie, subData(servers, title)) {
                     this.posterUrl = poster
                     this.backgroundPosterUrl = poster
                     this.plot = desc
+                    this.trailers = trailers
                 }
             }
             url.contains("topcinema") -> {
@@ -511,10 +601,12 @@ class HorrorMoviesProvider : MainAPI() {
                 val poster = doc?.let { og(it, "image") }
                 val desc = doc?.let { og(it, "description") }
                 val watch = url.trimEnd('/') + "/watch/"
+                val trailers = trailerFor(title)
                 newMovieLoadResponse(title.ifBlank { "TopCinema" }, url, TvType.Movie, subData(watch, title)) {
                     this.posterUrl = poster
                     this.backgroundPosterUrl = poster
                     this.plot = desc
+                    this.trailers = trailers
                 }
             }
             url.contains("aflamstream") -> {
@@ -524,10 +616,12 @@ class HorrorMoviesProvider : MainAPI() {
                 val title = cleanMovieTitle(og(doc ?: return movieFallback(url), "title") ?: "")
                 val poster = doc?.let { og(it, "image") }
                 val desc = doc?.let { og(it, "description") }
+                val trailers = trailerFor(title)
                 newMovieLoadResponse(title.ifBlank { "AflamStream" }, url, TvType.Movie, subData(url, title)) {
                     this.posterUrl = poster
                     this.backgroundPosterUrl = poster
                     this.plot = desc
+                    this.trailers = trailers
                 }
             }
             else -> movieFallback(url)
@@ -536,7 +630,9 @@ class HorrorMoviesProvider : MainAPI() {
 
     private suspend fun movieFallback(url: String): LoadResponse {
         val name = cleanMovieTitle(url.substringAfterLast('/').replace('-', ' '))
-        return newMovieLoadResponse(name.ifBlank { "فيلم" }, url, TvType.Movie, subData(url, name))
+        return newMovieLoadResponse(name.ifBlank { "فيلم" }, url, TvType.Movie, subData(url, name)) {
+            this.trailers = trailerFor(name)
+        }
     }
 
     // ---------------------------------------------------------------

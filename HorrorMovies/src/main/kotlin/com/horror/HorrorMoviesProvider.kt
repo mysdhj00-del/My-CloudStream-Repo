@@ -139,6 +139,27 @@ import org.jsoup.nodes.Document
  * budget — extractors fastest-first, capped links, digs capped,
  * relay only when nothing playable exists yet.
  *
+ * v14 (2026-11-14, Dead Howling 2026 on-device: "DEBUG Horror
+ * v10·EgyBest | srv=17 | ext=0 | dig=0 | relay=0 | t=117s"):
+ * the 17 servers are real (JSON-LD + 17 loadIframe wrappers) but
+ * 6 are mixdrop.ps COPIES of a DELETED file ("WE ARE SORRY — We
+ * can't find the video"), and 9 more have NO stock extractor at
+ * all (vidmoly.org, uqload.vc, mixdrop.top, 1vid, vidspeed,
+ * byse mirrors, cybervynx — the registry only covers vidmoly.net,
+ * uqload.com, mixdrop.co/.ps/.to, byse.sx, ...). The old chain ran
+ * extractors first, so the dead mixdrops ate the 11 s extractor
+ * budget and the ~5 s of dig budget left died on the same dead
+ * hosts before vidmoly / 1vid / vidspeed / uqload / mixdrop.top
+ * were ever tried — all five yield a real direct link when dug
+ * (verified live on Dead Howling, Insidious Possession and Marrow
+ * 2026). Then the relay phase ran unbounded app.get calls (2
+ * attempts each) against the sleeping Render service and burned
+ * ~100 s for zero links. v14: dig-first for no-extractor hosts,
+ * extractors capped at 2 per host, second dig pass, ONE bounded
+ * (8 s) relay attempt; extractDirect also reads MDCore.wurl and
+ * protocol-relative //...mp4|m3u8 URLs (the live mixdrop.top
+ * link). DEBUG marker is now "Horror v14·<lane>".
+ *
  * RATING: CloudStream's card type has no rating slot in this app
  * version, so ratings ride the detail page: the plot line opens
  * with «★ التقييم: X/10» wherever the source page provides one
@@ -728,13 +749,33 @@ class HorrorMoviesProvider : MainAPI() {
         Regex("""videoUrl\s*=\s*"(https?://[^"]+)"""").find(clean)?.let {
             return it.groupValues[1]
         }
+        // v14: MixDrop packed pages carry MDCore.wurl="//host/...mp4"
+        // (protocol-relative) — the stock extractor reads wurl, the
+        // dig never did, so the one live MixDrop mirror was missed.
+        Regex("""wurl\s*[:=]\s*["']([^"']+)["']""").find(clean)?.let {
+            val u = it.groupValues[1]
+            if (u.contains(".mp4") || u.contains(".m3u8")) {
+                normalizeMediaUrl(u)?.let { return it }
+            }
+        }
         Regex("""https?://[^\s"'<>]+\.m3u8[^\s"'<>]*""").find(clean)?.let {
             return it.value
         }
         Regex("""https?://[^\s"'<>]+\.mp4[^\s"'<>]*""").find(clean)?.let {
             return it.value
         }
+        // v14: protocol-relative media URLs (//host/...mp4|m3u8).
+        Regex("""//[^\s"'<>]+\.(m3u8|mp4)[^\s"'<>]*""").find(clean)?.let {
+            return "https:" + it.value
+        }
         return null
+    }
+
+    /** v14: "//host/..." -> "https://host/..."; http(s) URLs pass through. */
+    private fun normalizeMediaUrl(u: String): String? = when {
+        u.startsWith("//") -> "https:$u"
+        u.startsWith("http") -> u
+        else -> null
     }
 
     private val packedRegex = Regex(
@@ -787,14 +828,12 @@ class HorrorMoviesProvider : MainAPI() {
         val relayUrl = "$relayBase/relay/resolve?url=" +
             java.net.URLEncoder.encode(embed, "UTF-8") +
             "&ref=" + java.net.URLEncoder.encode(data, "UTF-8")
-        var text: String? = null
-        for (attempt in 1..2) {
-            text = runCatching { app.get(relayUrl).text }.getOrNull()
-            if (text != null) break
-            Thread.sleep(2000)
-        }
-        val body = text ?: return 0
-        val json = runCatching { JSONObject(body) }.getOrNull() ?: return 0
+        // v14: ONE attempt, hard 8 s cap (raw HttpURLConnection).
+        // The old loop did 2 unbounded app.get attempts with a 2 s
+        // sleep — on a sleeping Render service that burned ~100 s
+        // (on-device Dead Howling: t=117s) for zero links.
+        val text = httpGetText(relayUrl, 8000) ?: return 0
+        val json = runCatching { JSONObject(text) }.getOrNull() ?: return 0
         if (!json.optBoolean("ok")) return 0
         val arr = json.optJSONArray("direct") ?: return 0
         var emitted = 0
@@ -843,11 +882,21 @@ class HorrorMoviesProvider : MainAPI() {
         Regex("""videoUrl\s*=\s*"(https?://[^"]+)"""").findAll(clean).forEach {
             add(it.groupValues[1])
         }
+        // v14: wurl + protocol-relative media URLs (see extractDirect).
+        Regex("""wurl\s*[:=]\s*["']([^"']+)["']""").findAll(clean).forEach {
+            val u = it.groupValues[1]
+            if (u.contains(".mp4") || u.contains(".m3u8")) {
+                normalizeMediaUrl(u)?.let { add(it) }
+            }
+        }
         Regex("""https?://[^\s"'<>]+\.m3u8[^\s"'<>]*""").findAll(clean).forEach {
             add(it.value)
         }
         Regex("""https?://[^\s"'<>]+\.mp4[^\s"'<>]*""").findAll(clean).forEach {
             add(it.value)
+        }
+        Regex("""//[^\s"'<>]+\.(m3u8|mp4)[^\s"'<>]*""").findAll(clean).forEach {
+            add("https:" + it.value)
         }
         return out.take(4)
     }
@@ -948,7 +997,67 @@ class HorrorMoviesProvider : MainAPI() {
         }
     }
 
-    /** Shared extractor → dig → relay core with caps and a budget. */
+    /** v14: stock-extractor coverage, verified against the app's
+     * extractor registry (stub mainUrls). Hosts NOT in this set can
+     * never resolve via loadExtractor — they only resolve via the
+     * dig (packed-JS / direct-link) path or the relay. EgyBest's
+     * template serves many such hosts (vidmoly.org, uqload.vc,
+     * mixdrop.top, 1vid, vidspeed, cybervynx, byse mirrors). */
+    private val extractorHosts = setOf(
+        "mixdrop.co", "mixdrop.ag", "mixdrop.bz", "mixdrop.ch",
+        "mixdrop.ps", "mixdrop.si", "mixdrop.to",
+        "voe.sx", "uqload.com", "uqload.co", "uqload.bz", "uqload.cx",
+        "uqloads.xyz", "vidmoly.net", "vidmoly.biz", "vidmoly.me",
+        "vidmoly.to", "byse.sx", "bysebuho.com", "byseqekaho.com",
+        "bysevepoin.com", "bysezejataos.com", "hgcloud.to",
+        "doodstream.com", "dood.cx", "dood.la", "dood.li", "dood.pm",
+        "dood.sh", "dood.so", "dood.to", "dood.watch", "dood.wf",
+        "dood.ws", "dood.yt", "streamwish.to", "streamwish.site",
+        "streamtape.com", "streamtape.net", "streamtape.xyz",
+        "filemoon.to", "filemoon.in", "filemoon.sx",
+        "filelions.to", "filelions.live", "filelions.online",
+        "vidhide.com", "vidhidehub.com", "vidhidepre.com",
+        "vidhidepro.com", "vidhidevip.com", "mp4upload.com",
+        "firestream.to", "firestream.site",
+        "lulustream.com", "luluvdo.com", "luluvdoo.com"
+    )
+
+    private fun hasStockExtractor(url: String): Boolean {
+        val h = hostOf(url)
+        if (h.isBlank()) return false
+        return extractorHosts.any { h == it || h.endsWith(".$it") }
+    }
+
+    /** v14: hosts whose pages most often yield a direct/packed link
+     * when dug — tried first in the dig phases. */
+    private val digFirstHosts = listOf(
+        "vidmoly", "1vid", "vidspeed", "uqload", "mixdrop",
+        "mp4upload", "nuvorel", "luluv", "playmogo", "streamtape",
+        "filemoon"
+    )
+
+    private fun digRank(url: String): Int {
+        val h = hostOf(url)
+        return if (digFirstHosts.any { h.contains(it) }) 0 else 1
+    }
+
+    /** Shared extractor → dig → relay core with caps and a budget.
+     * The caps are measured from THIS chain's own clock, not from
+     * loadLinks entry (v10: a slow earlier stage ate the whole
+     * budget before a single extractor ran).
+     * v14 restructure (Dead Howling 2026 on-device: srv=17 ext=0
+     * dig=0 relay=0 t=117s): the old order ran extractors first
+     * on a priority-sorted list, so six DEAD mixdrop.ps embeds ate
+     * the 11 s extractor budget and the ~5 s of dig budget left
+     * died on the same dead hosts before vidmoly / 1vid / vidspeed
+     * / uqload / mixdrop.top were ever tried — all five yield a
+     * real direct link when dug (verified live on three titles).
+     * Then the relay phase ran unbounded app.get calls against the
+     * sleeping Render service and burned ~100 s for zero links.
+     * Now: dig-first for no-extractor hosts (D1), then extractors
+     * capped at 2 per host (E), then a second dig pass (D2), then
+     * ONE bounded relay attempt (R). Total chain budget ≈ 18 s
+     * plus one 8 s relay attempt, worst case. */
     private suspend fun runChain(
         embeds: List<String>,
         referer: String,
@@ -959,12 +1068,6 @@ class HorrorMoviesProvider : MainAPI() {
         allowDebug: Boolean = true,
         diagExtra: List<String> = emptyList()
     ): Boolean {
-        // v10: the resolver caps are measured from THIS chain's own
-        // clock, not from loadLinks entry. Before v10 the caps shared
-        // loadLinks' t0, so a slow earlier stage (TopCinema's 10
-        // sequential Server.php POSTs, LaRos's MixDrop loop, the
-        // subtitle fetch) could eat the whole budget before a single
-        // extractor ran — on-device v9: srv=7 ext=0 dig=0, t=12s.
         val tChain = System.currentTimeMillis()
         val chainMs = { System.currentTimeMillis() - tChain }
         var emitted = 0
@@ -973,33 +1076,75 @@ class HorrorMoviesProvider : MainAPI() {
             callback(link)
         }
         var extOk = 0
-        val unresolved = mutableListOf<String>()
-        val ordered = embeds.sortedByDescending { e ->
+        var digOk = 0
+        val digTried = HashSet<String>()
+        val digHostTried = HashMap<String, Int>()
+        suspend fun digOne(embed: String): Boolean {
+            digTried += embed
+            val h = hostOf(embed)
+            digHostTried[h] = (digHostTried[h] ?: 0) + 1
+            return scanEmbed(embed, referer, counting).also {
+                if (it) digOk++
+            }
+        }
+        fun digHostCapped(embed: String): Boolean {
+            val h = hostOf(embed)
+            return (digHostTried[h] ?: 0) < 2
+        }
+        // Phase D1 — dig the no-extractor hosts first (cap 9 s,
+        // max 3 digs). These can never resolve via loadExtractor.
+        val (digEmbeds, extEmbeds) = embeds.partition { !hasStockExtractor(it) }
+        val digOrder = digEmbeds.sortedWith(
+            compareBy({ digRank(it) }, { digEmbeds.indexOf(it) })
+        )
+        for (embed in digOrder) {
+            if (emitted >= 5 || digOk >= 3 || chainMs() > 9000) break
+            if (!digHostCapped(embed)) continue
+            digOne(embed)
+        }
+        // Phase E — stock extractors (cap 14 s, max 2 per host:
+        // six copies of one dead host must not eat the budget).
+        val extHostTried = HashMap<String, Int>()
+        val orderedExt = extEmbeds.sortedByDescending { e ->
             priorityHosts.any { e.contains(it) }
         }
-        for (embed in ordered) {
-            if (emitted >= 5 || chainMs() > 11000) break
+        val unresolved = mutableListOf<String>()
+        for (embed in orderedExt) {
+            if (emitted >= 5 || chainMs() > 14000) break
+            val h = hostOf(embed)
+            if ((extHostTried[h] ?: 0) >= 2) continue
+            extHostTried[h] = (extHostTried[h] ?: 0) + 1
             val before = emitted
             runCatching { loadExtractor(embed, referer, subtitleCallback, counting) }
             if (emitted > before) extOk++ else unresolved += embed
         }
-        var digOk = 0
+        // Phase D2 — dig whatever was never dug (cap 18 s).
         if (emitted < 3) {
-            for (embed in unresolved) {
-                if (chainMs() > 16000 || digOk >= 3) break
-                if (scanEmbed(embed, referer, counting)) digOk++
+            val rest = embeds.filter { it !in digTried }.sortedWith(
+                compareBy({ digRank(it) }, { embeds.indexOf(it) })
+            )
+            for (embed in rest) {
+                if (emitted >= 5 || digOk >= 3 || chainMs() > 18000) break
+                if (!digHostCapped(embed)) continue
+                digOne(embed)
             }
         }
+        // Phase R — relay, last resort only: ONE embed, ONE bounded
+        // attempt (v14: the old 2-attempt app.get loop hung ~100 s
+        // on a sleeping Render service).
         var relayOk = 0
-        if (emitted == 0) {
-            for (embed in unresolved.take(3)) {
-                if (chainMs() > 22000) break
-                relayOk += resolveViaRelay(embed, referer, counting)
+        if (emitted == 0 && chainMs() <= 12000) {
+            val relayPick = (unresolved + embeds.filter { it !in digTried })
+                .distinct()
+                .sortedWith(compareBy({ digRank(it) }, { embeds.indexOf(it) }))
+                .firstOrNull()
+            if (relayPick != null) {
+                relayOk += resolveViaRelay(relayPick, referer, counting)
             }
         }
         if (emitted == 0 && allowDebug) {
             emitDebug(
-                listOf("Horror v10·$lane") + diagExtra +
+                listOf("Horror v14·$lane") + diagExtra +
                     listOf("srv=${embeds.size}", "ext=$extOk",
                         "dig=$digOk", "relay=$relayOk", "t=${elapsed() / 1000}s"),
                 callback

@@ -1,9 +1,9 @@
 // AnimeGG CloudStream plugin module.
-// animegg.org — anime subbed & dubbed, JWPlayer /play/ mp4 chain
-// (episode page -> /embed/<id> -> videoSources -> vidcache mp4),
+// animegg.org — anime subbed & dubbed, Desi chain (AniList GraphQL
+// catalog + iframe/embed media regex + loadExtractor fallback),
 // plus the EN->AR subtitle gear (OpenSubtitles + phone-side free
 // Google Translate with MyMemory fallback) and trailer v3.
-version = 1
+version = 2
 
 android {
     namespace = "com.animegg"

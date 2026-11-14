@@ -1,5 +1,5 @@
 // FasselHD CloudStream plugin module.
-version = 11
+version = 12
 
 android {
     namespace = "com.fasselhd"

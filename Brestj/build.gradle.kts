@@ -1,5 +1,5 @@
 // Brestj CloudStream plugin module.
-version = 8
+version = 9
 
 android {
     namespace = "com.brestj"

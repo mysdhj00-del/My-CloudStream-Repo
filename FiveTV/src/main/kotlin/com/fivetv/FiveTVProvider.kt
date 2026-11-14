@@ -406,10 +406,16 @@ class FiveTVProvider : MainAPI() {
         return Triple(title.ifBlank { "فايف تي في" }, poster, plot)
     }
 
-    // Trailer (rollout, pattern from HorrorMovies v11): a trailer
-    // button on every detail page, from a free YouTube search.
-    // Desktop UA is REQUIRED — the mobile search page returns no
-    // parseable results. The setter wants a MutableList.
+    // v2 fix (2026-11-14, user-tested): the v1 pick rule only
+    // accepted titles containing "trailer"/"PV", so Arabic results
+    // fell through to a blind first-result fallback and returned
+    // full episodes. v2 sanitizes the title to a trailer NAME,
+    // searches Latin first then Arabic, and only accepts a result
+    // whose normalized title contains the name AND a trailer word.
+    // No match = no trailer (better than a wrong one).
+    // Digits-only guard: a Latin candidate is valid only if it
+    // contains at least one [A-Za-z] letter — an Arabic-only title
+    // leaves only digits behind ("2 - 1"), which is not a title.
     private val trailerHeaders = mapOf(
         "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
         "Accept-Language" to "en-US,en;q=0.9"
@@ -430,6 +436,35 @@ class FiveTVProvider : MainAPI() {
         return out
     }
 
+    private fun normalizeArabic(s: String): String {
+        var t = s.replace(Regex("""[\u064B-\u0652\u0640]"""), "")
+        t = t.replace(Regex("""[أإآ]"""), "ا").replace("ة", "ه").replace("ى", "ي")
+        return t.lowercase(java.util.Locale.ROOT)
+            .replace(Regex("""\s+"""), " ").trim()
+    }
+
+    private fun trailerName(title: String): String {
+        var t = title.substringBefore('|').trim()
+        t = t.replace(Regex("""الحلق[ةه]\s*\d*"""), " ")
+        t = t.replace(Regex("""الموسم\s*\d*"""), " ")
+        t = t.replace(Regex("""الجزء\s+\S+"""), " ").replace(Regex("""الجزء"""), " ")
+        t = t.replace(Regex("""\b(19|20)\d\d\b"""), " ")
+        val drop = setOf(
+            "مسلسل", "فيلم", "مشاهدة", "مترجم", "مدبلج", "اون", "لاين", "online",
+            "انمي", "أنمي", "كرتون", "web-dl", "bluray", "hd", "hdts", "hdcam",
+            "webdl", "mtarjm", "mudblj", "egybest", "ايجى", "بست", "mycima",
+            "movizland", "موفيز", "لاند", "larostv", "لاروز", "topcinema",
+            "fasselhd", "akwam", "اكوام", "brestj", "برستيج", "cima4y",
+            "animezid", "egydead", "goojara", "hitv", "viu", "turkmood",
+            "turkdub", "wecima", "qesset", "isk", "merged", "miruro", "animeverse"
+        )
+        t = t.split(Regex("""\s+"""))
+            .filter { it.lowercase(java.util.Locale.ROOT) !in drop }
+            .joinToString(" ")
+        t = t.replace(Regex("""[^A-Za-z0-9\u0600-\u06FF :'\-!.,]+"""), " ")
+        return t.replace(Regex("""\s+"""), " ").trim()
+    }
+
     private suspend fun trailerFor(
         title: String,
         isSeries: Boolean = false,
@@ -437,20 +472,25 @@ class FiveTVProvider : MainAPI() {
     ): MutableList<TrailerData> {
         return try {
             val year = Regex("""(19|20)\d\d""").find(title)?.value
+            val name = trailerName(title)
+            // Digits-only guard (2026-11-14, user-proved): an Arabic-only
+            // title leaves only digits behind ("2 - 1" from season 2 /
+            // episode 1) — that is NOT a Latin title. A Latin candidate
+            // is valid only if it contains at least one [A-Za-z] letter.
+            val latins = latinTitleCandidates(title)
+                .filter { cand -> cand.any { it in 'A'..'Z' || it in 'a'..'z' } }
+            val names = (latins + listOfNotNull(name.takeIf { it.isNotBlank() })).distinct()
             val queries = ArrayList<String>()
-            for (cand in latinTitleCandidates(title)) {
+            for (cand in latins) {
                 queries += if (isSeries) "$cand official trailer"
                 else listOfNotNull(cand, year, "official trailer").joinToString(" ")
             }
-            if (queries.isEmpty()) {
-                val clean = cleanTitle(title)
-                if (clean.isNotBlank()) {
-                    queries += if (isSeries) "$clean الإعلان الرسمي"
-                    else listOfNotNull(clean, year, "trailer").joinToString(" ")
-                }
+            if (name.isNotBlank() && name.contains(Regex("""[\u0600-\u06FF]"""))) {
+                queries += if (isSeries) "$name الإعلان الرسمي"
+                else listOfNotNull(name, year, "الإعلان الرسمي").joinToString(" ")
             }
             for (q in queries) {
-                val id = youtubeTrailerId(q, acceptPv) ?: continue
+                val id = youtubeTrailerId(q, names, acceptPv) ?: continue
                 return mutableListOf(
                     TrailerData(
                         "https://www.youtube.com/watch?v=$id",
@@ -465,28 +505,42 @@ class FiveTVProvider : MainAPI() {
         }
     }
 
-    private suspend fun youtubeTrailerId(query: String, acceptPv: Boolean = false): String? {
+    private suspend fun youtubeTrailerId(
+        query: String,
+        names: List<String>,
+        acceptPv: Boolean = false
+    ): String? {
         return try {
             val url = "https://www.youtube.com/results?search_query=" +
                 java.net.URLEncoder.encode(query, "UTF-8")
             val html = app.get(url, headers = trailerHeaders).text
             if (html.isBlank()) return null
             val idRe = Regex(""""videoId":"([A-Za-z0-9_-]{11})"""")
-            val titleRe =
+            val runsRe =
                 Regex(""""title":\{"runs":\[\{"text":"([^"]{3,120})"""")
-            var firstId: String? = null
+            val simpleRe =
+                Regex(""""title":\{"simpleText":"([^"]{3,120})"""")
+            val normNames = names.map { normalizeArabic(it) }
+                .filter { it.length >= 3 }
+            if (normNames.isEmpty()) return null
             val seen = HashSet<String>()
             for (m in idRe.findAll(html)) {
                 val id = m.groupValues[1]
                 if (!seen.add(id)) continue
-                if (firstId == null) firstId = id
-                val end = minOf(html.length, m.range.last + 800)
+                val end = minOf(html.length, m.range.last + 1200)
                 val window = html.substring(m.range.last, end)
-                val t = titleRe.find(window)?.groupValues?.get(1) ?: continue
-                if (t.contains("trailer", ignoreCase = true)) return id
-                if (acceptPv && t.contains("PV")) return id
+                val t = runsRe.find(window)?.groupValues?.get(1)
+                    ?: simpleRe.find(window)?.groupValues?.get(1)
+                    ?: continue
+                val nt = normalizeArabic(t)
+                if (normNames.none { nt.contains(it) }) continue
+                val isTrailer = nt.contains("trailer") || nt.contains("teaser") ||
+                    nt.contains("الاعلان الرسمي") || nt.contains("اعلان") ||
+                    nt.contains("برومو") || nt.contains("تيزر") ||
+                    (acceptPv && t.contains("PV"))
+                if (isTrailer) return id
             }
-            firstId
+            null
         } catch (_: Exception) {
             null
         }

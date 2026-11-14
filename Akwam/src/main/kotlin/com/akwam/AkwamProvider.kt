@@ -8,6 +8,7 @@ import com.lagradost.cloudstream3.MainAPI
 import com.lagradost.cloudstream3.MainPageRequest
 import com.lagradost.cloudstream3.SearchResponse
 import com.lagradost.cloudstream3.SubtitleFile
+import com.lagradost.cloudstream3.TrailerData
 import com.lagradost.cloudstream3.TvType
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.fixUrl
@@ -75,9 +76,9 @@ class AkwamProvider : MainAPI() {
         "$mainUrl/mix" to "منوعات",
         "$mainUrl/category/movies/%d8%a7%d9%81%d9%84%d8%a7%d9%85-%d8%a7%d8%ac%d9%86%d8%a8%d9%8a" to "أفلام أجنبية",
         "$mainUrl/category/%d8%a7%d9%81%d9%84%d8%a7%d9%85-%d8%b9%d8%b1%d8%a8%d9%8a" to "أفلام عربية",
-        "$mainUrl/category/%d8%a7%d9%81%d9%84%d8%a7%d9%85-%d8%a7%d8%b3%d9%8a%d9%88%d9%8a%d8%a9/" to "أفلام آسيوية",
-        "$mainUrl/category/%d8%a7%d9%81%d9%84%d8%a7%d9%85-%d8%aa%d8%b1%d9%83%d9%8a%d8%a9/" to "أفلام تركية",
-        "$mainUrl/category/%d8%a7%d9%81%d9%84%d8%a7%d9%85-%d9%87%d9%86%d8%af%d9%8a%d8%a9/" to "أفلام هندية",
+        "$mainUrl/category/%d8%a7%d9%81%d9%84%d8%a7%d9%85-%d8%a7%d8%b3%d9%8a%d9%88%d9%8a%d8%a9" to "أفلام آسيوية",
+        "$mainUrl/category/%d8%a7%d9%81%d9%84%d8%a7%d9%85-%d8%aa%d8%b1%d9%83%d9%8a%d8%a9" to "أفلام تركية",
+        "$mainUrl/category/%d8%a7%d9%81%d9%84%d8%a7%d9%85-%d9%87%d9%86%d8%af%d9%8a%d8%a9" to "أفلام هندية",
         "$mainUrl/category/%d8%a7%d9%81%d9%84%d8%a7%d9%85-%d8%a7%d9%86%d9%85%d9%8a" to "أفلام أنمي",
         "$mainUrl/category/%d8%a7%d9%81%d9%84%d8%a7%d9%85-%d9%83%d8%b1%d8%aa%d9%88%d9%86" to "أفلام كرتون",
         "$mainUrl/category/%d9%85%d8%b3%d9%84%d8%b3%d9%84%d8%a7%d8%aa-%d8%a7%d8%ac%d9%86%d8%a8%d9%8a" to "مسلسلات أجنبية",
@@ -174,6 +175,92 @@ class AkwamProvider : MainAPI() {
         return app.get(url, headers = browserHeaders).document.parseCards()
     }
 
+    // Trailer (rollout, pattern from HorrorMovies v11): a trailer
+    // button on every detail page, from a free YouTube search.
+    // Desktop UA is REQUIRED — the mobile search page returns no
+    // parseable results. The setter wants a MutableList.
+    private val trailerHeaders = mapOf(
+        "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+        "Accept-Language" to "en-US,en;q=0.9"
+    )
+
+    private fun latinTitleCandidates(title: String): List<String> {
+        var t = title.replace(Regex("""[\u0600-\u06FF]+"""), " ")
+        t = t.replace(Regex("""(?i)\b(mtarjm|mudblj|online|web-dl|bluray|hd|hdts|hdcam|webdl)\b"""), " ")
+        t = t.replace(Regex("""[^A-Za-z0-9 :'\-!.,]+"""), " ")
+        t = t.replace(Regex("""\s+"""), " ").trim()
+        t = t.replace(Regex("""\s+(19|20)\d\d\s*$"""), "").trim()
+        if (t.isBlank()) return emptyList()
+        val out = mutableListOf(t)
+        Regex("""\s+\d{1,2}$""").find(t)?.let {
+            val stripped = t.substring(0, it.range.first).trim()
+            if (stripped.isNotBlank()) out += stripped
+        }
+        return out
+    }
+
+    private suspend fun trailerFor(
+        title: String,
+        isSeries: Boolean = false,
+        acceptPv: Boolean = false
+    ): MutableList<TrailerData> {
+        return try {
+            val year = Regex("""(19|20)\d\d""").find(title)?.value
+            val queries = ArrayList<String>()
+            for (cand in latinTitleCandidates(title)) {
+                queries += if (isSeries) "$cand official trailer"
+                else listOfNotNull(cand, year, "official trailer").joinToString(" ")
+            }
+            if (queries.isEmpty()) {
+                val clean = cleanTitle(title)
+                if (clean.isNotBlank()) {
+                    queries += if (isSeries) "$clean الإعلان الرسمي"
+                    else listOfNotNull(clean, year, "trailer").joinToString(" ")
+                }
+            }
+            for (q in queries) {
+                val id = youtubeTrailerId(q, acceptPv) ?: continue
+                return mutableListOf(
+                    TrailerData(
+                        "https://www.youtube.com/watch?v=$id",
+                        "https://www.youtube.com/",
+                        false
+                    )
+                )
+            }
+            mutableListOf()
+        } catch (_: Exception) {
+            mutableListOf()
+        }
+    }
+
+    private suspend fun youtubeTrailerId(query: String, acceptPv: Boolean = false): String? {
+        return try {
+            val url = "https://www.youtube.com/results?search_query=" +
+                java.net.URLEncoder.encode(query, "UTF-8")
+            val html = app.get(url, headers = trailerHeaders).text
+            if (html.isBlank()) return null
+            val idRe = Regex(""""videoId":"([A-Za-z0-9_-]{11})"""")
+            val titleRe =
+                Regex(""""title":\{"runs":\[\{"text":"([^"]{3,120})"""")
+            var firstId: String? = null
+            val seen = HashSet<String>()
+            for (m in idRe.findAll(html)) {
+                val id = m.groupValues[1]
+                if (!seen.add(id)) continue
+                if (firstId == null) firstId = id
+                val end = minOf(html.length, m.range.last + 800)
+                val window = html.substring(m.range.last, end)
+                val t = titleRe.find(window)?.groupValues?.get(1) ?: continue
+                if (t.contains("trailer", ignoreCase = true)) return id
+                if (acceptPv && t.contains("PV")) return id
+            }
+            firstId
+        } catch (_: Exception) {
+            null
+        }
+    }
+
     override suspend fun load(url: String): LoadResponse {
         val document = app.get(url, headers = browserHeaders).document
         val title = cleanTitle(
@@ -211,6 +298,7 @@ class AkwamProvider : MainAPI() {
             ) {
                 this.posterUrl = document.pagePoster()
                 this.plot = document.pagePlot()
+                this.trailers = trailerFor(title, isSeries = true, acceptPv = isAnime)
             }
         } else {
             newMovieLoadResponse(
@@ -220,6 +308,7 @@ class AkwamProvider : MainAPI() {
             ) {
                 this.posterUrl = document.pagePoster()
                 this.plot = document.pagePlot()
+                this.trailers = trailerFor(title, isSeries = false, acceptPv = isAnime)
             }
         }
     }

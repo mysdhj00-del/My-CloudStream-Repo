@@ -1,5 +1,5 @@
 // FiveTV CloudStream plugin module.
-version = 6
+version = 7
 
 android {
     namespace = "com.fivetv"

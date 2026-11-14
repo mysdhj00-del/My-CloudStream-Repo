@@ -1,5 +1,5 @@
 // MovizLand CloudStream plugin module.
-version = 2
+version = 3
 
 android {
     namespace = "com.movizland"

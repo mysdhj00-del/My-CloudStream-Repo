@@ -1,5 +1,5 @@
 // AnimeZid CloudStream plugin module.
-version = 13
+version = 14
 
 android {
     namespace = "com.animezid"

@@ -1,9 +1,10 @@
 // AnimeGG CloudStream plugin module.
 // animegg.org — anime subbed & dubbed, Desi chain (AniList GraphQL
 // catalog + iframe/embed media regex + loadExtractor fallback),
-// plus the EN->AR subtitle gear (OpenSubtitles + phone-side free
-// Google Translate with MyMemory fallback) and trailer v3.
-version = 2
+// plus the subtitle gear (OpenSubtitles + phone-side free AI
+// translation BOTH directions EN->AR and AR->EN, dual-always
+// "العربية + الإنجليزية") and trailer v3.
+version = 3
 
 android {
     namespace = "com.animegg"

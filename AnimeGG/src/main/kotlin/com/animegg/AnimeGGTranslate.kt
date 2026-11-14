@@ -6,17 +6,21 @@ import com.lagradost.cloudstream3.app
 import java.net.URLEncoder
 
 /**
- * EN->AR subtitle translation for AnimeGG (ported from AnimeVerse
- * v21 / Goojara v26): when OpenSubtitles has an English file but
- * no Arabic one, translate it on the phone — first with free
- * Google Translate (gtx, no key), and when gtx fails (Panel #10:
- * carrier-level block of googleapis on the phone's network)
+ * EN->AR and AR->EN subtitle translation for AnimeGG (ported from
+ * AnimeVerse v21 / Goojara v26): when OpenSubtitles has an English
+ * file but no Arabic one, translate it on the phone — first with
+ * free Google Translate (gtx, no key), and when gtx fails (Panel
+ * #10: carrier-level block of googleapis on the phone's network)
  * with MyMemory (free, no key, different domain, GET
- * api.mymemory.translated.net/get). Timestamps are never
- * touched: AnimeGGSubs.buildSubVTT reuses the ORIGINAL start/end
- * strings and substitutes only the text lines. Translated files
- * are cached in SharedPreferences (OS URL -> stored URLs) so
- * repeat plays skip translation.
+ * api.mymemory.translated.net/get). v3 adds the MIRROR direction
+ * (AR->EN): when OpenSubtitles has Arabic but no English, the
+ * Arabic file is translated to English so the combined
+ * "العربية + الإنجليزية" entry can always be built (user order
+ * 2026-11-14: subtitles must never be separate-only).
+ * Timestamps are never touched: AnimeGGSubs.buildSubVTT reuses the
+ * ORIGINAL start/end strings and substitutes only the text lines.
+ * Translated files are cached in SharedPreferences (source URL +
+ * direction -> stored URLs) so repeat plays skip translation.
  */
 object AnimeGGTranslate {
 
@@ -86,13 +90,18 @@ object AnimeGGTranslate {
     /**
      * Translates cue texts: gtx first, MyMemory fallback when gtx fails.
      * Null only when both engines fail. Runs on the PHONE's network.
+     * Direction defaults to EN->AR; v3 also calls it AR->EN.
      */
-    suspend fun translateSubCues(cues: List<AnimeGGSubs.SubCue>): List<String>? {
+    suspend fun translateSubCues(
+        cues: List<AnimeGGSubs.SubCue>,
+        fromLang: String = "en",
+        toLang: String = "ar"
+    ): List<String>? {
         mmUsed = false
         mmFailed = false
         mmLimit = false
-        translateGtx(cues)?.let { return it }
-        val mm = translateMm(cues)
+        translateGtx(cues, fromLang, toLang)?.let { return it }
+        val mm = translateMm(cues, fromLang, toLang)
         if (mm != null) mmUsed = true
         return mm
     }
@@ -101,7 +110,11 @@ object AnimeGGTranslate {
      * Translates cue texts via public gtx (free, no key), char-budgeted
      * batches, paced between batches. Null on total failure.
      */
-    suspend fun translateGtx(cues: List<AnimeGGSubs.SubCue>): List<String>? {
+    suspend fun translateGtx(
+        cues: List<AnimeGGSubs.SubCue>,
+        fromLang: String = "en",
+        toLang: String = "ar"
+    ): List<String>? {
         gtxCode = 0
         gtxParseFail = false
         gtxExc = ""
@@ -110,7 +123,7 @@ object AnimeGGTranslate {
         var batchChars = 0
         suspend fun flush(): Boolean {
             if (batch.isEmpty()) return true
-            val params = StringBuilder("client=gtx&sl=en&tl=ar&dt=t")
+            val params = StringBuilder("client=gtx&sl=$fromLang&tl=$toLang&dt=t")
             for (t in batch) params.append("&q=").append(URLEncoder.encode(t, "UTF-8"))
             val texts = batch.toList()
             val ok = translateBatch(params.toString(), texts, out)
@@ -220,10 +233,14 @@ object AnimeGGTranslate {
 
     /** One MyMemory request. Null on failure; sets mmLimit when the
      * daily quota is exhausted (429 / quotaFinished). */
-    private suspend fun mmRequest(text: String): String? {
+    private suspend fun mmRequest(
+        text: String,
+        fromLang: String = "en",
+        toLang: String = "ar"
+    ): String? {
         return try {
             val url = "https://api.mymemory.translated.net/get?q=" +
-                URLEncoder.encode(text, "UTF-8") + "&langpair=en|ar"
+                URLEncoder.encode(text, "UTF-8") + "&langpair=$fromLang|$toLang"
             val resp = app.get(url)
             val json = org.json.JSONObject(resp.text)
             val statusStr = json.opt("responseStatus")?.toString() ?: ""
@@ -243,8 +260,13 @@ object AnimeGGTranslate {
 
     /** Translates a small batch cue-by-cue (used when the joined
      * request fails or its line count mismatches). Over-long cues
-     * keep their English text so the file stays aligned. */
-    private suspend fun mmSingles(texts: List<String>, out: ArrayList<String>): Boolean {
+     * keep their source-language text so the file stays aligned. */
+    private suspend fun mmSingles(
+        texts: List<String>,
+        out: ArrayList<String>,
+        fromLang: String = "en",
+        toLang: String = "ar"
+    ): Boolean {
         for (t in texts) {
             if (t.length > 450) {
                 out.add(t)
@@ -254,7 +276,7 @@ object AnimeGGTranslate {
                 mmLimit = true
                 return false
             }
-            val one = mmRequest(t)
+            val one = mmRequest(t, fromLang, toLang)
             if (one == null) {
                 if (!mmLimit) mmFailed = true
                 return false
@@ -270,7 +292,11 @@ object AnimeGGTranslate {
      * <=5 cues / <=450 chars (the per-request cap is 500, verified),
      * newlines preserved in the reply, 1 s pacing. Null on failure.
      */
-    suspend fun translateMm(cues: List<AnimeGGSubs.SubCue>): List<String>? {
+    suspend fun translateMm(
+        cues: List<AnimeGGSubs.SubCue>,
+        fromLang: String = "en",
+        toLang: String = "ar"
+    ): List<String>? {
         val out = ArrayList<String>()
         var batch = ArrayList<String>()
         var batchChars = 0
@@ -284,13 +310,13 @@ object AnimeGGTranslate {
                 mmLimit = true
                 return false
             }
-            val tr = mmRequest(joined)
+            val tr = mmRequest(joined, fromLang, toLang)
             if (tr == null) {
                 if (mmLimit) return false
-                return mmSingles(texts, out)
+                return mmSingles(texts, out, fromLang, toLang)
             }
             val lines = tr.split("\n")
-            if (lines.size != texts.size) return mmSingles(texts, out)
+            if (lines.size != texts.size) return mmSingles(texts, out, fromLang, toLang)
             out.addAll(lines)
             Thread.sleep(1000)
             return true
@@ -341,5 +367,59 @@ object AnimeGGTranslate {
         val dualUrl = AnimeGGSubs.storeSub(AnimeGGSubs.buildDualVTT(cues, translated))
         putCache(engUrl, arUrl, dualUrl)
         return TrResult(arUrl, dualUrl, null)
+    }
+
+    // ---------- AR->EN direction (v3, dual-always) ----------
+
+    private fun cacheKeyArEn(araUrl: String) = "os_${araUrl.hashCode()}_ar-en"
+
+    fun cachedEn(araUrl: String): String? =
+        prefs()?.getString("${cacheKeyArEn(araUrl)}.en", null)
+
+    fun cachedDualArEn(araUrl: String): String? =
+        prefs()?.getString("${cacheKeyArEn(araUrl)}.dual", null)
+
+    fun putCacheArEn(araUrl: String, enUrl: String?, dualUrl: String?) {
+        try {
+            prefs()?.edit()?.apply {
+                if (enUrl != null) putString("${cacheKeyArEn(araUrl)}.en", enUrl)
+                if (dualUrl != null) putString("${cacheKeyArEn(araUrl)}.dual", dualUrl)
+            }?.apply()
+        } catch (_: Exception) {
+        }
+    }
+
+    /** Result of an AR->EN translation attempt: urls on success, or the failing stage. */
+    data class TrResultEn(val enUrl: String?, val dualUrl: String?, val failStage: String?)
+
+    /**
+     * Translates parsed ARABIC cues to English (the mirror of
+     * translateCues, for episodes where OpenSubtitles has Arabic
+     * but no English — e.g. Naruto Shippuden ep 50 / ep 300,
+     * verified live 2026-11-14): gtx ar->en first, MyMemory ar|en
+     * fallback (MyMemory ar->en verified live: "ليس هنا" ->
+     * "It's not here.", match 0.99). Stores the English file + the
+     * AR+EN merged dual via the relay and caches them. The dual
+     * keeps Arabic on the first line, English on the second.
+     */
+    suspend fun translateCuesArToEn(
+        cues: List<AnimeGGSubs.SubCue>,
+        araUrl: String
+    ): TrResultEn {
+        val cached = cachedEn(araUrl)
+        if (cached != null) return TrResultEn(cached, cachedDualArEn(araUrl), null)
+        val translated = translateSubCues(cues, "ar", "en") ?: return TrResultEn(
+            null, null,
+            when {
+                mmLimit -> "mm-limit"
+                mmFailed -> "mm"
+                else -> "gtx"
+            }
+        )
+        val enVtt = AnimeGGSubs.buildSubVTT(cues, translated)
+        val enUrl = AnimeGGSubs.storeSub(enVtt) ?: return TrResultEn(null, null, "store")
+        val dualUrl = AnimeGGSubs.storeSub(AnimeGGSubs.buildDualVTTArBase(cues, translated))
+        putCacheArEn(araUrl, enUrl, dualUrl)
+        return TrResultEn(enUrl, dualUrl, null)
     }
 }

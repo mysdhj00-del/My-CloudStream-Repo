@@ -4,7 +4,7 @@
 // subtitle-mode options as Goojara; emissions in all three sites
 // gated by the mode (default "dual" = v21 behaviour); DEBUG gains
 // mode:<ar|en|dual>.
-version = 24
+version = 25
 
 android {
     namespace = "com.animeverse"

@@ -243,7 +243,12 @@ class AkwamProvider : MainAPI() {
         return try {
             val year = Regex("""(19|20)\d\d""").find(title)?.value
             val name = trailerName(title)
+            // Digits-only guard (2026-11-14, user-proved): an Arabic-only
+            // title leaves only digits behind ("2 - 1" from season 2 /
+            // episode 1) — that is NOT a Latin title. A Latin candidate
+            // is valid only if it contains at least one [A-Za-z] letter.
             val latins = latinTitleCandidates(title)
+                .filter { cand -> cand.any { it in 'A'..'Z' || it in 'a'..'z' } }
             val names = (latins + listOfNotNull(name.takeIf { it.isNotBlank() })).distinct()
             val queries = ArrayList<String>()
             for (cand in latins) {

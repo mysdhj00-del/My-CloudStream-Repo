@@ -3,6 +3,7 @@ package com.animeverse
 import com.lagradost.cloudstream3.LoadResponse
 import com.lagradost.cloudstream3.SearchResponse
 import com.lagradost.cloudstream3.SubtitleFile
+import com.lagradost.cloudstream3.TrailerData
 import com.lagradost.cloudstream3.TvType
 import com.lagradost.cloudstream3.MainAPI
 import com.lagradost.cloudstream3.app
@@ -358,12 +359,14 @@ object GogoAnimeSite : AnimeSite {
                 this.posterUrl = poster
                 this.plot = plot
                 this.tags = tags
+                this.trailers = AnimeSubs.trailerFor(title, isSeries = false, acceptPv = true)
             }
         } else {
             api.newTvSeriesLoadResponse(title, seriesUrl, TvType.Anime, episodes) {
                 this.posterUrl = poster
                 this.plot = plot
                 this.tags = tags
+                this.trailers = AnimeSubs.trailerFor(title, isSeries = true, acceptPv = true)
                 this.showStatus = when (status?.lowercase()) {
                     "ongoing" -> com.lagradost.cloudstream3.ShowStatus.Ongoing
                     "completed" -> com.lagradost.cloudstream3.ShowStatus.Completed

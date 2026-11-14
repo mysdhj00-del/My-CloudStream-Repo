@@ -3,6 +3,7 @@ package com.animeverse
 import com.lagradost.cloudstream3.LoadResponse
 import com.lagradost.cloudstream3.SearchResponse
 import com.lagradost.cloudstream3.SubtitleFile
+import com.lagradost.cloudstream3.TrailerData
 import com.lagradost.cloudstream3.TvType
 import com.lagradost.cloudstream3.MainAPI
 import com.lagradost.cloudstream3.app
@@ -310,12 +311,14 @@ object AniwatchSite : AnimeSite {
                 this.posterUrl = poster
                 this.plot = plot
                 this.tags = genres
+                this.trailers = AnimeSubs.trailerFor(title, isSeries = false, acceptPv = true)
             }
         } else {
             api.newTvSeriesLoadResponse(title, seriesUrl, TvType.Anime, episodes) {
                 this.posterUrl = poster
                 this.plot = plot
                 this.tags = genres
+                this.trailers = AnimeSubs.trailerFor(title, isSeries = true, acceptPv = true)
                 this.showStatus = when {
                     statusText.contains("Completed", ignoreCase = true) ||
                         statusText.contains("Finished", ignoreCase = true) ->

@@ -8,6 +8,7 @@ import com.lagradost.cloudstream3.MainAPI
 import com.lagradost.cloudstream3.MainPageRequest
 import com.lagradost.cloudstream3.SearchResponse
 import com.lagradost.cloudstream3.SubtitleFile
+import com.lagradost.cloudstream3.TrailerData
 import com.lagradost.cloudstream3.TvType
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.mainPageOf
@@ -265,6 +266,97 @@ class EgyDeadProvider : MainAPI() {
 
     // ---------- load ----------
 
+    // Trailer (rollout, pattern from HorrorMovies v11): a trailer
+    // button on every detail page, from a free YouTube search.
+    // Desktop UA is REQUIRED — the mobile search page returns no
+    // parseable results. The setter wants a MutableList. Anime:
+    // "PV" titles count as trailers too.
+    private val trailerHeaders = mapOf(
+        "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+        "Accept-Language" to "en-US,en;q=0.9"
+    )
+
+    private fun latinTitleCandidates(title: String): List<String> {
+        var t = title.replace(Regex("""[\u0600-\u06FF]+"""), " ")
+        t = t.replace(Regex("""(?i)\b(mtarjm|mudblj|online|web-dl|bluray|hd|hdts|hdcam|webdl)\b"""), " ")
+        t = t.replace(Regex("""[^A-Za-z0-9 :'\-!.,]+"""), " ")
+        t = t.replace(Regex("""\s+"""), " ").trim()
+        t = t.replace(Regex("""\s+(19|20)\d\d\s*$"""), "").trim()
+        if (t.isBlank()) return emptyList()
+        val out = mutableListOf(t)
+        Regex("""\s+\d{1,2}$""").find(t)?.let {
+            val stripped = t.substring(0, it.range.first).trim()
+            if (stripped.isNotBlank()) out += stripped
+        }
+        return out
+    }
+
+    private fun cleanTrailerTitle(title: String): String =
+        title.replace(Regex("""(?i)\b(مشاهدة|مترجم|مدبلج|اون لاين|اوفلاين)\b"""), " ")
+            .replace(Regex("""\s+"""), " ").trim()
+
+    private suspend fun trailerFor(
+        title: String,
+        isSeries: Boolean = false,
+        acceptPv: Boolean = false
+    ): MutableList<TrailerData> {
+        return try {
+            val year = Regex("""(19|20)\d\d""").find(title)?.value
+            val queries = ArrayList<String>()
+            for (cand in latinTitleCandidates(title)) {
+                queries += if (isSeries) "$cand official trailer"
+                else listOfNotNull(cand, year, "official trailer").joinToString(" ")
+            }
+            if (queries.isEmpty()) {
+                val clean = cleanTrailerTitle(title)
+                if (clean.isNotBlank()) {
+                    queries += if (isSeries) "$clean الإعلان الرسمي"
+                    else listOfNotNull(clean, year, "trailer").joinToString(" ")
+                }
+            }
+            for (q in queries) {
+                val id = youtubeTrailerId(q, acceptPv) ?: continue
+                return mutableListOf(
+                    TrailerData(
+                        "https://www.youtube.com/watch?v=$id",
+                        "https://www.youtube.com/",
+                        false
+                    )
+                )
+            }
+            mutableListOf()
+        } catch (_: Exception) {
+            mutableListOf()
+        }
+    }
+
+    private suspend fun youtubeTrailerId(query: String, acceptPv: Boolean = false): String? {
+        return try {
+            val url = "https://www.youtube.com/results?search_query=" +
+                java.net.URLEncoder.encode(query, "UTF-8")
+            val html = app.get(url, headers = trailerHeaders).text
+            if (html.isBlank()) return null
+            val idRe = Regex(""""videoId":"([A-Za-z0-9_-]{11})"""")
+            val titleRe =
+                Regex(""""title":\{"runs":\[\{"text":"([^"]{3,120})"""")
+            var firstId: String? = null
+            val seen = HashSet<String>()
+            for (m in idRe.findAll(html)) {
+                val id = m.groupValues[1]
+                if (!seen.add(id)) continue
+                if (firstId == null) firstId = id
+                val end = minOf(html.length, m.range.last + 800)
+                val window = html.substring(m.range.last, end)
+                val t = titleRe.find(window)?.groupValues?.get(1) ?: continue
+                if (t.contains("trailer", ignoreCase = true)) return id
+                if (acceptPv && t.contains("PV")) return id
+            }
+            firstId
+        } catch (_: Exception) {
+            null
+        }
+    }
+
     override suspend fun load(url: String): LoadResponse {
         val id = url.substringAfter("/title/").substringBefore('/').substringBefore('?')
             .toIntOrNull() ?: throw ErrorLoadingException("Bad title url")
@@ -276,6 +368,9 @@ class EgyDeadProvider : MainAPI() {
         val plot = t.optString("description").takeIf { it.isNotEmpty() }
         val year = t.optString("release_date").take(4).toIntOrNull()
         val tags = parseTags(t)
+        val isAnime = tags.any {
+            it.contains("انمي") || it.contains("أنمي") || it.contains("anime", ignoreCase = true)
+        }
 
         // Structural series test (the type field lies for part of the
         // catalog — see titleCard): seasons in the payload or a seasons
@@ -289,6 +384,7 @@ class EgyDeadProvider : MainAPI() {
                 this.plot = plot
                 this.year = year
                 this.tags = tags
+                this.trailers = trailerFor(title, isSeries = false, acceptPv = isAnime)
             }
         } else {
             // Episodes are built from the title's video rows: each row
@@ -317,6 +413,7 @@ class EgyDeadProvider : MainAPI() {
                 this.plot = plot
                 this.year = year
                 this.tags = tags
+                this.trailers = trailerFor(title, isSeries = true, acceptPv = isAnime)
             }
         }
     }

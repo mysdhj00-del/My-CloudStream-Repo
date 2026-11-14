@@ -753,44 +753,6 @@ object MiruroSite : AnimeSite {
         }
     }
 
-    /** Translates cue texts via public gtx, char-budgeted batches. Null on total failure. */
-    private suspend fun translateSubCues(cues: List<SubCue>): List<String>? {
-        val out = ArrayList<String>()
-        var batch = ArrayList<String>()
-        var batchChars = 0
-        suspend fun flush(): Boolean {
-            if (batch.isEmpty()) return true
-            return try {
-                val params = StringBuilder("client=gtx&sl=en&tl=ar&dt=t")
-                for (t in batch) params.append("&q=").append(URLEncoder.encode(t, "UTF-8"))
-                val text = app.get("https://translate.googleapis.com/translate_a/single?$params").text
-                val arr = org.json.JSONArray(text).optJSONArray(0) ?: return false
-                if (arr.length() != batch.size) return false
-                for (i in 0 until arr.length()) {
-                    val entry = arr.optJSONArray(i)
-                    val tr = entry?.optString(0)?.ifEmpty { null }
-                    out.add(tr ?: batch[i])
-                }
-                true
-            } catch (e: Exception) {
-                false
-            } finally {
-                batch = ArrayList()
-                batchChars = 0
-            }
-        }
-        for (c in cues) {
-            val t = c.text.replace("\n", " ")
-            if (batch.isNotEmpty() && (batchChars + t.length > 4000 || batch.size >= 50)) {
-                if (!flush()) return null
-            }
-            batch.add(t)
-            batchChars += t.length
-        }
-        if (!flush()) return null
-        return out
-    }
-
     // ---------- playback ----------
 
     /**
@@ -824,6 +786,7 @@ object MiruroSite : AnimeSite {
         var engDiag = "eng:-"
         var araDiag = "ara:-"
         var storeDiag = "store:-"
+        var trDiag = "tr:-"
         try {
             val html = fetchHtml(data)
             pageLen = html.length
@@ -924,14 +887,25 @@ object MiruroSite : AnimeSite {
                 engDiag = "eng:${parseSubCues(engText).size}cue(os)"
                 if (engText.isNotEmpty()) {
                     val cues = parseSubCues(engText)
-                    val tr = translateSubCues(cues)
-                    if (tr != null && cues.isNotEmpty()) {
-                        val arVtt = buildSubVTT(cues, tr)
-                        val storedAr = storeSub(arVtt)
-                        storedAr?.let { subtitleCallback(SubtitleFile("العربية (تلقائية)", it)) }
-                        val storedMerged = storeSub(mergeSubVTT(engText, arVtt))
-                        storedMerged?.let { subtitleCallback(SubtitleFile("عربي + English", it)) }
-                        storeDiag = if (storedAr != null || storedMerged != null) "store:ok" else "store:fail"
+                    if (cues.isNotEmpty()) {
+                        // v21: Goojara v26 engine (gtx + MyMemory
+                        // fallback, cached) — the old private
+                        // gtx-only copy threw on the phone.
+                        // Miruro's own SubCue is the same shape as
+                        // AnimeSubs.SubCue; convert one line.
+                        val res = AnimeTranslate.translateCues(
+                            cues.map { AnimeSubs.SubCue(it.startMs, it.endMs, it.start, it.end, it.text) },
+                            engOsUrl, engText
+                        )
+                        if (res.arUrl != null) {
+                            trDiag = if (AnimeTranslate.mmUsed) "tr:mm" else "tr:ok"
+                            subtitleCallback(SubtitleFile("العربية (تلقائية)", res.arUrl))
+                            res.dualUrl?.let { subtitleCallback(SubtitleFile("عربي + English", it)) }
+                            storeDiag = if (res.dualUrl != null) "store:ok" else "store:ar-only"
+                        } else {
+                            trDiag = "tr:fail-${res.failStage ?: "gtx"}"
+                            storeDiag = "store:tr-fail"
+                        }
                     }
                 }
             }
@@ -944,7 +918,7 @@ object MiruroSite : AnimeSite {
             callback(
                 newExtractorLink(
                     "Miruro",
-                    "DEBUG v17 $engDiag $araDiag $storeDiag",
+                    "DEBUG v21 $engDiag $araDiag $storeDiag $trDiag",
                     "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8",
                     ExtractorLinkType.M3U8
                 ) {

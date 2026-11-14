@@ -453,10 +453,12 @@ class HorrorMoviesProvider : MainAPI() {
      * resolver only (the subtitle gear's resolveImdbId) — not the
      * video host. The app shows its trailer button from
      * LoadResponse.trailers; a missing button means the search found
-     * nothing for that title. Returns emptyList() on any failure —
-     * a missing trailer must never break the detail page.
+     * nothing for that title. Returns an empty list on any failure —
+     * a missing trailer must never break the detail page. NOTE: the
+     * setter expects a MutableList (stub-verified), so this returns
+     * MutableList, not List.
      */
-    private suspend fun trailerFor(title: String): List<TrailerData> {
+    private suspend fun trailerFor(title: String): MutableList<TrailerData> {
         return try {
             val year = Regex("""(19|20)\d\d""").find(title)?.value
             val queries = ArrayList<String>()
@@ -469,7 +471,7 @@ class HorrorMoviesProvider : MainAPI() {
             }
             for (q in queries) {
                 val id = youtubeTrailerId(q) ?: continue
-                return listOf(
+                return mutableListOf(
                     TrailerData(
                         "https://www.youtube.com/watch?v=$id",
                         "https://www.youtube.com/",
@@ -477,9 +479,9 @@ class HorrorMoviesProvider : MainAPI() {
                     )
                 )
             }
-            emptyList()
+            mutableListOf()
         } catch (_: Exception) {
-            emptyList()
+            mutableListOf()
         }
     }
 

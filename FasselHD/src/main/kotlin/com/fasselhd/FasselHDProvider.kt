@@ -187,15 +187,14 @@ class FasselHDProvider : MainAPI() {
     /**
      * v8: single status probe, used ONLY on the load-failure
      * path to tell a server-broken record apart from a network
-     * failure. A scattered set of OLD records (series AND
-     * movies, e.g. serie 3142 and its neighbours 3135-3150)
-     * makes the operator's own detail endpoints answer HTTP
-     * 500 "Server Error" — verified live 2026-11-14, persistent,
-     * identical on the sister host (shared DB). The catalog
-     * lists them fine (different endpoint); only the detail
-     * controller is broken, and no alternate endpoint lists
-     * their seasons/episodes, so those titles cannot be
-     * recovered client-side — the message says so plainly.
+     * failure. CORRECTION (v9, 2026-11-14): most HTTP 500s seen
+     * on detail calls were NOT broken records — they were
+     * cross-table misrouting (the panel has three tables
+     * sharing one id space; series/show 500s, or returns the
+     * wrong title, for an animes-table id). v9 routes each
+     * record to its own table first (animes/show) and falls
+     * back to the other table, so this probe now fires only
+     * for records that fail on BOTH tables.
      */
     private suspend fun apiStatus(path: String): Int? {
         val base = liveBase ?: primaryApi
@@ -220,11 +219,27 @@ class FasselHDProvider : MainAPI() {
         if (title.isBlank()) return null
         val poster = s(row, "poster_path").ifBlank { null }
         val type = s(row, "type").lowercase()
+        // v9: the panel has THREE tables sharing one id space
+        // (movies / series / animes) — the SAME numeric id can be
+        // a movie, a serie AND an anime at once (e.g. 3142 is
+        // ناروتو شيبودن in animes, 2717 is قصص بادانامو in
+        // animes but "Tomorrow With You" in series, 5000 is the
+        // serie "Outlast"). The listing row's type IS the table:
+        // type "anime" (or is_anime=1) = animes table, served by
+        // animes/show — NOT series/show, which 500s or returns
+        // the WRONG title for those ids. That misrouting was the
+        // whole "كرتون مدبلج" failure and the 3142 "No detail".
+        val isAnimeTable = type == "anime" || s(row, "is_anime") == "1"
         val isAnime = forceAnime || s(row, "is_anime") == "1"
         val year = yearOf(s(row, "release_date").ifBlank { s(row, "first_air_date") })
         return when {
             type == "movie" ->
                 newMovieSearchResponse(title, "movie:$id", TvType.Movie) {
+                    this.posterUrl = poster
+                    this.year = year
+                }
+            isAnimeTable ->
+                newAnimeSearchResponse(title, "animes:$id", TvType.Anime) {
                     this.posterUrl = poster
                     this.year = year
                 }
@@ -295,7 +310,9 @@ class FasselHDProvider : MainAPI() {
      * anywhere in the string rather than parsed positionally.
      */
     private fun parseToken(data: String): Pair<String, String>? {
-        val m = Regex("""(movie|serie|anime|episode):(\d+)""").find(data) ?: return null
+        // "animeepisode" must precede "anime"/"animes": it starts
+        // with "anime", and the regex tries alternatives in order.
+        val m = Regex("""(movie|serie|animeepisode|anime|animes|episode):(\d+)""").find(data) ?: return null
         return m.groupValues[1] to m.groupValues[2]
     }
 
@@ -303,7 +320,8 @@ class FasselHDProvider : MainAPI() {
         val (kind, id) = parseToken(url) ?: throw ErrorLoadingException("Unknown kind")
         return when (kind) {
             "movie" -> loadMovie(id, url)
-            "serie", "anime" -> loadSeries(id, url, kind == "anime")
+            "serie", "anime" -> loadSeries(id, url, kind == "anime", false)
+            "animes" -> loadSeries(id, url, true, true)
             else -> throw ErrorLoadingException("Unknown kind")
         }
     }
@@ -348,15 +366,28 @@ class FasselHDProvider : MainAPI() {
         }
     }
 
-    private suspend fun loadSeries(id: String, url: String, anime: Boolean): LoadResponse {
-        val showPath = "series/show/$id/1"
-        val root = apiJson(showPath)
-            ?: throw ErrorLoadingException(brokenDetailMessage(showPath, "المسلسل"))
-        val title = s(root, "name").ifBlank { s(root, "original_name") }
+    private suspend fun loadSeries(id: String, url: String, anime: Boolean, animeTable: Boolean): LoadResponse {
+        // v9: try the record's own table first, then the other
+        // one — a row mislabelled in some listing still lands
+        // on the right detail instead of a 500 / wrong title.
+        val primaryShow = if (animeTable) "animes/show/$id/1" else "series/show/$id/1"
+        val fallbackShow = if (animeTable) "series/show/$id/1" else "animes/show/$id/1"
+        var tableIsAnime = animeTable
+        var root = apiJson(primaryShow)
+        if (root == null) {
+            root = apiJson(fallbackShow)
+            if (root != null) tableIsAnime = !animeTable
+        }
+        val finalRoot = root
+            ?: throw ErrorLoadingException(
+                brokenDetailMessage(primaryShow, if (animeTable) "الأنمي" else "المسلسل")
+            )
+        val rootObj = finalRoot
+        val title = s(rootObj, "name").ifBlank { s(rootObj, "original_name") }
         if (title.isBlank()) throw ErrorLoadingException("No title")
-        val year = yearOf(s(root, "first_air_date"))
+        val year = yearOf(s(rootObj, "first_air_date"))
         val seriesTitle = titleWithYear(title, year)
-        val seasons = arr(root, "seasons")
+        val seasons = arr(rootObj, "seasons")
         val seasonList = ArrayList<JSONObject>()
         if (seasons != null) {
             for (i in 0 until seasons.length()) {
@@ -364,19 +395,21 @@ class FasselHDProvider : MainAPI() {
             }
         }
         seasonList.sortBy { s(it, "season_number").toIntOrNull() ?: 0 }
+        val seasonPrefix = if (tableIsAnime) "animes/season/" else "series/season/"
+        val epToken = if (tableIsAnime) "animeepisode" else "episode"
         val episodes = ArrayList<Episode>()
         for (season in seasonList) {
             val seasonId = s(season, "id")
             val seasonNum = s(season, "season_number").toIntOrNull() ?: 1
             if (seasonId.isBlank()) continue
-            val epRoot = apiJson("series/season/$seasonId/1") ?: continue
+            val epRoot = apiJson("$seasonPrefix$seasonId/1") ?: continue
             val epRows = arr(epRoot, "episodes") ?: continue
             for (i in 0 until epRows.length()) {
                 val ep = epRows.optJSONObject(i) ?: continue
                 val epId = s(ep, "id")
                 if (epId.isBlank()) continue
                 val epNum = s(ep, "episode_number").toIntOrNull()
-                episodes += newEpisode(subData("episode:$epId", seriesTitle, seasonNum, epNum)) {
+                episodes += newEpisode(subData("$epToken:$epId", seriesTitle, seasonNum, epNum)) {
                     this.name = s(ep, "name").ifBlank { epNum?.let { n -> "الحلقة $n" } }
                     this.season = seasonNum
                     this.episode = epNum
@@ -387,15 +420,15 @@ class FasselHDProvider : MainAPI() {
         episodes.sortWith(compareBy({ it.season ?: 1 }, { it.episode ?: 0 }))
         return newTvSeriesLoadResponse(
             title, url,
-            if (anime) TvType.Anime else TvType.TvSeries,
+            if (anime || tableIsAnime) TvType.Anime else TvType.TvSeries,
             episodes
         ) {
-            this.posterUrl = s(root, "poster_path").ifBlank { null }
-            this.backgroundPosterUrl = s(root, "backdrop_path").ifBlank { null }
-            this.plot = s(root, "overview").ifBlank { null }
+            this.posterUrl = s(rootObj, "poster_path").ifBlank { null }
+            this.backgroundPosterUrl = s(rootObj, "backdrop_path").ifBlank { null }
+            this.plot = s(rootObj, "overview").ifBlank { null }
             this.year = year
-            this.tags = tagsOf(root)
-            this.actors = actorsOf(root)
+            this.tags = tagsOf(rootObj)
+            this.actors = actorsOf(rootObj)
         }
     }
 
@@ -440,13 +473,25 @@ class FasselHDProvider : MainAPI() {
     /** Pulls the videos[] server list for a movie id or an episode id. */
     private suspend fun fetchServers(data: String): List<ServerRow> {
         val (kind, id) = parseToken(data) ?: return emptyList()
+        // v9: episode videos live in the SAME table as the
+        // episode — series/episodeshow answers {"episodes":[]}
+        // for an anime episode id, and vice versa. Try the
+        // episode's own table first, then the other one.
+        suspend fun videosFrom(path: String): JSONArray? {
+            val root = apiJson(path) ?: return null
+            val eps = arr(root, "episodes")
+            val first = if (eps != null && eps.length() > 0) eps.optJSONObject(0) else null
+            return arr(first, "videos")
+        }
         val videos: JSONArray? = when (kind) {
             "movie" -> arr(apiJson("media/detail/$id/1"), "videos")
             "episode" -> {
-                val root = apiJson("series/episodeshow/$id/1")
-                val eps = arr(root, "episodes")
-                val first = if (eps != null && eps.length() > 0) eps.optJSONObject(0) else null
-                arr(first, "videos")
+                val v = videosFrom("series/episodeshow/$id/1")
+                if (v != null && v.length() > 0) v else videosFrom("animes/episodeshow/$id/1")
+            }
+            "animeepisode" -> {
+                val v = videosFrom("animes/episodeshow/$id/1")
+                if (v != null && v.length() > 0) v else videosFrom("series/episodeshow/$id/1")
             }
             else -> null
         }

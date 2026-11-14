@@ -583,23 +583,31 @@ object GogoAnimeSite : AnimeSite {
             // Subtitle layer (shared AnimeSubs): Arabic from
             // OpenSubtitles, merged AR+EN via the relay, phone-IP
             // translate fallback — same flow as Miruro v11/v12.
+            // v22: emissions gated by the settings gear
+            // (AnimeVerseSubs.mode) — "ar" Arabic only, "en"
+            // English only, "dual" everything (v21 behaviour).
             try {
                 val cleanTitle = seriesTitle
+                val subMode = AnimeVerseSubs.mode
                 val araUrl = if (cleanTitle.isNotEmpty() && epNum != null)
                     AnimeSubs.osSubFor(cleanTitle, season, epNum, "ara") else null
-                araUrl?.let { subtitleCallback(SubtitleFile("العربية", it)) }
+                if (subMode != "en") araUrl?.let { subtitleCallback(SubtitleFile("العربية", it)) }
                 val engOsUrl = if (cleanTitle.isNotEmpty() && epNum != null)
                     AnimeSubs.osSubFor(cleanTitle, season, epNum, "eng") else null
                 val araUrls = if (cleanTitle.isNotEmpty() && epNum != null)
                     AnimeSubs.osSubsFor(cleanTitle, season, epNum, "ara") else emptyList()
                 if (engDiag == "eng:-") engDiag = if (engOsUrl != null) "eng:os" else "eng:-"
                 araDiag = "ara:${araUrls.size}"
-                if (engOsUrl != null && araUrls.isNotEmpty()) {
-                    val mergeUrl = StringBuilder("${AnimeSubs.relayBase}/relay/mergesubs?eng=")
-                        .append(URLEncoder.encode(engOsUrl, "UTF-8"))
-                    for (u in araUrls) mergeUrl.append("&ara=").append(URLEncoder.encode(u, "UTF-8"))
-                    subtitleCallback(SubtitleFile("عربي + English", mergeUrl.toString()))
-                    storeDiag = "merge:ok"
+                if (subMode == "en") {
+                    engOsUrl?.let { subtitleCallback(SubtitleFile("الإنجليزية", it)) }
+                } else if (engOsUrl != null && araUrls.isNotEmpty()) {
+                    if (subMode == "dual") {
+                        val mergeUrl = StringBuilder("${AnimeSubs.relayBase}/relay/mergesubs?eng=")
+                            .append(URLEncoder.encode(engOsUrl, "UTF-8"))
+                        for (u in araUrls) mergeUrl.append("&ara=").append(URLEncoder.encode(u, "UTF-8"))
+                        subtitleCallback(SubtitleFile("عربي + English", mergeUrl.toString()))
+                        storeDiag = "merge:ok"
+                    }
                 } else if (engOsUrl != null) {
                     val engText = AnimeSubs.fetchSubText(engOsUrl, "", cloudflareKiller).first
                     val cues = if (engText.isNotEmpty()) AnimeSubs.parseSubCues(engText) else emptyList()
@@ -612,8 +620,8 @@ object GogoAnimeSite : AnimeSite {
                         if (res.arUrl != null) {
                             trDiag = if (AnimeTranslate.mmUsed) "tr:mm" else "tr:ok"
                             subtitleCallback(SubtitleFile("العربية (تلقائية)", res.arUrl))
-                            res.dualUrl?.let { subtitleCallback(SubtitleFile("عربي + English", it)) }
-                            storeDiag = if (res.dualUrl != null) "store:ok" else "store:ar-only"
+                            if (subMode == "dual") res.dualUrl?.let { subtitleCallback(SubtitleFile("عربي + English", it)) }
+                            storeDiag = if (subMode == "dual" && res.dualUrl != null) "store:ok" else "store:ar-only"
                         } else {
                             trDiag = "tr:fail-${res.failStage ?: "gtx"}"
                             storeDiag = "store:tr-fail"
@@ -631,7 +639,7 @@ object GogoAnimeSite : AnimeSite {
             callback(
                 newExtractorLink(
                     "GogoAnime",
-                    "DEBUG v21 $hostDiag $bloggerDiag $megaDiag $otherDiag $engDiag $araDiag $storeDiag $trDiag $engCuesDiag",
+                    "DEBUG v22 $hostDiag $bloggerDiag $megaDiag $otherDiag $engDiag $araDiag $storeDiag $trDiag $engCuesDiag mode:${AnimeVerseSubs.mode}",
                     "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8",
                     ExtractorLinkType.M3U8
                 ) {

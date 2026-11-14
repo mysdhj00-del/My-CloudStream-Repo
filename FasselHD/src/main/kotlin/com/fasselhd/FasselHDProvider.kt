@@ -278,11 +278,12 @@ class FasselHDProvider : MainAPI() {
         val root = apiJson("media/detail/$id/1") ?: throw ErrorLoadingException("No detail")
         val title = s(root, "title").ifBlank { s(root, "original_name") }
         if (title.isBlank()) throw ErrorLoadingException("No title")
-        return newMovieLoadResponse(title, url, TvType.Movie, "movie:$id") {
+        val year = yearOf(s(root, "release_date"))
+        return newMovieLoadResponse(title, url, TvType.Movie, subData("movie:$id", titleWithYear(title, year), null, null)) {
             this.posterUrl = s(root, "poster_path").ifBlank { null }
             this.backgroundPosterUrl = s(root, "backdrop_path").ifBlank { null }
             this.plot = s(root, "overview").ifBlank { null }
-            this.year = yearOf(s(root, "release_date"))
+            this.year = year
             this.tags = tagsOf(root)
             this.actors = actorsOf(root)
         }
@@ -292,6 +293,8 @@ class FasselHDProvider : MainAPI() {
         val root = apiJson("series/show/$id/1") ?: throw ErrorLoadingException("No detail")
         val title = s(root, "name").ifBlank { s(root, "original_name") }
         if (title.isBlank()) throw ErrorLoadingException("No title")
+        val year = yearOf(s(root, "first_air_date"))
+        val seriesTitle = titleWithYear(title, year)
         val seasons = arr(root, "seasons")
         val seasonList = ArrayList<JSONObject>()
         if (seasons != null) {
@@ -312,7 +315,7 @@ class FasselHDProvider : MainAPI() {
                 val epId = s(ep, "id")
                 if (epId.isBlank()) continue
                 val epNum = s(ep, "episode_number").toIntOrNull()
-                episodes += newEpisode("episode:$epId") {
+                episodes += newEpisode(subData("episode:$epId", seriesTitle, seasonNum, epNum)) {
                     this.name = s(ep, "name").ifBlank { epNum?.let { n -> "الحلقة $n" } }
                     this.season = seasonNum
                     this.episode = epNum
@@ -329,7 +332,7 @@ class FasselHDProvider : MainAPI() {
             this.posterUrl = s(root, "poster_path").ifBlank { null }
             this.backgroundPosterUrl = s(root, "backdrop_path").ifBlank { null }
             this.plot = s(root, "overview").ifBlank { null }
-            this.year = yearOf(s(root, "first_air_date"))
+            this.year = year
             this.tags = tagsOf(root)
             this.actors = actorsOf(root)
         }
@@ -670,9 +673,22 @@ class FasselHDProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
+        // v6: subtitle gear (ported from Wecima2 v12) — the
+        // title/season/episode ride in the data string after
+        // "|||"; strip them before any fetch. Runs first so the
+        // phase time budgets below (measured from `started`)
+        // keep their full window.
+        val (realData, subTitle, subSeason, subEp) = parseSubData(data)
+        var subDiag = "sub:-"
+        if (FasselHDSubs.autoEnglish && subTitle.isNotBlank()) {
+            subDiag = if (emitEnglishSub(subTitle, subSeason, subEp, realData, subtitleCallback)) "sub:en" else "sub:no-match"
+        } else if (!FasselHDSubs.autoEnglish) {
+            subDiag = "sub:off"
+        }
         val diag = mutableListOf<String>()
+        diag += subDiag
         val started = System.currentTimeMillis()
-        val servers = runCatching { fetchServers(data) }.getOrDefault(emptyList())
+        val servers = runCatching { fetchServers(realData) }.getOrDefault(emptyList())
         diag += "srv=${servers.size}"
         if (servers.isEmpty()) {
             emitDebug(diag, callback)
@@ -820,5 +836,158 @@ class FasselHDProvider : MainAPI() {
                 }
             )
         }
+    }
+
+    // ---------- auto English subtitles (v6, Wecima2 v12 port) ----------
+
+    /**
+     * AUTO ENGLISH SUBTITLES: CloudStream has no standalone
+     * subtitle-plugin type that auto-attaches to other
+     * providers' playback, so the tool lives here — inside
+     * loadLinks, before any video link is emitted:
+     *   Latin title (+ year) -> IMDb suggest (key-free) -> IMDb
+     *   id -> OpenSubtitles v3 Stremio endpoint (key-free) ->
+     *   best lang=eng file by sync-first ranking ->
+     *   subtitleCallback(SubtitleFile("English", url)).
+     * Everything is fail-soft and fail-fast (8 s caps): if any
+     * step misses, playback continues with zero subtitles —
+     * never blocked.
+     */
+    private fun httpGetText(url: String, timeoutMs: Int): String? {
+        return runCatching {
+            val conn = java.net.URL(url).openConnection()
+                as java.net.HttpURLConnection
+            conn.requestMethod = "GET"
+            conn.connectTimeout = timeoutMs
+            conn.readTimeout = timeoutMs
+            conn.setRequestProperty("User-Agent", browserUA)
+            conn.setRequestProperty("Accept", "application/json, text/plain, */*")
+            val stream = if (conn.responseCode in 200..299) {
+                conn.inputStream
+            } else {
+                return@runCatching null
+            }
+            stream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+        }.getOrNull()
+    }
+
+    private fun latinTitleCandidates(title: String): List<String> {
+        var t = title.replace(Regex("""[\u0600-\u06FF]+"""), " ")
+        t = t.replace(Regex("""(?i)\b(mtarjm|mudblj|online|web-dl|bluray|hd|hdts|hdcam|webdl)\b"""), " ")
+        t = t.replace(Regex("""[^A-Za-z0-9 :'\-!.,]+"""), " ")
+        t = t.replace(Regex("""\s+"""), " ").trim()
+        t = t.replace(Regex("""\s+(19|20)\d\d\s*$"""), "").trim()
+        if (t.isBlank()) return emptyList()
+        val out = mutableListOf(t)
+        Regex("""\s+\d{1,2}$""").find(t)?.let {
+            val stripped = t.substring(0, it.range.first).trim()
+            if (stripped.isNotBlank()) out += stripped
+        }
+        return out
+    }
+
+    /** FasselHD data tokens ("movie:123", "episode:456") carry
+     * no slug, so there is no second candidate source here —
+     * the API title carries it. */
+    private fun slugCandidates(url: String): List<String> = emptyList()
+
+    private fun resolveImdbId(latinTitle: String, year: Int?, wantSeries: Boolean): String? {
+        val bucket = latinTitle.firstOrNull()?.lowercaseChar() ?: return null
+        val q = java.net.URLEncoder.encode(latinTitle, "UTF-8")
+        val json = httpGetText(
+            "https://v2.sg.media-imdb.com/suggestion/$bucket/$q.json", 8000
+        ) ?: return null
+        val arr = runCatching {
+            JSONObject(json).optJSONArray("d")
+        }.getOrNull() ?: return null
+        val want = if (wantSeries) "TV series" else "feature"
+        val other = if (wantSeries) "feature" else "TV series"
+        var fallback: String? = null
+        for (i in 0 until arr.length()) {
+            val o = arr.optJSONObject(i) ?: continue
+            val id = o.optString("id")
+            if (id.isBlank()) continue
+            val kind = o.optString("q")
+            if (fallback == null && kind == other) fallback = id
+            if (kind != want) continue
+            if (year != null && o.has("y") && o.optInt("y") != year) continue
+            return id
+        }
+        return fallback
+    }
+
+    private fun emitEnglishSub(
+        title: String,
+        season: Int?,
+        ep: Int?,
+        url: String,
+        subtitleCallback: (SubtitleFile) -> Unit
+    ): Boolean {
+        val year = Regex("""(19|20)\d\d""").find(title)?.value?.toIntOrNull()
+        val candidates = latinTitleCandidates(title) + slugCandidates(url)
+        val wantSeries = season != null && ep != null
+        for (candidate in candidates) {
+            val tt = resolveImdbId(candidate, year, wantSeries) ?: continue
+            val osUrl = if (wantSeries)
+                "https://opensubtitles-v3.strem.io/subtitles/series/$tt:$season:$ep.json"
+            else
+                "https://opensubtitles-v3.strem.io/subtitles/movie/$tt.json"
+            val json = httpGetText(osUrl, 8000) ?: continue
+            val arr = runCatching {
+                JSONObject(json).optJSONArray("subtitles")
+            }.getOrNull() ?: continue
+            // Sync-first ranking (HorrorMovies v7): don't take
+            // the first eng file. A subtitle timed for 25fps on
+            // a 23.976fps stream drifts more and more as the
+            // film plays — the classic desync. Prefer
+            // 23.976fps BluRay/WEB UTF-8 files, which match
+            // the standard movie streams best.
+            var bestUrl = ""
+            var bestScore = -1
+            for (i in 0 until arr.length()) {
+                val o = arr.optJSONObject(i) ?: continue
+                if (o.optString("lang") != "eng") continue
+                val u = o.optString("url")
+                if (u.isBlank()) continue
+                var score = 0
+                if (o.optInt("fpsMilli", 0) == 23976) score += 3
+                val fmt = o.optString("releaseFormat")
+                if (fmt == "BluRay" || fmt == "WEB") score += 2
+                if (o.optString("SubEncoding") == "UTF-8") score += 1
+                if (score > bestScore) {
+                    bestScore = score
+                    bestUrl = u
+                }
+            }
+            if (bestUrl.isNotBlank()) {
+                subtitleCallback(SubtitleFile("English", bestUrl))
+                return true
+            }
+        }
+        return false
+    }
+
+    /** Appends the year to the packed title so the gear can
+     * match the IMDb year (the candidates strip it again). */
+    private fun titleWithYear(title: String, year: Int?): String =
+        if (year != null) "$title $year" else title
+
+    /** Packs title (+season/episode) into a loadLinks data string. */
+    private fun subData(url: String, title: String, season: Int?, ep: Int?): String {
+        val enc = java.net.URLEncoder.encode(title, "UTF-8")
+        return url + "|||" + enc + "|||" + (season?.toString() ?: "") + "|||" + (ep?.toString() ?: "")
+    }
+
+    private data class SubPack(val url: String, val title: String, val season: Int?, val ep: Int?)
+
+    private fun parseSubData(data: String): SubPack {
+        val parts = data.split("|||")
+        val real = parts.getOrNull(0) ?: data
+        val title = parts.getOrNull(1)?.let {
+            runCatching { java.net.URLDecoder.decode(it, "UTF-8") }.getOrDefault("")
+        }.orEmpty()
+        val season = parts.getOrNull(2)?.toIntOrNull()
+        val ep = parts.getOrNull(3)?.toIntOrNull()
+        return SubPack(real, title, season, ep)
     }
 }

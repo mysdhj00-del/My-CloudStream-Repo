@@ -1,5 +1,5 @@
 // YouTube CloudStream plugin module.
-version = 7
+version = 8
 
 android {
     namespace = "com.ytube"

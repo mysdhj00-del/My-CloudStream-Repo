@@ -605,17 +605,17 @@ object GogoAnimeSite : AnimeSite {
                     val cues = if (engText.isNotEmpty()) AnimeSubs.parseSubCues(engText) else emptyList()
                     engCuesDiag = "engcues:${cues.size}"
                     if (cues.isNotEmpty()) {
-                        val tr = AnimeSubs.translateSubCues(cues)
-                        if (tr != null) {
-                            trDiag = "tr:ok"
-                            val arVtt = AnimeSubs.buildSubVTT(cues, tr)
-                            val storedAr = AnimeSubs.storeSub(arVtt)
-                            storedAr?.let { subtitleCallback(SubtitleFile("العربية (تلقائية)", it)) }
-                            val storedMerged = AnimeSubs.storeSub(AnimeSubs.mergeSubVTT(engText, arVtt))
-                            storedMerged?.let { subtitleCallback(SubtitleFile("عربي + English", it)) }
-                            storeDiag = if (storedAr != null || storedMerged != null) "store:ok" else "store:fail"
+                        // v21: Goojara v26 engine (gtx + MyMemory
+                        // fallback, cached) — the old gtx-only call
+                        // threw on the phone and produced nothing.
+                        val res = AnimeTranslate.translateCues(cues, engOsUrl, engText)
+                        if (res.arUrl != null) {
+                            trDiag = if (AnimeTranslate.mmUsed) "tr:mm" else "tr:ok"
+                            subtitleCallback(SubtitleFile("العربية (تلقائية)", res.arUrl))
+                            res.dualUrl?.let { subtitleCallback(SubtitleFile("عربي + English", it)) }
+                            storeDiag = if (res.dualUrl != null) "store:ok" else "store:ar-only"
                         } else {
-                            trDiag = "tr:fail"
+                            trDiag = "tr:fail-${res.failStage ?: "gtx"}"
                             storeDiag = "store:tr-fail"
                         }
                     }
@@ -631,7 +631,7 @@ object GogoAnimeSite : AnimeSite {
             callback(
                 newExtractorLink(
                     "GogoAnime",
-                    "DEBUG v20 $hostDiag $bloggerDiag $megaDiag $otherDiag $engDiag $araDiag $storeDiag $trDiag $engCuesDiag",
+                    "DEBUG v21 $hostDiag $bloggerDiag $megaDiag $otherDiag $engDiag $araDiag $storeDiag $trDiag $engCuesDiag",
                     "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8",
                     ExtractorLinkType.M3U8
                 ) {

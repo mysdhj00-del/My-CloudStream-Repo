@@ -32,8 +32,30 @@ import java.net.URLEncoder
 import java.util.Locale
 
 /**
- * AnimeGG v2 — Desi's proven chain (Faisal0786/Desi AnimeGG v3),
+ * AnimeGG v3 — Desi's proven chain (Faisal0786/Desi AnimeGG v3),
  * reimplemented in clean Kotlin, + our subtitle gear + trailer v3.
+ *
+ * v3 fixes (user reports 2026-11-14 18:04 + 18:06, on-device v2):
+ * (1) DUAL-ALWAYS: v2 emitted the combined "العربية +
+ * الإنجليزية" entry only when OpenSubtitles had BOTH files. On
+ * episodes with ready Arabic but NO English (Naruto Shippuden
+ * ep 50 / ep 300, verified live: ara 3/1, eng 0), v2 emitted a
+ * lone "العربية" and no dual at all. v3 translates the Arabic
+ * file to English (gtx ar->en first, MyMemory ar|en fallback —
+ * verified live) and always builds the combined entry; in dual
+ * mode the combined entry is the ONLY subtitle emitted, singles
+ * appear only when no combined file could be built. A ready
+ * Arabic file is also stored as .vtt through the relay before
+ * emission: the raw OS download URL has no file extension, which
+ * leaves the player unable to detect the format (greyed entry).
+ * (2) LOAD RESILIENCE: v2's load() returned a bare null (=
+ * "Error loading") whenever the AniList GraphQL query failed —
+ * AniList is HTTP 403 from datacenter IPs and may fail on the
+ * phone too — and whenever the first direct page fetch threw.
+ * v3 falls back: AniList failure -> AniList web-page title ->
+ * site search; direct fetch failure -> alternate host retry ->
+ * slug resolution through the site; episode parse falls back
+ * from the resolved doc to the direct doc.
  *
  * Desi's chain, recovered from its compiled .cs3 (see
  * ~/workspace/animegg-study/NOTES.md, "Desi v3 chain (from dex)"):
@@ -57,20 +79,12 @@ import java.util.Locale
  *     loadExtractor on the iframe URL. Labels come from the iframe
  *     context ("dubbed" -> مدبلج, else مترجم).
  *
- * Why v1 failed on-device: v1's home depended on animegg.org HTML
- * scraping + a POST /index/recentReleases (empty home = "لا تعمل"
- * at the first screen), and its playback depended ENTIRELY on the
- * ul#videos tabs + the exact JWPlayer videoSources serialization +
- * emitting /play/<id>/video.mp4?for=<token> directly — a token
- * minted per embed fetch that can die before ExoPlayer requests
- * it (the subtitle gear's network calls run first and add seconds
- * of delay). Desi's chain removes both single points of failure.
- *
  * The site serves NO subtitle tracks at all, so every subtitle
  * comes from the gear: OpenSubtitles (IMDb suggest, no key) for
- * ready AR/EN, else phone-side AI translation EN->AR (free gtx
- * first, MyMemory fallback — gtx is carrier-blocked on the
- * user's phone, Panel #10, so the fallback is essential).
+ * ready AR/EN, else phone-side AI translation (free gtx first,
+ * MyMemory fallback — gtx is carrier-blocked on the user's
+ * phone, Panel #10, so the fallback is essential), both
+ * directions (EN->AR and AR->EN).
  * Trailers follow the v3 rule: Latin titles only, Arabic-only
  * titles get the poster only, no YouTube query at all.
  */
@@ -325,11 +339,92 @@ class AnimeGGProvider : MainAPI() {
             ?.attr("content")?.trim().orEmpty()
         val fromOg = og.replace(Regex("(?i)Episode.*"), "").trim()
         if (fromOg.isNotBlank()) return fromOg
+        return slugToTitle(url)
+    }
+
+    /** "naruto-shippuden" -> "Naruto Shippuden" (last resort title). */
+    private fun slugToTitle(url: String): String {
         val slug = url.substringAfterLast("/").substringBefore("?")
+            .substringBefore("#")
         val pretty = slug.replace("-", " ").split(" ").joinToString(" ") { w ->
             w.replaceFirstChar { c -> c.uppercaseChar() }
         }
         return pretty.ifBlank { "Unknown Anime" }
+    }
+
+    /** Fetches a page document; null on any failure (never throws). */
+    private suspend fun fetchDoc(url: String): Document? {
+        return try {
+            app.get(url, headers = browserHeaders, referer = baseUrl()).document
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /** animegg.org <-> www.animegg.org host swap (retry variant). */
+    private fun altHost(url: String): String? {
+        return when {
+            url.startsWith("https://www.animegg.org/") ->
+                url.replace("https://www.animegg.org/", "https://animegg.org/")
+            url.startsWith("https://animegg.org/") ->
+                url.replace("https://animegg.org/", "https://www.animegg.org/")
+            else -> null
+        }
+    }
+
+    /** Fetches a series doc only when it actually carries episodes. */
+    private suspend fun fetchDocWithEpisodes(url: String): Document? {
+        val doc = fetchDoc(url) ?: return null
+        return doc.takeIf { it.select("li div:has(a.anm_det_pop)").isNotEmpty() }
+    }
+
+    /** AniList web page title (fallback when the GraphQL API is
+     * blocked — HTTP 403 from datacenter IPs, verified live). */
+    private suspend fun fetchAnilistWebTitle(url: String): String? {
+        return try {
+            val doc = app.get(url, headers = browserHeaders).document
+            doc.selectFirst("meta[property=og:title]")?.attr("content")
+                ?.trim()?.takeIf { it.isNotBlank() }
+                ?: doc.selectFirst("title")?.text()?.trim()
+                    ?.substringBefore("|")?.substringBefore("·")
+                    ?.trim()?.takeIf { it.isNotBlank() }
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /** Parses the episode list out of a series page document.
+     * Number comes from the episode URL FIRST (authoritative:
+     * /<slug>-episode-<N>); the <i class="anititle"> text is
+     * only a fallback, because it is often the episode TITLE
+     * ("...Part 6: ...") whose first digits are NOT the episode
+     * number (v2 bug: ep 499 parsed as 6, breaking the subtitle
+     * lookup for that episode). */
+    private fun parseEpisodes(
+        doc: Document,
+        base: String,
+        display: String
+    ): ArrayList<Episode> {
+        val episodes = ArrayList<Episode>()
+        for (li in doc.select("li div:has(a.anm_det_pop)")) {
+            val a = li.selectFirst("a.anm_det_pop") ?: continue
+            val epUrl = absUrl(a.attr("href"), base) ?: continue
+            val num = Regex("""-episode-(\d+)""").find(epUrl)
+                ?.groupValues?.get(1)?.toIntOrNull()
+                ?: Regex("""\d+""")
+                    .find(a.selectFirst("i.anititle")?.text() ?: a.text())
+                    ?.value?.toIntOrNull()
+                ?: Regex("""\d+""").find(li.text())?.value?.toIntOrNull()
+                ?: continue
+            episodes.add(
+                newEpisode(EpisodeRef(epUrl, num, display, "sub").toJson()) {
+                    this.name = "الحلقة $num"
+                    this.episode = num
+                }
+            )
+        }
+        episodes.reverse()
+        return episodes
     }
 
     /** Desi's resolver: direct slugs, then site-search links, then fetched docs. */
@@ -337,14 +432,10 @@ class AnimeGGProvider : MainAPI() {
         val base = baseUrl()
         val slugs = buildCandidateSlugs(titles)
         for (slug in slugs.take(5)) {
-            val doc = try {
-                app.get("$base/series/$slug", headers = browserHeaders, referer = base).document
-            } catch (_: Exception) {
-                null
-            }
-            if (doc != null && doc.select("li div:has(a.anm_det_pop)").isNotEmpty()) {
-                return doc
-            }
+            // Bare host first, www host as the retry (v3).
+            fetchDocWithEpisodes("$base/series/$slug")?.let { return it }
+            val www = altHost("$base/series/$slug")
+            if (www != null) fetchDocWithEpisodes(www)?.let { return it }
         }
         val links = ArrayList<String>()
         for (slug in slugs.take(3)) {
@@ -361,22 +452,16 @@ class AnimeGGProvider : MainAPI() {
             }
         }
         for (link in links.distinct().take(5)) {
-            val doc = try {
-                app.get(link, headers = browserHeaders, referer = base).document
-            } catch (_: Exception) {
-                null
-            }
-            if (doc != null && doc.select("li div:has(a.anm_det_pop)").isNotEmpty()) {
-                return doc
-            }
+            fetchDocWithEpisodes(link)?.let { return it }
         }
         return null
     }
 
     override suspend fun load(url: String): LoadResponse? {
         val base = baseUrl()
-        val meta: JSONObject?
-        val directDoc: Document?
+        var meta: JSONObject? = null
+        var directDoc: Document? = null
+        var foundDoc: Document? = null
         val titles: List<String>
         if (url.startsWith("https://anilist.co/anime/")) {
             val id = url.substringAfterLast("/").substringBefore("?")
@@ -386,26 +471,39 @@ class AnimeGGProvider : MainAPI() {
                 "description(asHtml: false) seasonYear averageScore genres " +
                 "coverImage { extraLarge large } } }"
             meta = queryAniList(q)?.optJSONObject("data")?.optJSONObject("media")
-                ?: return null
-            titles = anilistTitles(meta)
-            directDoc = null
-        } else {
-            directDoc = try {
-                app.get(url, headers = browserHeaders, referer = base).document
-            } catch (_: Exception) {
-                return null
+            titles = if (meta != null) {
+                anilistTitles(meta)
+            } else {
+                // v3: GraphQL blocked on this network — fall back to
+                // the AniList web page title, then the site search.
+                // Never a bare null while a title can still be found.
+                val webTitle = fetchAnilistWebTitle(url) ?: return null
+                listOf(webTitle)
             }
-            val fb = extractFallbackTitle(directDoc, url)
-            val q = "query { Media(search: \"${escapeGql(fb)}\", " +
-                "type: ANIME, isAdult: false, sort: [SEARCH_MATCH]) { " +
-                "id title { english romaji } synonyms " +
-                "description(asHtml: false) seasonYear averageScore genres " +
-                "coverImage { extraLarge large } } }"
-            meta = queryAniList(q)?.optJSONObject("data")?.optJSONObject("media")
-            titles = if (meta != null) anilistTitles(meta) else listOf(fb)
+        } else {
+            // v3: retry the direct fetch on the alternate host
+            // before giving up on the page itself.
+            directDoc = fetchDoc(url) ?: altHost(url)?.let { fetchDoc(it) }
+            if (directDoc == null) {
+                // Page unreachable directly: resolve via the slug
+                // through the site search instead of failing.
+                val slugTitle = slugToTitle(url)
+                foundDoc = findAnimeggDocument(listOf(slugTitle))
+                    ?: return null
+                titles = listOf(slugTitle)
+            } else {
+                val fb = extractFallbackTitle(directDoc, url)
+                val q = "query { Media(search: \"${escapeGql(fb)}\", " +
+                    "type: ANIME, isAdult: false, sort: [SEARCH_MATCH]) { " +
+                    "id title { english romaji } synonyms " +
+                    "description(asHtml: false) seasonYear averageScore genres " +
+                    "coverImage { extraLarge large } } }"
+                meta = queryAniList(q)?.optJSONObject("data")?.optJSONObject("media")
+                titles = if (meta != null) anilistTitles(meta) else listOf(fb)
+            }
         }
 
-        val doc = findAnimeggDocument(titles) ?: directDoc ?: return null
+        val doc = foundDoc ?: findAnimeggDocument(titles) ?: directDoc ?: return null
 
         val titleObj = meta?.optJSONObject("title")
         val display = titleObj?.optString("english")?.takeIf { it.isNotBlank() }
@@ -429,25 +527,12 @@ class AnimeGGProvider : MainAPI() {
             }
         }
 
-        val episodes = ArrayList<Episode>()
-        for (li in doc.select("li div:has(a.anm_det_pop)")) {
-            val a = li.selectFirst("a.anm_det_pop") ?: continue
-            val epUrl = absUrl(a.attr("href"), base) ?: continue
-            val num = Regex("""\d+""")
-                .find(a.selectFirst("i.anititle")?.text() ?: a.text())
-                ?.value?.toIntOrNull()
-                ?: Regex("""-episode-(\d+)""").find(epUrl)
-                    ?.groupValues?.get(1)?.toIntOrNull()
-                ?: Regex("""\d+""").find(li.text())?.value?.toIntOrNull()
-                ?: continue
-            episodes.add(
-                newEpisode(EpisodeRef(epUrl, num, display, "sub").toJson()) {
-                    this.name = "الحلقة $num"
-                    this.episode = num
-                }
-            )
+        // v3: if the resolved doc yields no episodes, try the
+        // direct doc before reporting an empty series.
+        var episodes = parseEpisodes(doc, base, display)
+        if (episodes.isEmpty() && directDoc != null && directDoc !== doc) {
+            episodes = parseEpisodes(directDoc, base, display)
         }
-        episodes.reverse()
         if (episodes.isEmpty()) return null
 
         val type = when {
@@ -524,12 +609,30 @@ class AnimeGGProvider : MainAPI() {
 
     private data class SubResult(val os: String, val tr: String)
 
+    /** Fetches a subtitle file's text; null on any failure. */
+    private suspend fun fetchTextOrNull(url: String): String? {
+        return try {
+            val res = app.get(url)
+            if (res.isSuccessful) res.text.takeIf { it.isNotBlank() } else null
+        } catch (_: Exception) {
+            null
+        }
+    }
+
     /**
-     * Subtitle gear: OpenSubtitles by title (IMDb suggest, no key).
-     * Ready Arabic -> emit it (dual mode merges it with English
-     * via the relay). No ready Arabic -> translate the English
-     * file to Arabic on the phone (gtx first, MyMemory fallback)
-     * and emit AR (+ dual). English-only mode never translates.
+     * Subtitle gear v3 (dual-always, user order 2026-11-14):
+     * OpenSubtitles by title (IMDb suggest, no key). In DUAL mode
+     * the combined "العربية + الإنجليزية" entry is ALWAYS built
+     * when either side exists — AR-only episodes are translated
+     * AR->EN (gtx ar->en first, MyMemory ar|en fallback) and
+     * EN-only episodes EN->AR (existing path) — and the combined
+     * entry is then the ONLY subtitle emitted. Singles are
+     * emitted only when no combined file could be built at all.
+     * A ready Arabic file is stored as .vtt through the relay
+     * before emission: the raw OS download URL has no file
+     * extension, which leaves the player unable to detect the
+     * format (greyed entry on-device). English-only mode never
+     * translates and is unchanged.
      */
     private suspend fun runOsFlow(
         ref: EpisodeRef,
@@ -557,45 +660,92 @@ class AnimeGGProvider : MainAPI() {
             return SubResult("no-match", "-")
         }
 
-        if (ara != null) {
-            subtitleCallback(SubtitleFile("العربية", ara))
-            if (mode == "dual") {
-                if (eng != null) {
-                    subtitleCallback(SubtitleFile("English", eng))
-                    val mergeUrl = "${AnimeGGSubs.relayBase}/relay/mergesubs?eng=" +
-                        URLEncoder.encode(eng, "UTF-8") +
-                        "&ara=" + URLEncoder.encode(ara, "UTF-8")
-                    subtitleCallback(SubtitleFile("العربية + الإنجليزية", mergeUrl))
-                    return SubResult("ar+dual", "-")
-                }
+        fun relayMergeUrl(engUrl: String, araUrl: String): String =
+            "${AnimeGGSubs.relayBase}/relay/mergesubs?eng=" +
+                URLEncoder.encode(engUrl, "UTF-8") +
+                "&ara=" + URLEncoder.encode(araUrl, "UTF-8")
+
+        // Stores a ready Arabic file as .vtt through the relay so
+        // the player can detect the format; null when the fetch or
+        // the store fails (caller falls back to the raw URL).
+        suspend fun storedArUrl(araUrl: String): String? {
+            val raw = fetchTextOrNull(araUrl) ?: return null
+            val cues = AnimeGGSubs.parseSubCues(raw)
+            if (cues.isEmpty()) return null
+            return AnimeGGSubs.storeSub(AnimeGGSubs.buildSubVTT(cues))
+        }
+
+        if (mode == "ar") {
+            if (ara != null) {
+                subtitleCallback(SubtitleFile("العربية", storedArUrl(ara) ?: ara))
+                return SubResult("ar", "-")
             }
+            if (eng != null) {
+                val raw = fetchTextOrNull(eng)
+                val cues = raw?.let { AnimeGGSubs.parseSubCues(it) }.orEmpty()
+                if (cues.isEmpty()) return SubResult("no-cues", "-")
+                val res = AnimeGGTranslate.translateCues(cues, eng, raw!!)
+                if (res.arUrl != null) {
+                    subtitleCallback(SubtitleFile("العربية", res.arUrl))
+                    val trMark = if (AnimeGGTranslate.mmUsed) "tr-mm" else "tr-ok"
+                    return SubResult("tr", trMark)
+                }
+                return SubResult("tr-fail", res.failStage ?: "gtx")
+            }
+            return SubResult("no-match", "-")
+        }
+
+        // mode == "dual" from here: combined entry first, always.
+        if (ara != null && eng != null) {
+            subtitleCallback(
+                SubtitleFile("العربية + الإنجليزية", relayMergeUrl(eng, ara))
+            )
+            return SubResult("ar+dual", "-")
+        }
+
+        if (ara != null) {
+            // AR-only (e.g. Naruto Shippuden ep 50 / ep 300: ara
+            // present, eng 0 on OpenSubtitles): translate the
+            // Arabic file to English, then merge AR+EN.
+            val raw = fetchTextOrNull(ara)
+            val cues = raw?.let { AnimeGGSubs.parseSubCues(it) }.orEmpty()
+            if (cues.isNotEmpty()) {
+                val res = AnimeGGTranslate.translateCuesArToEn(cues, ara)
+                if (res.enUrl != null) {
+                    val dual = res.dualUrl ?: relayMergeUrl(res.enUrl, ara)
+                    subtitleCallback(SubtitleFile("العربية + الإنجليزية", dual))
+                    val trMark = if (AnimeGGTranslate.mmUsed) "tr-mm-ar-en" else "tr-ar-en"
+                    return SubResult("ar+tr-en", trMark)
+                }
+                // Translation failed: single Arabic (stored .vtt
+                // when possible) as the only fallback.
+                val stored = AnimeGGSubs.storeSub(AnimeGGSubs.buildSubVTT(cues))
+                subtitleCallback(SubtitleFile("العربية", stored ?: ara))
+                return SubResult("ar", "-")
+            }
+            subtitleCallback(SubtitleFile("العربية", ara))
             return SubResult("ar", "-")
         }
 
         if (eng != null) {
-            val raw = try {
-                val res = app.get(eng)
-                if (res.isSuccessful) res.text.takeIf { it.isNotBlank() } else null
-            } catch (_: Exception) {
-                null
-            }
-            if (raw.isNullOrBlank()) return SubResult("no-cues", "-")
-            val cues = AnimeGGSubs.parseSubCues(raw)
-            if (cues.isEmpty()) return SubResult("no-cues", "-")
-            val res = AnimeGGTranslate.translateCues(cues, eng, raw)
-            if (res.arUrl == null) {
-                val stage = res.failStage ?: "gtx"
-                return SubResult("tr-fail", stage)
-            }
-            subtitleCallback(SubtitleFile("العربية", res.arUrl))
-            if (mode == "dual") {
+            val raw = fetchTextOrNull(eng)
+            val cues = raw?.let { AnimeGGSubs.parseSubCues(it) }.orEmpty()
+            if (cues.isEmpty()) {
+                // No usable English text: single English as the
+                // only fallback.
                 subtitleCallback(SubtitleFile("English", eng))
-                if (res.dualUrl != null) {
-                    subtitleCallback(SubtitleFile("العربية + الإنجليزية", res.dualUrl))
-                }
+                return SubResult("no-cues", "-")
             }
-            val trMark = if (AnimeGGTranslate.mmUsed) "tr-mm" else "tr-ok"
-            return SubResult("tr", trMark)
+            val res = AnimeGGTranslate.translateCues(cues, eng, raw!!)
+            if (res.arUrl != null) {
+                val dual = res.dualUrl ?: relayMergeUrl(eng, res.arUrl)
+                subtitleCallback(SubtitleFile("العربية + الإنجليزية", dual))
+                val trMark = if (AnimeGGTranslate.mmUsed) "tr-mm" else "tr-ok"
+                return SubResult("tr", trMark)
+            }
+            // Translation failed: single English as the only fallback.
+            subtitleCallback(SubtitleFile("English", eng))
+            return SubResult("tr-fail", res.failStage ?: "gtx")
         }
         return SubResult("no-match", "-")
     }
@@ -742,7 +892,7 @@ class AnimeGGProvider : MainAPI() {
         } else SubResult("-", "-")
 
         val secs = (System.currentTimeMillis() - t0) / 1000
-        val debugName = "DEBUG AnimeGG v2 | mode=$mode | fr=$iframeCount" +
+        val debugName = "DEBUG AnimeGG v3 | mode=$mode | fr=$iframeCount" +
             " | vid=$videoLinks | bk=$bkLinks | ext=$extLinks | rx=$regexLinks" +
             " | sub:os=${subRes.os} | sub:tr=${subRes.tr}" +
             (if (AnimeGGTranslate.gtx429) " | sub:gtx429" else "") +

@@ -1,5 +1,5 @@
 // Anime9 CloudStream plugin module (standalone 9anime extension).
-version = 2
+version = 3
 
 android {
     namespace = "com.anime9"

@@ -3,7 +3,7 @@
 // no coroutines, no Jackson, no Firebase, no donation prompt, Arabic UI,
 // plus an EN->AR subtitle gear (phone-side free Google Translate) for
 // every English track the flixcloud embed offers.
-version = 7
+version = 8
 
 android {
     namespace = "com.reanime"

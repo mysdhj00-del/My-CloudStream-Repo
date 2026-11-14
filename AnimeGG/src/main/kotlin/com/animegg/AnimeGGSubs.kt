@@ -149,6 +149,16 @@ object AnimeGGSubs {
         return buildSubVTT(cues, combined)
     }
 
+    /** AR+EN dual VTT from ARABIC base cues + English translations
+     * (v3, AR->EN direction): Arabic line above the English line. */
+    fun buildDualVTTArBase(arCues: List<SubCue>, enTexts: List<String>): String {
+        val combined = arCues.mapIndexed { i, c ->
+            val en = enTexts.getOrNull(i) ?: c.text
+            if (en == c.text) c.text else "${c.text}\n$en"
+        }
+        return buildSubVTT(arCues, combined)
+    }
+
     /** Merge two finished VTT texts (EN base + AR overlay) by timestamp overlap. */
     fun mergeSubVTT(engText: String, araText: String): String {
         val eng = parseSubCues(engText)

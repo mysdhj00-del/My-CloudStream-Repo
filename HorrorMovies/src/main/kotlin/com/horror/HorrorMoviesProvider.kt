@@ -22,6 +22,9 @@ import com.lagradost.cloudstream3.utils.newExtractorLink
 import org.json.JSONObject
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
+import android.util.Base64
+import javax.crypto.Mac
+import javax.crypto.spec.SecretKeySpec
 
 /**
  * HorrorMovies (أفلام رعب) — horror movies aggregated from the four
@@ -186,6 +189,43 @@ import org.jsoup.nodes.Document
  * still get poster only, no YouTube query. DEBUG marker is now
  * "Horror v15·<lane>".
  *
+ * v16 (2026-11-15, NEW lane "أفلام رعب — MovieBox", FIRST
+ * section by the user's explicit order, Arabic-subtitled ONLY):
+ * clean-room reimplementation of the MovieBoxProvider v54 (CNC)
+ * flow, recovered from its dex — NO code copied, no .cs3
+ * redistributed. Catalog = the web ranking-list
+ * moviebox.sg/wefeed-h5api-bff/ranking-list/content?id=
+ * 8614980535946986176 (verified live p1-6: 17/15/18/18/18/18
+ * films; the Arabic filter accepts 2/14/17/17/18/15 = 83 in 6
+ * pages). Filter: subtitles field holds comma-separated language
+ * names, Arabic as "اَلْعَرَبِيَّةُ" (fully vocalized); normalize
+ * (strip diacritics/tatweel, أ/إ/آ→ا, ة→ه, ى→ي) then accept if
+ * any name contains "عرب" — verified live on 5 films (Other
+ * Mommy, Conjuring: Last Rites, Five Nights at Freddy's, 28
+ * Years Later: The Bone Temple accepted; Beware Boiúna English-
+ * only excluded). Detail = wefeed-h5api-bff/detail?detailPath=
+ * (fields live under data.subject). Playback = guest JWT token
+ * (mobile gateway first, web host fallback — the web host grants
+ * a real JWT in its x-user header, verified live; the token is
+ * accepted by the backend: search 400 "invalid token" -> 200
+ * with it) + X-Client-Token + x-tr-signature (HmacMD5 over the
+ * canonical string, keys double-base64 from the dex) -> GET
+ * {movie-box.co|moviebox.sg}/wefeed-h5api-bff/subject/play ->
+ * data.streams[]/dash[]/hls[] (signCookie per stream). Captions
+ * via get-ext-captions (Arabic pick) — fail-soft. KNOWN LIMIT
+ * (stated plainly): the sandbox is region-blocked (mobile
+ * gateway 403 "Service not available in current region"; the
+ * play endpoint returns empty streams even with a valid token),
+ * so playback is NOT verifiable from here — the original
+ * MovieBoxProvider v54 WORKS on the user's phone (his word
+ * 2026-11-15 21:44), so the same flow is expected to work
+ * on-device; the on-device verdict is his. Apocalypse Z is NOT
+ * in the MovieBox ranking p1-6 nor in its H5 search (0 results)
+ * at v16 build time — use a listed Arabic-subtitled title
+ * (Conjuring: Last Rites, 28 Years Later: The Bone Temple,
+ * Other Mommy) for the on-device test. DEBUG marker is now
+ * "Horror v16·MovieBox".
+ *
  * RATING: CloudStream's card type has no rating slot in this app
  * version, so ratings ride the detail page: the plot line opens
  * with «★ التقييم: X/10» wherever the source page provides one
@@ -210,6 +250,9 @@ class HorrorMoviesProvider : MainAPI() {
     private val relayBase = "https://egydead-stremio.onrender.com"
 
     override val mainPage = mainPageOf(
+        // v16: MovieBox FIRST by the user's explicit order.
+        "moviebox:https://moviebox.sg/wefeed-h5api-bff/ranking-list/content?id=8614980535946986176&perPage=20" to
+            "أفلام رعب — MovieBox",
         "moviz:https://www.moviz.land/tag/%d8%b1%d8%b9%d8%a8/" to
             "أفلام رعب — موفيز لاند",
         "eg:https://egy.bet/genre/%d8%b1%d8%b9%d8%a8/" to
@@ -255,6 +298,50 @@ class HorrorMoviesProvider : MainAPI() {
         request: MainPageRequest
     ): HomePageResponse {
         val (lane, base) = request.data.split(":", limit = 2)
+        // v16: MovieBox — JSON ranking-list, NOT an HTML page.
+        // Arabic-subtitled ONLY: a film with no Arabic in its
+        // subtitles field never becomes a card. hasNext comes
+        // from the RAW film count (a page can legitimately yield
+        // 0 Arabic cards — e.g. page 1 has only 2 of 17 — so an
+        // empty filtered page must NOT end the section).
+        if (lane == "moviebox") {
+            val url = if (page <= 1) base else "$base&page=$page"
+            val text = runCatching {
+                app.get(url, headers = mbJsonHeaders).text
+            }.getOrNull()
+            if (text.isNullOrBlank()) {
+                return newHomePageResponse(emptyList(), false)
+            }
+            val list = runCatching {
+                JSONObject(text).optJSONObject("data")
+                    ?.optJSONArray("subjectList")
+            }.getOrNull()
+            if (list == null) {
+                return newHomePageResponse(emptyList(), false)
+            }
+            val rawCount = list.length()
+            val cards = ArrayList<SearchResponse>()
+            for (i in 0 until rawCount) {
+                val o = list.optJSONObject(i) ?: continue
+                if (!hasArabicSub(o.optString("subtitles"))) continue
+                val title = o.optString("title")
+                val dp = o.optString("detailPath")
+                if (title.isBlank() || dp.isBlank()) continue
+                val poster = o.optJSONObject("cover")
+                    ?.optString("url")?.ifBlank { null }
+                movieCard(
+                    title,
+                    "$mbWebBase/ar/moviedetail/$dp",
+                    poster
+                )?.let { cards += it }
+            }
+            return newHomePageResponse(
+                listOf(
+                    HomePageList(request.name, cards, isHorizontalImages = true)
+                ),
+                rawCount >= 20
+            )
+        }
         val url = when (lane) {
             "moviz" -> if (page <= 1) base else base + "page/$page/"
             "eg" -> if (page <= 1) base else base + "page/$page/"
@@ -706,6 +793,48 @@ class HorrorMoviesProvider : MainAPI() {
                     this.trailers = trailers
                 }
             }
+            // v16: MovieBox — detail JSON; fields live under
+            // data.subject (NOT data itself). subjectId is packed
+            // into the loadLinks data string (third "|||" part).
+            url.contains("moviebox.sg") || url.contains("movie-box.co") -> {
+                val dp = url.substringAfter("/moviedetail/")
+                    .substringBefore("?").substringBefore("#").trim()
+                val json = runCatching {
+                    app.get(
+                        "$mbWebBase/wefeed-h5api-bff/detail?detailPath=" +
+                            java.net.URLEncoder.encode(dp, "UTF-8"),
+                        headers = mbJsonHeaders
+                    ).text
+                }.getOrNull()
+                val subj = runCatching {
+                    JSONObject(json ?: "").optJSONObject("data")
+                        ?.optJSONObject("subject")
+                }.getOrNull()
+                if (subj == null) return movieFallback(url)
+                val title = subj.optString("title")
+                val poster = subj.optJSONObject("cover")
+                    ?.optString("url")?.ifBlank { null }
+                val desc = subj.optString("description")
+                val genre = subj.optString("genre")
+                val rating = subj.optDouble("imdbRatingValue", -1.0)
+                    .let { if (it >= 0) it.toString() else null }
+                val plot = buildString {
+                    if (rating != null) append("★ التقييم: $rating/10\n")
+                    if (genre.isNotBlank()) append("النوع: $genre\n")
+                    if (desc.isNotBlank()) append(desc)
+                }.ifBlank { null }
+                val subjectId = subj.optString("subjectId")
+                val trailers = trailerFor(title)
+                newMovieLoadResponse(
+                    title.ifBlank { "MovieBox" }, url, TvType.Movie,
+                    movieBoxData(url, title, subjectId)
+                ) {
+                    this.posterUrl = poster
+                    this.backgroundPosterUrl = poster
+                    this.plot = plot
+                    this.trailers = trailers
+                }
+            }
             else -> movieFallback(url)
         }
     }
@@ -1047,6 +1176,8 @@ class HorrorMoviesProvider : MainAPI() {
             realData.contains("larozatv") -> loadLinksLaRos(realData, subtitleCallback, callback, ::elapsed)
             realData.contains("topcinema") -> loadLinksTop(realData, subtitleCallback, callback, ::elapsed)
             realData.contains("aflamstream") -> loadLinksAf(realData, subtitleCallback, callback, ::elapsed)
+            // v16: MovieBox — full data string (carries subjectId).
+            isMovieBox(realData) -> loadLinksMovieBox(data, subtitleCallback, callback, ::elapsed)
             else -> {
                 emitDebug(listOf("Horror", "unknown-lane"), callback)
                 true
@@ -1201,7 +1332,7 @@ class HorrorMoviesProvider : MainAPI() {
         }
         if (emitted == 0 && allowDebug) {
             emitDebug(
-                listOf("Horror v15·$lane") + diagExtra +
+                listOf("Horror v16·$lane") + diagExtra +
                     listOf("srv=${embeds.size}", "ext=$extOk",
                         "dig=$digOk", "relay=$relayOk", "t=${elapsed() / 1000}s"),
                 callback
@@ -1272,7 +1403,7 @@ class HorrorMoviesProvider : MainAPI() {
     ): Boolean {
         val res = runCatching { app.get(data, headers = browserHeaders) }.getOrNull()
         if (res == null) {
-            emitDebug(listOf("Horror v15·EgyBest", "page-fail"), callback)
+            emitDebug(listOf("Horror v16·EgyBest", "page-fail"), callback)
             return true
         }
         val text = res.text
@@ -1708,5 +1839,496 @@ class HorrorMoviesProvider : MainAPI() {
             }
         }
         return runChain(embeds.toList(), watchUrl, subtitleCallback, callback, elapsed, "Af")
+    }
+
+    // ---------------------------------------------------------------
+    // MovieBox (v16) — clean-room reimplementation of the
+    // MovieBoxProvider v54 (CNC) flow, recovered from its dex
+    // (see ~/workspace/moviebox-study/NOTES.md). NO code copied,
+    // no .cs3 redistributed. Catalog = web ranking-list (works
+    // anonymously); playback = guest JWT token (mobile gateway
+    // first, web host fallback) + X-Client-Token + x-tr-signature
+    // (HmacMD5 over the canonical string) -> subject/play ->
+    // data.streams[]/dash[]/hls[] (signCookie per stream).
+    // Captions via get-ext-captions (Arabic pick), fail-soft.
+    // KNOWN LIMIT: the sandbox is region-blocked (mobile gateway
+    // 403 "Service not available in current region"; play returns
+    // empty streams even with a valid token), so playback is NOT
+    // verifiable from here — the original v54 WORKS on the user's
+    // phone (his word 2026-11-15 21:44), so the same flow is
+    // expected to work on-device; the on-device verdict is his.
+    // ---------------------------------------------------------------
+    private val mbWebBase = "https://moviebox.sg"
+    private val mbMobileBase = "https://apig.inmoviebox.com"
+    private val mbRankId = "8614980535946986176"
+    private val mbRankCategoryType = "4516404531735022304"
+    private val mbJsonHeaders = mapOf(
+        "User-Agent" to browserUA,
+        "Accept" to "application/json, text/plain, */*"
+    )
+    private val mbUaToken =
+        "com.community.mbox.in/50020042 (Linux; U; Android 16; en_IN; " +
+            "sdk_gphone64_x86_64; Build/BP22.250325.006; Cronet/133.0.6876.3)"
+    private val mbUaPlayChrome =
+        "Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 " +
+            "(KHTML, like Gecko) Chrome/154.0.0.0 Mobile Safari/537.36"
+
+    private fun isMovieBox(url: String): Boolean {
+        val h = hostOf(url)
+        return h == "moviebox.sg" || h.endsWith(".moviebox.sg") ||
+            h == "movie-box.co" || h.endsWith(".movie-box.co")
+    }
+
+    /** v16 Arabic-only filter: normalize each subtitle language
+     * name (strip diacritics/tatweel, أ/إ/آ→ا, ة→ه, ى→ي) and
+     * accept the film if ANY name contains "عرب". Arabic shows
+     * as "اَلْعَرَبِيَّةُ" (fully vocalized) in the subtitles
+     * field — verified live: 33/50 accepted on ranking p1-3. */
+    private fun normalizeArabic(s: String): String {
+        var t = s.replace(Regex("""[\u064B-\u0652\u0670\u0640]"""), "")
+        t = t.replace('أ', 'ا').replace('إ', 'ا').replace('آ', 'ا')
+            .replace('ة', 'ه').replace('ى', 'ي')
+        return t
+    }
+
+    private fun hasArabicSub(subtitles: String?): Boolean {
+        if (subtitles.isNullOrBlank()) return false
+        return subtitles.split(",")
+            .any { normalizeArabic(it.trim()).contains("عرب") }
+    }
+
+    /** loadLinks data for MovieBox: url ||| title ||| subjectId. */
+    private fun movieBoxData(url: String, title: String, subjectId: String): String =
+        subData(url, title) + "|||" + subjectId
+
+    // --- v54 auth (protocol constants recovered from the dex) ---
+    private val mbDeviceId: String by lazy {
+        val rnd = java.security.SecureRandom()
+        val bytes = ByteArray(16)
+        rnd.nextBytes(bytes)
+        bytes.joinToString("") { "%02x".format(it.toInt() and 0xFF) }
+    }
+
+    private fun md5Hex(bytes: ByteArray): String {
+        val digest = java.security.MessageDigest.getInstance("MD5")
+            .digest(bytes)
+        return digest.joinToString("") { "%02x".format(it.toInt() and 0xFF) }
+    }
+
+    /** The two HMAC keys, double-base64 as stored in the dex. */
+    private val mbKeyDefaultB64 =
+        "NzZpUmwwN3MweFNOOWpxbUVXQXQ3OUVCSlp1bElRSXNWNjRGWnIyTw=="
+    private val mbKeyAltB64 =
+        "WHFuMm5uTzQxL0w5Mm8xaXVYaFNMSFRiWHZZNFo1Wlo2Mm04bVNMQQ=="
+
+    private fun mbKey(doubleB64: String): ByteArray {
+        val once = Base64.decode(doubleB64, Base64.DEFAULT)
+        val inner = String(once, Charsets.UTF_8).trim()
+        return Base64.decode(inner, Base64.DEFAULT)
+    }
+
+    private fun urlDecode(s: String): String = runCatching {
+        java.net.URLDecoder.decode(s.replace("+", "%2B"), "UTF-8")
+    }.getOrDefault(s)
+
+    /** Canonical string: METHOD\nACCEPT\nCONTENT_TYPE\nBODY_LEN\n
+     * TS\nBODY_HASH\nPATH[?sorted-query] — query keys sorted
+     * alphabetically, each rendered name=value (decoded) joined
+     * with '&'. GET with no body => BODY_LEN and BODY_HASH are
+     * empty strings. */
+    private fun mbCanonical(method: String, url: String, ts: Long): String {
+        val qStart = url.indexOf('?')
+        val rawPath = if (qStart >= 0) url.substring(0, qStart) else url
+        val path = Regex("""^[a-z]+://[^/]+""").replace(rawPath, "")
+        val pairs = ArrayList<Pair<String, String>>()
+        if (qStart >= 0) {
+            val query = url.substring(qStart + 1)
+            if (query.isNotBlank()) {
+                for (part in query.split("&")) {
+                    if (part.isEmpty()) continue
+                    val eq = part.indexOf('=')
+                    val k = if (eq >= 0) urlDecode(part.substring(0, eq))
+                    else urlDecode(part)
+                    val v = if (eq >= 0) urlDecode(part.substring(eq + 1))
+                    else ""
+                    pairs += k to v
+                }
+            }
+        }
+        val rendered = StringBuilder()
+        for (k in pairs.map { it.first }.distinct().sorted()) {
+            for ((kk, vv) in pairs) {
+                if (kk == k) {
+                    if (rendered.isNotEmpty()) rendered.append("&")
+                    rendered.append(k).append("=").append(vv)
+                }
+            }
+        }
+        val curl = if (rendered.isEmpty()) path else "$path?$rendered"
+        return listOf(
+            method.uppercase(), "application/json", "application/json",
+            "", ts.toString(), "", curl
+        ).joinToString("\n")
+    }
+
+    /** X-Client-Token = "<ts>,<md5(reverse(ts))>"; x-tr-signature
+     * = "<ts>|2|<base64(HmacMD5(key, canonical))>". */
+    private fun mbSignedHeaders(
+        method: String,
+        url: String,
+        ua: String,
+        clientInfo: String
+    ): Map<String, String> {
+        val ts = System.currentTimeMillis()
+        val xct = "$ts,${md5Hex(ts.toString().reversed().toByteArray(Charsets.UTF_8))}"
+        val canonical = mbCanonical(method, url, ts)
+        val mac = Mac.getInstance("HmacMD5")
+        mac.init(SecretKeySpec(mbKey(mbKeyDefaultB64), "HmacMD5"))
+        val sigBytes = mac.doFinal(canonical.toByteArray(Charsets.UTF_8))
+        val sig = "$ts|2|" + Base64.encodeToString(sigBytes, Base64.NO_WRAP)
+        return mapOf(
+            "User-Agent" to ua,
+            "Accept" to "application/json",
+            "Content-Type" to "application/json",
+            "X-Client-Token" to xct,
+            "x-tr-signature" to sig,
+            "X-Client-Info" to clientInfo,
+            "X-Client-Status" to "0"
+        )
+    }
+
+    private fun mbClientInfoToken(): String =
+        "{\"package_name\":\"com.community.mbox.in\",\"version_name\":\"3.0.03.0529.03\"," +
+            "\"version_code\":50020042,\"os\":\"android\",\"os_version\":\"16\"," +
+            "\"device_id\":\"" + mbDeviceId + "\",\"install_store\":\"ps\"," +
+            "\"gaid\":\"d7578036d13336cc\",\"brand\":\"google\",\"model\":\"SM-S918B\"," +
+            "\"system_language\":\"en\",\"net\":\"NETWORK_WIFI\",\"region\":\"IN\"," +
+            "\"timezone\":\"Asia/Calcutta\",\"sp_code\":\"\"}"
+
+    private fun mbClientInfoPlay(): String =
+        "{\"package_name\":\"com.community.mbox.in\",\"version_name\":\"4.0.02.0831.03\"," +
+            "\"version_code\":50020126,\"os\":\"android\",\"os_version\":\"14\"," +
+            "\"install_ch\":\"official\",\"device_id\":\"" + mbDeviceId + "\"," +
+            "\"install_store\":\"official\",\"gaid\":\"1b2212c1-dadf-43c3-a0c8-bd6ce48ae22d\"," +
+            "\"brand\":\"Google\",\"model\":\"Pixel 8\",\"system_language\":\"en\"," +
+            "\"net\":\"NETWORK_WIFI\",\"region\":\"IN\",\"timezone\":\"Asia/Calcutta\"," +
+            "\"sp_code\":\"\",\"X-Play-Mode\":\"1\",\"X-Idle-Data\":\"1\"," +
+            "\"X-Family-Mode\":\"0\",\"X-Content-Mode\":\"0\"}"
+
+    /** Read the guest JWT from one call: the token arrives in the
+     * "x-user" response header (a JSON string with a "token"
+     * field) or, failing that, in the JSON body. */
+    private suspend fun mbTokenFrom(
+        url: String,
+        signed: Boolean,
+        clientInfo: String?,
+        ua: String
+    ): String? {
+        return try {
+            val headers = if (signed && clientInfo != null) {
+                mbSignedHeaders("GET", url, ua, clientInfo)
+            } else {
+                mapOf(
+                    "User-Agent" to ua,
+                    "Accept" to "application/json, text/plain, */*"
+                )
+            }
+            val res = app.get(url, headers = headers)
+            if (res.code !in 200..299) return null
+            val xu = res.headers["x-user"] ?: res.headers["X-User"]
+            val fromHeader = xu?.let {
+                runCatching { JSONObject(it).optString("token") }.getOrNull()
+            }?.ifBlank { null }
+            if (!fromHeader.isNullOrBlank()) return fromHeader
+            val body = res.text
+            if (body.isBlank()) return null
+            val j = runCatching { JSONObject(body) }.getOrNull()
+                ?: return null
+            j.optString("token").ifBlank { null }
+                ?: j.optJSONObject("data")?.optString("token")?.ifBlank { null }
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    @Volatile
+    private var mbCachedToken: String? = null
+    @Volatile
+    private var mbCachedAt: Long = 0
+
+    /** Guest JWT (valid ~90 days; cached 1 h per session). Mobile
+     * gateway first (v54 order), web host fallback — the web host
+     * grants the same JWT in its x-user header (verified live). */
+    private suspend fun mbGuestToken(): Pair<String?, String> {
+        val now = System.currentTimeMillis()
+        val cached = mbCachedToken
+        if (cached != null && now - mbCachedAt < 3600_000) {
+            return cached to "cached"
+        }
+        val mobUrl = "$mbMobileBase/wefeed-mobile-bff/tab/ranking-list" +
+            "?tabId=0&categoryType=$mbRankCategoryType&page=1&perPage=1"
+        var tok = mbTokenFrom(
+            mobUrl, signed = true,
+            clientInfo = mbClientInfoToken(), ua = mbUaToken
+        )
+        var via = "mob"
+        if (tok == null) {
+            val webUrl = "$mbWebBase/wefeed-h5api-bff/ranking-list/content" +
+                "?id=$mbRankId&page=1&perPage=1"
+            tok = mbTokenFrom(
+                webUrl, signed = false, clientInfo = null, ua = browserUA
+            )
+            via = "web"
+        }
+        if (tok != null) {
+            mbCachedToken = tok
+            mbCachedAt = now
+        }
+        return tok to via
+    }
+
+    private fun mbStreamUrl(s: JSONObject): String? {
+        val direct = s.optString("url").trim()
+        if (direct.isNotBlank()) return direct
+        val arr = s.optJSONArray("resolutions") ?: return null
+        for (i in 0 until arr.length()) {
+            val u = arr.optJSONObject(i)?.optString("url").orEmpty().trim()
+            if (u.isNotBlank()) return u
+        }
+        return null
+    }
+
+    private suspend fun emitMovieBoxLink(
+        url: String,
+        label: String,
+        signCookie: String?,
+        referer: String,
+        callback: (ExtractorLink) -> Unit
+    ) {
+        val headers = LinkedHashMap<String, String>()
+        headers["Referer"] = referer
+        headers["User-Agent"] = mbUaPlayChrome
+        if (!signCookie.isNullOrBlank()) headers["Cookie"] = signCookie
+        val quality = when {
+            label.contains("1080") -> Qualities.P1080.value
+            label.contains("720") -> Qualities.P720.value
+            label.contains("480") -> Qualities.P480.value
+            label.contains("360") -> Qualities.P360.value
+            else -> Qualities.Unknown.value
+        }
+        runCatching {
+            callback(
+                newExtractorLink(
+                    name, label, url,
+                    when {
+                        url.contains(".m3u8") -> ExtractorLinkType.M3U8
+                        url.contains(".mpd") -> ExtractorLinkType.DASH
+                        else -> ExtractorLinkType.VIDEO
+                    }
+                ) {
+                    this.referer = referer
+                    this.quality = quality
+                    this.headers = headers
+                }
+            )
+        }
+    }
+
+    /** Scan one captions array for an Arabic track and attach it.
+     * Returns true when an Arabic track was emitted. */
+    private fun mbPickArabicCaption(
+        arr: org.json.JSONArray?,
+        subtitleCallback: (SubtitleFile) -> Unit
+    ): Boolean {
+        if (arr == null) return false
+        for (i in 0 until arr.length()) {
+            val o = arr.optJSONObject(i) ?: continue
+            val lan = o.optString("lanName")
+            val lang = o.optString("language")
+            val capUrl = o.optString("url")
+            if (capUrl.isBlank()) continue
+            if (normalizeArabic(lan).contains("عرب") ||
+                lang == "ar" || lang == "ara"
+            ) {
+                subtitleCallback(SubtitleFile("العربية", capUrl))
+                return true
+            }
+        }
+        return false
+    }
+
+    /** Arabic captions for a film: get-ext-captions (subjectId
+     * only) first, then get-stream-captions when the play response
+     * yielded stream/resource ids. Both fail-soft — a missing
+     * caption must never block playback. */
+    private suspend fun mbEmitArabicCaption(
+        subjectId: String,
+        token: String,
+        streamId: String?,
+        resourceId: String?,
+        subtitleCallback: (SubtitleFile) -> Unit
+    ) {
+        runCatching {
+            val extUrl = "$mbMobileBase/wefeed-mobile-bff/subject-api/" +
+                "get-ext-captions?subjectId=$subjectId"
+            val extHeaders = mbSignedHeaders(
+                "GET", extUrl, mbUaToken, mbClientInfoToken()
+            ) + mapOf(
+                "Authorization" to "Bearer $token",
+                "X-MB-Token" to token
+            )
+            val extRes = app.get(extUrl, headers = extHeaders)
+            if (extRes.code in 200..299) {
+                val extJson = runCatching { JSONObject(extRes.text) }
+                    .getOrNull()
+                val arr = extJson?.optJSONObject("data")
+                    ?.optJSONArray("extCaptions")
+                    ?: extJson?.optJSONArray("extCaptions")
+                if (mbPickArabicCaption(arr, subtitleCallback)) return
+            }
+            if (streamId.isNullOrBlank() || resourceId.isNullOrBlank()) return
+            val streamUrl = "$mbMobileBase/wefeed-mobile-bff/subject-api/" +
+                "get-stream-captions?subjectId=$subjectId" +
+                "&streamId=$streamId&episode=0&resourceId=$resourceId"
+            val streamHeaders = mbSignedHeaders(
+                "GET", streamUrl, mbUaToken, mbClientInfoToken()
+            ) + mapOf(
+                "Authorization" to "Bearer $token",
+                "X-MB-Token" to token
+            )
+            val streamRes = app.get(streamUrl, headers = streamHeaders)
+            if (streamRes.code !in 200..299) return
+            val streamJson = runCatching { JSONObject(streamRes.text) }
+                .getOrNull() ?: return
+            val arr = streamJson.optJSONObject("data")
+                ?.optJSONArray("captions")
+                ?: streamJson.optJSONArray("captions")
+            mbPickArabicCaption(arr, subtitleCallback)
+        }
+    }
+
+    private suspend fun loadLinksMovieBox(
+        data: String,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit,
+        elapsed: () -> Long
+    ): Boolean {
+        val parts = data.split("|||")
+        val realData = parts.getOrNull(0) ?: data
+        val subjectId = parts.getOrNull(2).orEmpty()
+        val detailPath = realData.substringAfter("/moviedetail/")
+            .substringBefore("?").substringBefore("#").trim()
+        var streamsFound = 0
+        var emitted = 0
+        var playCode = "?"
+        var tokVia = "none"
+        var streamId: String? = null
+        var resourceId: String? = null
+        val counting: (ExtractorLink) -> Unit = { link ->
+            emitted++
+            callback(link)
+        }
+        if (subjectId.isBlank() || detailPath.isBlank()) {
+            emitDebug(
+                listOf(
+                    "Horror v16·MovieBox", "srv=0", "ext=0", "dig=0",
+                    "relay=0", "t=${elapsed() / 1000}s", "tok=$tokVia",
+                    "play=$playCode", "id-missing"
+                ),
+                callback
+            )
+            return true
+        }
+        val (token, via) = mbGuestToken()
+        tokVia = via
+        if (token != null) {
+            val referer = "/movies/?id=$subjectId&type=/movie/detail" +
+                "&detailSe=&detailEp=&lang=en"
+            val bases = listOf("https://movie-box.co", "https://moviebox.sg")
+            for (base in bases) {
+                if (emitted > 0 || elapsed() > 20000) break
+                val playUrl = "$base/wefeed-h5api-bff/subject/play" +
+                    "?subjectId=$subjectId&se=0&ep=0" +
+                    "&detailPath=" +
+                    java.net.URLEncoder.encode(detailPath, "UTF-8") +
+                    "&streamSignType=1" +
+                    "&supportCodecs%5Bhevc%5D=1&supportCodecs%5Bh264%5D=1"
+                val headers = mbSignedHeaders(
+                    "GET", playUrl, mbUaPlayChrome, mbClientInfoPlay()
+                ) + mapOf(
+                    "Referer" to referer,
+                    "Authorization" to "Bearer $token",
+                    "X-MB-Token" to token,
+                    "x-play-mode" to "1",
+                    "x-request-lang" to "en",
+                    "x-vip-restrict" to "0",
+                    "x-no-high-risk-restrict" to "0",
+                    "x-source" to ""
+                )
+                val res = runCatching { app.get(playUrl, headers = headers) }
+                    .getOrNull() ?: continue
+                playCode = res.code.toString()
+                if (res.code !in 200..299) continue
+                val body = res.text
+                if (body.isBlank()) continue
+                val d = runCatching {
+                    JSONObject(body).optJSONObject("data")
+                }.getOrNull() ?: continue
+                resourceId = d.optString("resourceId").ifBlank { null }
+                    ?: resourceId
+                val streamObjs = ArrayList<JSONObject>()
+                for (key in listOf("streams", "dash", "hls")) {
+                    val arr = d.optJSONArray(key) ?: continue
+                    for (i in 0 until arr.length()) {
+                        arr.optJSONObject(i)?.let { streamObjs += it }
+                    }
+                }
+                streamsFound += streamObjs.size
+                if (streamObjs.isNotEmpty()) {
+                    streamId = streamObjs[0].optString("id")
+                        .ifBlank { null } ?: streamId
+                    if (resourceId == null) {
+                        resourceId = streamObjs[0].optString("resourceId")
+                            .ifBlank { null }
+                    }
+                }
+                for (s in streamObjs) {
+                    if (emitted >= 6 || elapsed() > 25000) break
+                    val linkUrl = mbStreamUrl(s) ?: continue
+                    val signCookie = s.optString("signCookie")
+                        .ifBlank { null }
+                    val resLabel = s.optString("resolution").ifBlank {
+                        s.optJSONArray("resolutions")
+                            ?.optJSONObject(0)?.optString("resolution")
+                            .orEmpty()
+                    }
+                    val q = Regex("""(2160|1440|1080|720|480|360)""")
+                        .find(resLabel)?.groupValues?.get(1)
+                    val label = "MovieBox" + if (q != null) " ${q}p" else ""
+                    emitMovieBoxLink(
+                        linkUrl, label, signCookie, referer, counting
+                    )
+                }
+                if (emitted > 0) {
+                    mbEmitArabicCaption(
+                        subjectId, token, streamId, resourceId,
+                        subtitleCallback
+                    )
+                    break
+                }
+            }
+        }
+        if (emitted == 0) {
+            emitDebug(
+                listOf(
+                    "Horror v16·MovieBox", "srv=$streamsFound",
+                    "ext=$emitted", "dig=0", "relay=0",
+                    "t=${elapsed() / 1000}s", "tok=$tokVia",
+                    "play=$playCode"
+                ),
+                callback
+            )
+        }
+        return true
     }
 }

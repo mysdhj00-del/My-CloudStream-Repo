@@ -1,5 +1,5 @@
 // WeCima CloudStream plugin module.
-version = 34
+version = 35
 
 android {
     namespace = "com.wecima"

@@ -1,5 +1,5 @@
 // EgyBest CloudStream plugin module.
-version = 5
+version = 6
 
 android {
     namespace = "com.egybest"

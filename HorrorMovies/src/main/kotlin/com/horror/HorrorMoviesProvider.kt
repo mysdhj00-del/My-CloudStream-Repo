@@ -316,6 +316,38 @@ import okhttp3.RequestBody.Companion.toRequestBody
  * tests on the 4 films: see v18/NOTES.md.
  * DEBUG marker is now "Horror v18·MovieBox".
  *
+ * v19 (2026-11-15, MovieBox dual subtitles «العربية +
+ * الإنجليزية»): the user's on-device verdict on v18 was
+ * "ظهرات الترجمة في قسم moviesbox أفلام رعب" (Arabic
+ * subtitles now show) + his order "اضيف عربي + إنجليزي في
+ * نفس الوقت" — add Arabic + English at the same time. The
+ * same captions array that returns Arabic returns English
+ * too, so mbPickCaptions takes the first of each; when both
+ * exist the menu gets TWO entries — «العربية» (raw URL, as
+ * in v18) and «العربية + الإنجليزية» (Goojara v20 pattern:
+ * the anime-subs relay's /relay/mergesubs?eng=&ara=, which
+ * fetches both files and returns one merged VTT — verified
+ * live from the sandbox on stored test files: 200, merged
+ * VTT carries both languages' cues). The mergesubs URL is
+ * verified with one GET before advertising it; if it does
+ * not serve, the fallback merges locally on the phone's
+ * network (which reaches MovieBox) — tolerant VTT/SRT cue
+ * parser + overlap merge (Arabic line first, English
+ * second) + /relay/store hosting. One side only -> that
+ * side alone ("ar" / "en"); both sides but no dual file
+ * -> "ar+mf" (Arabic single still emitted). DEBUG: "ar+en"
+ * is now the good outcome — the line is emitted whenever
+ * the outcome is anything else. The trailer logic in this
+ * file is UNTOUCHED in v19 (a separate trailer fix takes
+ * HorrorMovies as v20 next). HONEST LIMIT: no real MovieBox
+ * caption file was ever retrieved from the sandbox (the
+ * play endpoint returns empty streams from a datacenter IP,
+ * so no real stream id exists here) — whether the relay can
+ * fetch MovieBox's actual caption URLs is unproven until
+ * his phone tries; the local-merge fallback exists exactly
+ * for that case. See v19/NOTES.md.
+ * DEBUG marker is now "Horror v19·MovieBox".
+ *
  * RATING: CloudStream's card type has no rating slot in this app
  * version, so ratings ride the detail page: the plot line opens
  * with «★ التقييم: X/10» wherever the source page provides one
@@ -1446,7 +1478,7 @@ class HorrorMoviesProvider : MainAPI() {
         }
         if (emitted == 0 && allowDebug) {
             emitDebug(
-                listOf("Horror v18·$lane") + diagExtra +
+                listOf("Horror v19·$lane") + diagExtra +
                     listOf("srv=${embeds.size}", "ext=$extOk",
                         "dig=$digOk", "relay=$relayOk", "t=${elapsed() / 1000}s"),
                 callback
@@ -1517,7 +1549,7 @@ class HorrorMoviesProvider : MainAPI() {
     ): Boolean {
         val res = runCatching { app.get(data, headers = browserHeaders) }.getOrNull()
         if (res == null) {
-            emitDebug(listOf("Horror v18·EgyBest", "page-fail"), callback)
+            emitDebug(listOf("Horror v19·EgyBest", "page-fail"), callback)
             return true
         }
         val text = res.text
@@ -1974,6 +2006,11 @@ class HorrorMoviesProvider : MainAPI() {
     // ---------------------------------------------------------------
     private val mbWebBase = "https://moviebox.sg"
     private val mbMobileBase = "https://apig.inmoviebox.com"
+    // v19: subtitle relay for the dual Arabic+English merge
+    // (Goojara/ReAnime/AnimeGG pattern) — NOT the dead Render
+    // relayBase above. mergesubs merges two caption URLs
+    // server-side; /relay/store hosts a locally merged VTT.
+    private val mbSubsRelayBase = "https://anime-subs-relay.mysdhj00-del.deno.net"
     private val mbRankId = "8614980535946986176"
     private val mbRankCategoryType = "4516404531735022304"
     private val mbJsonHeaders = mapOf(
@@ -2464,23 +2501,197 @@ class HorrorMoviesProvider : MainAPI() {
         return false
     }
 
-    /** Scan one captions array for an Arabic track and attach it.
-     * Returns true when an Arabic track was emitted. */
-    private fun mbPickArabicCaption(
-        arr: org.json.JSONArray?,
-        subtitleCallback: (SubtitleFile) -> Unit
-    ): Boolean {
-        if (arr == null) return false
+    /** v19: mirror of mbIsArabicCaption for English tracks. */
+    private fun mbIsEnglishCaption(o: JSONObject): Boolean {
+        val lan = o.optString("lan").lowercase()
+        val lang = o.optString("language").lowercase()
+        if (lan == "en" || lan == "eng" || lang == "en" || lang == "eng") return true
+        val lanName = o.optString("lanName")
+        if (lanName.lowercase().contains("english")) return true
+        if (normalizeArabic(lanName).contains("انجليز")) return true
+        return false
+    }
+
+    /** v19: scan one captions array for the FIRST Arabic and the
+     * FIRST English track. Returns (araUrl, engUrl) — either
+     * may be null. Both come from the SAME array (the same
+     * caption call that returns Arabic returns English too). */
+    private fun mbPickCaptions(
+        arr: org.json.JSONArray?
+    ): Pair<String?, String?> {
+        var ara: String? = null
+        var eng: String? = null
+        if (arr == null) return null to null
         for (i in 0 until arr.length()) {
             val o = arr.optJSONObject(i) ?: continue
             val capUrl = o.optString("url")
             if (capUrl.isBlank()) continue
-            if (mbIsArabicCaption(o)) {
-                subtitleCallback(SubtitleFile("العربية", capUrl))
-                return true
-            }
+            if (ara == null && mbIsArabicCaption(o)) ara = capUrl
+            if (eng == null && mbIsEnglishCaption(o)) eng = capUrl
+            if (ara != null && eng != null) break
         }
-        return false
+        return ara to eng
+    }
+
+    // ---- v19 local subtitle merge (fallback when the relay
+    // mergesubs URL does not serve) ----
+    private data class MbSubCue(
+        val startMs: Long,
+        val endMs: Long,
+        val text: String
+    )
+
+    private fun mbSubTsToMs(t: String): Long {
+        val clean = t.trim().replace(',', '.')
+        val parts = clean.split(":")
+        val secParts = parts.last().split(".")
+        val secs = secParts[0].toLongOrNull() ?: 0L
+        val ms = (secParts.getOrNull(1) ?: "0").padEnd(3, '0')
+            .take(3).toLongOrNull() ?: 0L
+        var total = secs * 1000 + ms
+        if (parts.size == 3) total += (parts[0].toLongOrNull() ?: 0L) * 3600000 +
+            (parts[1].toLongOrNull() ?: 0L) * 60000
+        else if (parts.size == 2) total += (parts[0].toLongOrNull() ?: 0L) * 60000
+        return total
+    }
+
+    private fun mbFmtMs(ms: Long): String {
+        val h = ms / 3600000
+        val m = (ms % 3600000) / 60000
+        val s = (ms % 60000) / 1000
+        val r = ms % 1000
+        return "%02d:%02d:%02d.%03d".format(h, m, s, r)
+    }
+
+    /** Tolerant VTT/SRT cue parser (SRT index lines and comma
+     * timestamps are skipped/accepted; HTML tags stripped). */
+    private fun mbParseSubCues(text: String): List<MbSubCue> {
+        val cues = ArrayList<MbSubCue>()
+        val blocks = text.replace("\r\n", "\n").replace("\r", "\n")
+            .split("\n\n")
+        val tsRe = Regex(
+            """(\d{1,2}:\d{2}:\d{2}[.,]\d{1,3}|\d{1,2}:\d{2}[.,]\d{1,3})\s*-->\s*(\d{1,2}:\d{2}:\d{2}[.,]\d{1,3}|\d{1,2}:\d{2}[.,]\d{1,3})"""
+        )
+        for (block in blocks) {
+            val lines = block.lines().map { it.trim() }
+                .filter { it.isNotEmpty() }
+            if (lines.isEmpty()) continue
+            var tsIdx = -1
+            var m: MatchResult? = null
+            for (i in lines.indices) {
+                m = tsRe.find(lines[i])
+                if (m != null) {
+                    tsIdx = i
+                    break
+                }
+            }
+            if (tsIdx < 0 || m == null) continue
+            val startMs = mbSubTsToMs(m.groupValues[1])
+            val endMs = mbSubTsToMs(m.groupValues[2])
+            val cueText = lines.subList(tsIdx + 1, lines.size)
+                .joinToString("\n") { it.replace(Regex("<[^>]*>"), "") }
+                .trim()
+            if (cueText.isEmpty()) continue
+            cues += MbSubCue(startMs, endMs, cueText)
+        }
+        return cues
+    }
+
+    /** Merge Arabic + English cue lists into one dual VTT:
+     * every Arabic cue gains the overlapping English line(s)
+     * underneath it; English cues with no Arabic overlap stay
+     * on their own. Same shape the relay's mergesubs returns
+     * (Arabic line first, English second). */
+    private fun mbBuildDualVTT(
+        araCues: List<MbSubCue>,
+        engCues: List<MbSubCue>
+    ): String {
+        val usedEng = HashSet<Int>()
+        val merged = ArrayList<MbSubCue>()
+        for (a in araCues) {
+            val overlapping = engCues.withIndex()
+                .filter { it.value.startMs < a.endMs && it.value.endMs > a.startMs }
+            val enText = overlapping.joinToString("\n") { it.value.text }
+            overlapping.forEach { usedEng += it.index }
+            val text = if (enText.isEmpty()) a.text else a.text + "\n" + enText
+            merged += MbSubCue(a.startMs, a.endMs, text)
+        }
+        for ((idx, e) in engCues.withIndex()) {
+            if (idx !in usedEng) merged += MbSubCue(e.startMs, e.endMs, e.text)
+        }
+        merged.sortBy { it.startMs }
+        val out = StringBuilder("WEBVTT\n\n")
+        for (c in merged) {
+            out.append(mbFmtMs(c.startMs)).append(" --> ")
+                .append(mbFmtMs(c.endMs)).append("\n")
+                .append(c.text).append("\n\n")
+        }
+        return out.toString()
+    }
+
+    /** Fetch both caption files on the phone's network (which
+     * reaches MovieBox), merge locally and host the result on
+     * the subtitle relay. Returns the stored dual URL, or null
+     * when any step fails. */
+    private suspend fun mbMergeCaptionsLocal(
+        araUrl: String,
+        engUrl: String
+    ): String? {
+        return runCatching {
+            val araText = app.get(araUrl).text
+            val engText = app.get(engUrl).text
+            if (araText.isBlank() || engText.isBlank()) return@runCatching null
+            val araCues = mbParseSubCues(araText)
+            val engCues = mbParseSubCues(engText)
+            if (araCues.isEmpty() || engCues.isEmpty()) return@runCatching null
+            val vtt = mbBuildDualVTT(araCues, engCues)
+            val res = app.post(
+                "$mbSubsRelayBase/relay/store",
+                data = mapOf("vtt" to vtt)
+            )
+            JSONObject(res.text).optString("url").ifEmpty { null }
+        }.getOrNull()
+    }
+
+    /** Emit subtitles from one captions array. Returns the sub
+     * diagnostic: "ar+en" when the dual option was emitted,
+     * "ar" / "en" for a single side, "ar+mf" when both sides
+     * exist but no dual file could be built (merge + local
+     * fallback both failed — the Arabic single is still
+     * emitted), or null when the array holds neither.
+     * Dual = the relay's /relay/mergesubs (Goojara v20 pattern:
+     * it fetches both files and returns one merged VTT),
+     * verified with one GET before advertising it; the local
+     * merge + store above is the fallback. */
+    private suspend fun mbEmitFromArray(
+        arr: org.json.JSONArray?,
+        subtitleCallback: (SubtitleFile) -> Unit
+    ): String? {
+        val (ara, eng) = mbPickCaptions(arr)
+        if (ara == null && eng == null) return null
+        if (ara != null) subtitleCallback(SubtitleFile("العربية", ara))
+        if (ara != null && eng != null) {
+            val mergeUrl = "$mbSubsRelayBase/relay/mergesubs?eng=" +
+                java.net.URLEncoder.encode(eng, "UTF-8") +
+                "&ara=" + java.net.URLEncoder.encode(ara, "UTF-8")
+            val mergeOk = runCatching {
+                val r = app.get(mergeUrl)
+                r.code in 200..299 && r.text.contains("WEBVTT")
+            }.getOrDefault(false)
+            if (mergeOk) {
+                subtitleCallback(SubtitleFile("العربية + الإنجليزية", mergeUrl))
+                return "ar+en"
+            }
+            val stored = mbMergeCaptionsLocal(ara, eng)
+            if (stored != null) {
+                subtitleCallback(SubtitleFile("العربية + الإنجليزية", stored))
+                return "ar+en"
+            }
+            return "ar+mf"
+        }
+        if (ara != null) return "ar"
+        subtitleCallback(SubtitleFile("English", eng!!))
+        return "en"
     }
 
     /** Captions array from a caption-endpoint body: the mobile
@@ -2499,9 +2710,11 @@ class HorrorMoviesProvider : MainAPI() {
         return null
     }
 
-    /** Arabic captions for a film. Returns a diagnostic: "ar"
-     * when an Arabic track was emitted, else a compact
-     * "none:<route>=<code>/..." trail (e.g.
+    /** Captions for a film (v19: Arabic + English dual).
+     * Returns a diagnostic: "ar+en" when the dual option was
+     * emitted, "ar" / "en" for a single side, "ar+mf" when both
+     * sides exist but no dual file could be built, else a
+     * compact "none:<route>=<code>/..." trail (e.g.
      * "none:h5=200-empty/mob=403").
      * v18: the v17 routes called ONLY the mobile gateway
      * (apig.inmoviebox.com) — 403 "Service not available in
@@ -2551,8 +2764,8 @@ class HorrorMoviesProvider : MainAPI() {
                 trail += "h5=$code-empty"
                 continue
             }
-            if (mbPickArabicCaption(arr, subtitleCallback)) return "ar"
-            trail += "h5=$code-noar"
+            mbEmitFromArray(arr, subtitleCallback)?.let { return it }
+            trail += "h5=$code-nocap"
         }
         // Route mobile ext-captions (subjectId only).
         runCatching {
@@ -2569,7 +2782,7 @@ class HorrorMoviesProvider : MainAPI() {
             if (extRes.code in 200..299) {
                 val extJson = runCatching { JSONObject(extRes.text) }.getOrNull()
                 val arr = mbCaptionsArray(extJson, "extCaptions", "captions")
-                if (mbPickArabicCaption(arr, subtitleCallback)) return "ar"
+                mbEmitFromArray(arr, subtitleCallback)?.let { return it }
             }
         }
         // Route mobile stream-captions (needs stream + resource ids).
@@ -2589,7 +2802,7 @@ class HorrorMoviesProvider : MainAPI() {
                 if (streamRes.code in 200..299) {
                     val streamJson = runCatching { JSONObject(streamRes.text) }.getOrNull()
                     val arr = mbCaptionsArray(streamJson, "captions", "extCaptions")
-                    if (mbPickArabicCaption(arr, subtitleCallback)) return "ar"
+                    mbEmitFromArray(arr, subtitleCallback)?.let { return it }
                 }
             }
         }
@@ -2621,7 +2834,7 @@ class HorrorMoviesProvider : MainAPI() {
         if (subjectId.isBlank() || detailPath.isBlank()) {
             emitDebug(
                 listOf(
-                    "Horror v18·MovieBox", "srv=0", "ext=0", "dig=0",
+                    "Horror v19·MovieBox", "srv=0", "ext=0", "dig=0",
                     "relay=0", "t=${elapsed() / 1000}s", "tok=$tokVia",
                     "play=$playCode", "id-missing"
                 ),
@@ -2731,12 +2944,12 @@ class HorrorMoviesProvider : MainAPI() {
                 }
             }
         }
-        if (emitted == 0 || subDiag != "ar") {
+        if (emitted == 0 || subDiag != "ar+en") {
             // v18: a missing subtitle must never be silent again —
             // emit the DEBUG line even when playback links exist.
             emitDebug(
                 listOf(
-                    "Horror v18·MovieBox", "srv=$streamsFound",
+                    "Horror v19·MovieBox", "srv=$streamsFound",
                     "ext=$emitted", "dig=0", "relay=0",
                     "t=${elapsed() / 1000}s", "tok=$tokVia",
                     "play=$playCode", "sub=$subDiag"

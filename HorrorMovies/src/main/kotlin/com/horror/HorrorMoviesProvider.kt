@@ -33,11 +33,12 @@ import org.jsoup.nodes.Document
  *   {post}/watch/ lists .server-card embeds (extractors + digs +
  *   upbom direct mp4s). Post pages carry a real rating:
  *   <span class="rating">7.2/10</span> — shown on the detail page.
- * - EGYBEST (egibest.life): /genre/رعب/ renders a.postBlockCol
- *   cards (title attr, img[data-src] poster). Title pages carry
- *   JSON-LD embedUrl + loadIframe(this, '<site>/watch/?url=<b64>')
- *   server wrappers + plain iframes; chain = extractors → phone
- *   dig (raw + packed-JS) → relay.
+ * - EGYBEST (egy.bet — moved from egibest.life/vip 2026-11-15):
+ *   /genre/رعب/ renders a.postBlockCol cards (title attr, img[data-src]
+ *   poster). Title pages carry JSON-LD embedUrl + loadIframe(this,
+ *   '<site>/watch/?url=<b64>') server wrappers + plain iframes;
+ *   chain = dig-first for no-extractor hosts (v14) → extractors →
+ *   second dig → ONE bounded relay attempt.
  * - MYCIMA (vid.mycima.cc): Melody horror category
  *   categories-cimawbas.php?cat=horror-movies (&page={n}),
  *   ul#pm-grid cards linking watch.php?vid={vid}; play.php
@@ -160,6 +161,31 @@ import org.jsoup.nodes.Document
  * protocol-relative //...mp4|m3u8 URLs (the live mixdrop.top
  * link). DEBUG marker is now "Horror v14·<lane>".
  *
+ * v15 (2026-11-15, EgyBest section review — user report: films
+ * don't play, film info doesn't show, trailer doesn't show):
+ * ONE root cause for all three, proven live: the site moved
+ * domains AGAIN (egibest.life + egibest.vip both 301 to egy.bet;
+ * card hrefs are now https://egy.bet/... with NO "egibest"
+ * substring anywhere). v14's contains("egibest") checks in
+ * load() and loadLinks() therefore matched NOTHING: every EgyBest
+ * card fell to movieFallback (title "فيلم", no poster, no plot,
+ * trailerFor("فيلم") -> no Latin -> no trailer) and loadLinks
+ * fell to the else branch -> "DEBUG Horror | unknown-lane" +
+ * Big Buck Bunny test clip (exactly the user's 02:06 shot).
+ * The detail pages themselves are healthy (og:title / og:image /
+ * og:description all present on 6/6 films) and trailerFor
+ * matches the correct official trailer on 6/6 Latin titles live,
+ * and the v14 dig chain still yields direct links on today's
+ * egy.bet embeds (1vid/vidmoly/vidspeed 200, uqload + mixdrop.top
+ * links found). Fix: isEgyBest() host matcher used in load(),
+ * loadLinks() and the EgyBest embed/iframe filters; section +
+ * search base URLs moved to egy.bet; movieFallback trims the
+ * trailing slash before taking the slug title; poster URLs get
+ * non-ASCII percent-encoding (site posters carry raw Arabic in
+ * the filename). Trailer v3 rule untouched: Arabic-only titles
+ * still get poster only, no YouTube query. DEBUG marker is now
+ * "Horror v15·<lane>".
+ *
  * RATING: CloudStream's card type has no rating slot in this app
  * version, so ratings ride the detail page: the plot line opens
  * with «★ التقييم: X/10» wherever the source page provides one
@@ -186,7 +212,7 @@ class HorrorMoviesProvider : MainAPI() {
     override val mainPage = mainPageOf(
         "moviz:https://www.moviz.land/tag/%d8%b1%d8%b9%d8%a8/" to
             "أفلام رعب — موفيز لاند",
-        "eg:https://egibest.life/genre/%d8%b1%d8%b9%d8%a8/" to
+        "eg:https://egy.bet/genre/%d8%b1%d8%b9%d8%a8/" to
             "أفلام رعب — إيجي بست",
         "myc:https://vid.mycima.cc/categories-cimawbas.php?cat=horror-movies" to
             "أفلام رعب — ماي سيما",
@@ -304,9 +330,11 @@ class HorrorMoviesProvider : MainAPI() {
                 val href = a.attr("href")
                 if (href.isBlank()) continue
                 val img = a.selectFirst("img")
-                val poster = img?.attr("data-src")
-                    ?.takeIf { it.isNotBlank() && !it.contains("src-default") }
-                    ?: img?.attr("src")?.takeIf { it.isNotBlank() }
+                val poster = encodeNonAsciiUrl(
+                    img?.attr("data-src")
+                        ?.takeIf { it.isNotBlank() && !it.contains("src-default") }
+                        ?: img?.attr("src")?.takeIf { it.isNotBlank() }
+                )
                 val title = a.attr("title").ifBlank {
                     a.selectFirst("h3.title")?.text().orEmpty()
                 }
@@ -375,7 +403,7 @@ class HorrorMoviesProvider : MainAPI() {
         val out = mutableListOf<SearchResponse>()
         val jobs = listOf(
             "https://www.moviz.land/?s=$q" to "moviz",
-            "https://egibest.life/?s=$q" to "eg",
+            "https://egy.bet/?s=$q" to "eg",
             "https://vid.mycima.cc/search.php?keywords=$q" to "myc",
             "https://larozatv.com/search?q=$q" to "lar",
             "https://topcinema.film/?s=$q" to "top",
@@ -599,12 +627,12 @@ class HorrorMoviesProvider : MainAPI() {
                     this.trailers = trailers
                 }
             }
-            url.contains("egibest") -> {
+            isEgyBest(url) -> {
                 val doc = runCatching {
                     app.get(url, headers = browserHeaders).document
                 }.getOrNull()
                 val title = cleanMovieTitle(og(doc ?: return movieFallback(url), "title") ?: "")
-                val poster = doc?.let { og(it, "image") }
+                val poster = doc?.let { encodeNonAsciiUrl(og(it, "image")) }
                 val desc = doc?.let { og(it, "description") }
                 val trailers = trailerFor(title)
                 newMovieLoadResponse(title.ifBlank { "EgyBest" }, url, TvType.Movie, subData(url, title)) {
@@ -683,7 +711,9 @@ class HorrorMoviesProvider : MainAPI() {
     }
 
     private suspend fun movieFallback(url: String): LoadResponse {
-        val name = cleanMovieTitle(url.substringAfterLast('/').replace('-', ' '))
+        // v15: trim the trailing slash first — a detail URL ending
+        // in "/" gave substringAfterLast('/') = "" -> blank name.
+        val name = cleanMovieTitle(url.trimEnd('/').substringAfterLast('/').replace('-', ' '))
         return newMovieLoadResponse(name.ifBlank { "فيلم" }, url, TvType.Movie, subData(url, name)) {
             this.trailers = trailerFor(name)
         }
@@ -716,6 +746,33 @@ class HorrorMoviesProvider : MainAPI() {
     private fun hostOf(url: String): String =
         Regex("""^[a-z]+://([^/]+)""").find(url)?.groupValues?.get(1)
             ?.lowercase() ?: ""
+
+    /** v15: EgyBest moved domains twice in 24 h (egibest.life ->
+     * egibest.vip -> egy.bet, 2026-11-15). Match by host so the
+     * next move only needs one line here — a hard-coded
+     * contains("egibest") broke load() AND loadLinks() the moment
+     * the site became egy.bet (no "egibest" substring anywhere). */
+    private fun isEgyBest(url: String): Boolean {
+        val h = hostOf(url)
+        return h.contains("egibest") || h == "egy.bet" || h.endsWith(".egy.bet")
+    }
+
+    /** v15 (defensive): percent-encode non-ASCII chars in a URL
+     * (EgyBest posters carry raw Arabic in the filename).
+     * ASCII URLs pass through unchanged; existing %XX sequences
+     * are left alone (only chars > 127 are touched). */
+    private fun encodeNonAsciiUrl(u: String?): String? {
+        if (u.isNullOrBlank()) return u
+        val sb = StringBuilder()
+        for (ch in u) {
+            if (ch.code < 128) sb.append(ch)
+            else for (b in ch.toString().toByteArray(Charsets.UTF_8)) {
+                sb.append('%')
+                    .append((b.toInt() and 0xFF).toString(16).uppercase().padStart(2, '0'))
+            }
+        }
+        return sb.toString()
+    }
 
     private fun decodeBase64(input: String): String? {
         val clean = input.trim().replace('-', '+').replace('_', '/')
@@ -985,7 +1042,7 @@ class HorrorMoviesProvider : MainAPI() {
         }
         return when {
             realData.contains("moviz.land") -> loadLinksMoviz(realData, subtitleCallback, callback, ::elapsed)
-            realData.contains("egibest") -> loadLinksEgyBest(realData, subtitleCallback, callback, ::elapsed)
+            isEgyBest(realData) -> loadLinksEgyBest(realData, subtitleCallback, callback, ::elapsed)
             realData.contains("mycima") -> loadLinksMyCima(realData, subtitleCallback, callback, ::elapsed)
             realData.contains("larozatv") -> loadLinksLaRos(realData, subtitleCallback, callback, ::elapsed)
             realData.contains("topcinema") -> loadLinksTop(realData, subtitleCallback, callback, ::elapsed)
@@ -1144,7 +1201,7 @@ class HorrorMoviesProvider : MainAPI() {
         }
         if (emitted == 0 && allowDebug) {
             emitDebug(
-                listOf("Horror v14·$lane") + diagExtra +
+                listOf("Horror v15·$lane") + diagExtra +
                     listOf("srv=${embeds.size}", "ext=$extOk",
                         "dig=$digOk", "relay=$relayOk", "t=${elapsed() / 1000}s"),
                 callback
@@ -1215,7 +1272,7 @@ class HorrorMoviesProvider : MainAPI() {
     ): Boolean {
         val res = runCatching { app.get(data, headers = browserHeaders) }.getOrNull()
         if (res == null) {
-            emitDebug(listOf("Horror·EgyBest", "page-fail"), callback)
+            emitDebug(listOf("Horror v15·EgyBest", "page-fail"), callback)
             return true
         }
         val text = res.text
@@ -1235,7 +1292,7 @@ class HorrorMoviesProvider : MainAPI() {
                 if (decoded != null && decoded.startsWith("http")) {
                     embeds += fixUrl(decoded)
                 } else if (wrapper.startsWith("http") &&
-                    !wrapper.contains("egibest")
+                    !isEgyBest(wrapper)
                 ) {
                     embeds += fixUrl(wrapper)
                 }
@@ -1243,7 +1300,7 @@ class HorrorMoviesProvider : MainAPI() {
         }
         res.document.select("iframe[src]").forEach {
             val src = it.attr("src").trim()
-            if (src.startsWith("http") && !src.contains("egibest")) {
+            if (src.startsWith("http") && !isEgyBest(src)) {
                 embeds += fixUrl(src)
             }
         }

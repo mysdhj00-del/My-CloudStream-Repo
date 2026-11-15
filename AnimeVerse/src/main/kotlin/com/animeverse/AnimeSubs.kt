@@ -306,13 +306,16 @@ object AnimeSubs {
     }
 
 
-    // v3 (2026-11-14, user order): trailers ONLY for Latin titles.
-    // An Arabic-only title gets the poster only — no YouTube query
-    // at all. A Latin candidate is valid only if it contains at
-    // least one [A-Za-z] letter (digits-only candidates like "2"
-    // are NOT titles). Queries are Latin-only; the pick accepts
-    // only a result whose title contains a Latin candidate AND
-    // a trailer word. No match = no trailer button.
+    // v4 (2026-11-15, user order): trailers in the ORIGINAL language
+    // only — dubbed/localized variants (French/Polish/Russian/...) are
+    // skipped. v3 rules still hold: an Arabic-only title gets the poster
+    // only — no YouTube query at all; Latin candidates only, valid only
+    // if they contain at least one [A-Za-z] letter. The pick prefers the
+    // exact "official trailer" first, then any trailer/teaser/PV — and
+    // rejects titles carrying dub markers or non-Latin script (Cyrillic/
+    // Arabic/CJK), which are dubs or localized re-uploads, never the
+    // original. No match = no trailer button.
+
     suspend fun trailerFor(
         title: String,
         isSeries: Boolean = false,
@@ -344,6 +347,9 @@ object AnimeSubs {
         }
     }
 
+    // v4 (2026-11-15): the pick skips dubbed/localized results
+    // entirely (see isDubbedTitle / hasNonLatinScript below) and
+    // prefers the exact "official trailer" in a first pass.
     suspend fun youtubeTrailerId(
         query: String,
         names: List<String>,
@@ -362,7 +368,42 @@ object AnimeSubs {
             val lcNames = names.map { it.lowercase(java.util.Locale.ROOT) }
                 .filter { it.length >= 3 }
             if (lcNames.isEmpty()) return null
+            // Dub / localized markers: a result title carrying one of
+            // these is a dubbed or localized re-upload, never the
+            // original-language trailer. "dub" is a WHOLE WORD only
+            // (word-boundary regex) and "dubbed" is listed separately,
+            // so words like "club" or "Dubai" can never match.
+            // "doblado"/"doppiato" = dubbed in Spanish/Italian;
+            // "vostfr" = French-subtitled version; "oficial"/
+            // "legendado" = Portuguese localized title.
+            val dubbedMarks = listOf(
+                "dubbed", "dubs", "doublé", "doublage", "dublado",
+                "dublagem", "dublat", "doblado", "doppiato", "zwiastun",
+                "bande-annonce", "bande annonce", "trailer officiel",
+                "officiel", "oficial", "polski", "français", "francais",
+                "russian", "русский", "трейлер", "дубляж", "озвучка",
+                "hindi", "tamil", "telugu", "español", "italiano",
+                "deutsch", "português", "türkçe", "legendado", "vostfr",
+                "in french", "in polish", "in russian"
+            )
+            val dubWordRe = Regex("""\bdub\b""")
+            val isDubbedTitle = { t: String ->
+                val lt = t.lowercase(java.util.Locale.ROOT)
+                dubWordRe.containsMatchIn(lt) ||
+                    dubbedMarks.any { lt.contains(it) }
+            }
+            // Non-Latin script in the title = a dub or a localized
+            // re-title, never the original (original-language titles
+            // for our Latin-named films are Latin-script).
+            val hasNonLatinScript = { t: String ->
+                t.any { c ->
+                    (c in '\u0400'..'\u052F') || (c in '\u0600'..'\u06FF') ||
+                    (c in '\u4E00'..'\u9FFF') || (c in '\u3040'..'\u30FF') ||
+                    (c in '\u0590'..'\u05FF')
+                }
+            }
             val seen = HashSet<String>()
+            val cands = ArrayList<Pair<String, String>>()
             for (m in idRe.findAll(html)) {
                 val id = m.groupValues[1]
                 if (!seen.add(id)) continue
@@ -373,9 +414,20 @@ object AnimeSubs {
                     ?: continue
                 val lt = t.lowercase(java.util.Locale.ROOT)
                 if (lcNames.none { lt.contains(it) }) continue
-                val isTrailer = lt.contains("trailer") || lt.contains("teaser") ||
-                    (acceptPv && t.contains("PV"))
-                if (isTrailer) return id
+                if (isDubbedTitle(t)) continue
+                if (hasNonLatinScript(t)) continue
+                cands += id to t
+            }
+            // Pass 1: the exact "official trailer" first.
+            for ((id, t) in cands) {
+                if (t.lowercase(java.util.Locale.ROOT)
+                    .contains("official trailer")) return id
+            }
+            // Pass 2: any trailer / teaser / PV.
+            for ((id, t) in cands) {
+                val lt = t.lowercase(java.util.Locale.ROOT)
+                if (lt.contains("trailer") || lt.contains("teaser") ||
+                    (acceptPv && t.contains("PV"))) return id
             }
             null
         } catch (_: Exception) {

@@ -25,6 +25,8 @@ import org.jsoup.nodes.Document
 import android.util.Base64
 import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.RequestBody.Companion.toRequestBody
 
 /**
  * HorrorMovies (أفلام رعب) — horror movies aggregated from the four
@@ -226,6 +228,57 @@ import javax.crypto.spec.SecretKeySpec
  * Other Mommy) for the on-device test. DEBUG marker is now
  * "Horror v16·MovieBox".
  *
+ * v17 (2026-11-15, MovieBox rebuilt on the IN flow + pagination
+ * fix + franchise parts): the user's on-device verdict on v16
+ * was "فيلمين فقط ولا يستغل" (only two films, playback does not
+ * work) — page 1 carries only 2 Arabic films and v16's
+ * hasNext = rawCount >= 20 stopped the section there; and he
+ * ordered "استبداله بهذه" — replace the implementation with
+ * MovieBoxIN (CNC v56), which works on his phone. Dex comparison
+ * (IN v56 vs v54) proved the playback chain is IDENTICAL between
+ * the two (same token fetch, same signing keys, same play
+ * endpoint, same emit logic — byte-identical emit code); the
+ * differences are only in getMainPage (IN fetches its home tabs
+ * dynamically via wefeed-mobile-bff/tab-operating, v54 hardcodes
+ * 13 category tabs) and dub handling. So v16's failure is in OUR
+ * reimplementation's divergences from the CNC flow, fixed here:
+ * (1) the play-call Referer was a relative path
+ * "/movies/?id=..." — CNC sends the FULL player-page URL
+ * "<playBase>/movies/<detailPath>?id=<subjectId>&type=/movie/
+ * detail&detailSe=&detailEp=&lang=en" (proven from the IN dex,
+ * loadLinks$1 lines ~110f-1133; v54 identical); (2) detailPath
+ * was URL-encoded in the play URL — CNC appends it raw;
+ * (3) emitted links carried Referer = the same relative path,
+ * no Origin, and the signed cookie under hardcoded "Cookie" —
+ * CNC's emit (loadLinks$emitStream$2, lines 780-794) sends for
+ * VIDEO links Origin = subDomain, Referer =
+ * "<subDomain>/movies/<subPath>?id=...&type=...", the mobile
+ * Pixel 9 Chrome 154 UA, and the cookie under the stream's own
+ * signHeaderKey (default "X-MB-Token"); non-VIDEO links get
+ * {Referer: "https://movie-box.co/", desktop Chrome 154 UA}.
+ * Here subDomain = the play base that returned the streams and
+ * subPath = detailPath, so the emitted Referer is exactly the
+ * player-page URL the backend validated when issuing the
+ * streams (judgment call — the dex does not name how CNC
+ * derives them; the alternative, stream-URL origin, is noted
+ * in v17/NOTES.md). One CNC detail NOT reproduced: a header
+ * whose value is {"timezone":"Asia/Calcutta"} (IN dex 113d) —
+ * its header NAME could not be recovered from the dex (no
+ * timezone header string exists in it) and guessing a name is
+ * worse than omitting it. Pagination: hasNext now reads
+ * data.pager.hasMore AND stops only when a page brings zero NEW
+ * raw items (seen-set by detailPath, cleared on page 1) — a page
+ * with zero Arabic cards does NOT end the section. Verified
+ * live: 8 pages, 128 raw, 106 Arabic, 106 unique, 0 dupes,
+ * hasMore=false on p8. NEW: franchise parts on the film page
+ * (his order 2026-11-15 22:18) — load() searches MovieBox for
+ * the film's base name and attaches every matching part, sorted
+ * by year then part number, Arabic-subtitled only, fail-soft.
+ * Verified live: Saw -> 8 parts (2004..2023, X last); The
+ * Conjuring -> 2 parts (the 2013/2016 films are not in the
+ * MovieBox search index at all); 28 Years Later -> 2 parts.
+ * DEBUG marker is now "Horror v17·MovieBox".
+ *
  * RATING: CloudStream's card type has no rating slot in this app
  * version, so ratings ride the detail page: the plot line opens
  * with «★ التقييم: X/10» wherever the source page provides one
@@ -250,7 +303,7 @@ class HorrorMoviesProvider : MainAPI() {
     private val relayBase = "https://egydead-stremio.onrender.com"
 
     override val mainPage = mainPageOf(
-        // v16: MovieBox FIRST by the user's explicit order.
+        // v17: MovieBox FIRST by the user's explicit order.
         "moviebox:https://moviebox.sg/wefeed-h5api-bff/ranking-list/content?id=8614980535946986176&perPage=20" to
             "أفلام رعب — MovieBox",
         "moviz:https://www.moviz.land/tag/%d8%b1%d8%b9%d8%a8/" to
@@ -298,12 +351,17 @@ class HorrorMoviesProvider : MainAPI() {
         request: MainPageRequest
     ): HomePageResponse {
         val (lane, base) = request.data.split(":", limit = 2)
-        // v16: MovieBox — JSON ranking-list, NOT an HTML page.
+        // v17: MovieBox — JSON ranking-list, NOT an HTML page.
         // Arabic-subtitled ONLY: a film with no Arabic in its
-        // subtitles field never becomes a card. hasNext comes
-        // from the RAW film count (a page can legitimately yield
-        // 0 Arabic cards — e.g. page 1 has only 2 of 17 — so an
-        // empty filtered page must NOT end the section).
+        // subtitles field never becomes a card. Pagination (fixed
+        // v17 — v16 used rawCount >= 20, but pages return 17/15/18
+        // films, so page 1 gave hasNext=false and the section
+        // stopped at 2 Arabic films): hasNext reads
+        // data.pager.hasMore AND the section stops only when a
+        // page brings zero NEW raw items (seen-set by detailPath,
+        // cleared on page 1) — a page with zero Arabic cards does
+        // NOT end the section, and a clamped past-the-end page
+        // (zero new items) ends it even if hasMore claims true.
         if (lane == "moviebox") {
             val url = if (page <= 1) base else "$base&page=$page"
             val text = runCatching {
@@ -312,21 +370,27 @@ class HorrorMoviesProvider : MainAPI() {
             if (text.isNullOrBlank()) {
                 return newHomePageResponse(emptyList(), false)
             }
-            val list = runCatching {
+            val dataObj = runCatching {
                 JSONObject(text).optJSONObject("data")
-                    ?.optJSONArray("subjectList")
             }.getOrNull()
+            val list = dataObj?.optJSONArray("subjectList")
             if (list == null) {
                 return newHomePageResponse(emptyList(), false)
             }
+            if (page <= 1) mbSeenDetailPaths.clear()
+            val pager = dataObj.optJSONObject("pager")
             val rawCount = list.length()
+            var rawNew = 0
             val cards = ArrayList<SearchResponse>()
             for (i in 0 until rawCount) {
                 val o = list.optJSONObject(i) ?: continue
+                val dp = o.optString("detailPath")
+                if (dp.isBlank()) continue
+                if (!mbSeenDetailPaths.add(dp)) continue
+                rawNew++
                 if (!hasArabicSub(o.optString("subtitles"))) continue
                 val title = o.optString("title")
-                val dp = o.optString("detailPath")
-                if (title.isBlank() || dp.isBlank()) continue
+                if (title.isBlank()) continue
                 val poster = o.optJSONObject("cover")
                     ?.optString("url")?.ifBlank { null }
                 movieCard(
@@ -335,11 +399,16 @@ class HorrorMoviesProvider : MainAPI() {
                     poster
                 )?.let { cards += it }
             }
+            val apiHasMore = if (pager != null && pager.has("hasMore")) {
+                pager.optBoolean("hasMore")
+            } else {
+                rawNew > 0
+            }
             return newHomePageResponse(
                 listOf(
                     HomePageList(request.name, cards, isHorizontalImages = true)
                 ),
-                rawCount >= 20
+                apiHasMore && rawNew > 0
             )
         }
         val url = when (lane) {
@@ -793,7 +862,7 @@ class HorrorMoviesProvider : MainAPI() {
                     this.trailers = trailers
                 }
             }
-            // v16: MovieBox — detail JSON; fields live under
+            // v17: MovieBox — detail JSON; fields live under
             // data.subject (NOT data itself). subjectId is packed
             // into the loadLinks data string (third "|||" part).
             url.contains("moviebox.sg") || url.contains("movie-box.co") -> {
@@ -824,7 +893,14 @@ class HorrorMoviesProvider : MainAPI() {
                     if (desc.isNotBlank()) append(desc)
                 }.ifBlank { null }
                 val subjectId = subj.optString("subjectId")
+                val releaseDate = subj.optString("releaseDate")
                 val trailers = trailerFor(title)
+                // v17: franchise parts — every part of the series,
+                // ordered, on the film's own page (fail-soft; no
+                // row at all when no other part is found).
+                val parts = mbFranchiseParts(
+                    title, dp, releaseDate, poster
+                )
                 newMovieLoadResponse(
                     title.ifBlank { "MovieBox" }, url, TvType.Movie,
                     movieBoxData(url, title, subjectId)
@@ -833,6 +909,7 @@ class HorrorMoviesProvider : MainAPI() {
                     this.backgroundPosterUrl = poster
                     this.plot = plot
                     this.trailers = trailers
+                    if (parts.size > 1) this.recommendations = parts
                 }
             }
             else -> movieFallback(url)
@@ -1176,7 +1253,7 @@ class HorrorMoviesProvider : MainAPI() {
             realData.contains("larozatv") -> loadLinksLaRos(realData, subtitleCallback, callback, ::elapsed)
             realData.contains("topcinema") -> loadLinksTop(realData, subtitleCallback, callback, ::elapsed)
             realData.contains("aflamstream") -> loadLinksAf(realData, subtitleCallback, callback, ::elapsed)
-            // v16: MovieBox — full data string (carries subjectId).
+            // v17: MovieBox — full data string (carries subjectId).
             isMovieBox(realData) -> loadLinksMovieBox(data, subtitleCallback, callback, ::elapsed)
             else -> {
                 emitDebug(listOf("Horror", "unknown-lane"), callback)
@@ -1332,7 +1409,7 @@ class HorrorMoviesProvider : MainAPI() {
         }
         if (emitted == 0 && allowDebug) {
             emitDebug(
-                listOf("Horror v16·$lane") + diagExtra +
+                listOf("Horror v17·$lane") + diagExtra +
                     listOf("srv=${embeds.size}", "ext=$extOk",
                         "dig=$digOk", "relay=$relayOk", "t=${elapsed() / 1000}s"),
                 callback
@@ -1403,7 +1480,7 @@ class HorrorMoviesProvider : MainAPI() {
     ): Boolean {
         val res = runCatching { app.get(data, headers = browserHeaders) }.getOrNull()
         if (res == null) {
-            emitDebug(listOf("Horror v16·EgyBest", "page-fail"), callback)
+            emitDebug(listOf("Horror v17·EgyBest", "page-fail"), callback)
             return true
         }
         val text = res.text
@@ -1842,7 +1919,7 @@ class HorrorMoviesProvider : MainAPI() {
     }
 
     // ---------------------------------------------------------------
-    // MovieBox (v16) — clean-room reimplementation of the
+    // MovieBox (v17) — clean-room reimplementation of the
     // MovieBoxProvider v54 (CNC) flow, recovered from its dex
     // (see ~/workspace/moviebox-study/NOTES.md). NO code copied,
     // no .cs3 redistributed. Catalog = web ranking-list (works
@@ -1879,7 +1956,7 @@ class HorrorMoviesProvider : MainAPI() {
             h == "movie-box.co" || h.endsWith(".movie-box.co")
     }
 
-    /** v16 Arabic-only filter: normalize each subtitle language
+    /** v17 Arabic-only filter: normalize each subtitle language
      * name (strip diacritics/tatweel, أ/إ/آ→ا, ة→ه, ى→ي) and
      * accept the film if ANY name contains "عرب". Arabic shows
      * as "اَلْعَرَبِيَّةُ" (fully vocalized) in the subtitles
@@ -1895,6 +1972,173 @@ class HorrorMoviesProvider : MainAPI() {
         if (subtitles.isNullOrBlank()) return false
         return subtitles.split(",")
             .any { normalizeArabic(it.trim()).contains("عرب") }
+    }
+
+    /** v17: seen detailPaths for the MovieBox section (dedup
+     * across sideways-scroll pages; cleared on page 1). */
+    private val mbSeenDetailPaths = HashSet<String>()
+
+    private val mbRoman = mapOf(
+        "I" to 1, "II" to 2, "III" to 3, "IV" to 4, "V" to 5,
+        "VI" to 6, "VII" to 7, "VIII" to 8, "IX" to 9, "X" to 10,
+        "XI" to 11, "XII" to 12, "XIII" to 13
+    )
+
+    /** v17: franchise base name — strip a trailing "(YYYY)",
+     * drop any ": subtitle", drop a trailing "Part/Chapter N",
+     * then drop a trailing part number (digits, roman numeral,
+     * "3D") — only when something remains. "The Conjuring:
+     * Last Rites" -> "The Conjuring"; "Saw X" -> "Saw". */
+    private fun mbFranchiseBase(title: String): String {
+        var t = title.trim()
+        t = Regex("""\(\d{4}\)\s*$""").replace(t, "").trim()
+        t = t.substringBefore(":").trim()
+        t = Regex(
+            """\s+(?:Part|Chapter)\s+([IVXLCDM]+|\d+)\s*$""",
+            RegexOption.IGNORE_CASE
+        ).replace(t, "").trim()
+        val m = Regex("""\s+([IVXLCDM]+|\d+|3D)\s*$""").find(t)
+        if (m != null && t.substring(0, m.range.first).trim().length >= 2) {
+            t = t.substring(0, m.range.first).trim()
+        }
+        return Regex("""\s+""").replace(t, " ").trim()
+    }
+
+    /** v17: part number from the title tail — "Saw X" -> 10,
+     * "Saw II" -> 2, "Final Destination 5" -> 5; 0 when no
+     * number is present ("Saw 3D", "The Conjuring: Last
+     * Rites" — the year still orders those). */
+    private fun mbFranchisePart(title: String): Int {
+        var t = title.trim()
+        t = Regex("""\(\d{4}\)\s*$""").replace(t, "").trim()
+        val m1 = Regex(
+            """(?:Part|Chapter)\s+([IVXLCDM]+|\d+)\s*$""",
+            RegexOption.IGNORE_CASE
+        ).find(t)
+        if (m1 != null) {
+            val g = m1.groupValues[1].uppercase()
+            return mbRoman[g] ?: g.toIntOrNull() ?: 0
+        }
+        val m2 = Regex("""\s+([IVXLCDM]+|\d+)\s*$""")
+            .find(t.substringBefore(":").trim())
+        if (m2 != null) {
+            val g = m2.groupValues[1].uppercase()
+            return mbRoman[g] ?: g.toIntOrNull() ?: 0
+        }
+        return 0
+    }
+
+    private fun mbFranchiseYear(releaseDate: String?): Int =
+        releaseDate?.take(4)?.toIntOrNull() ?: 0
+
+    /** v17: franchise parts for a MovieBox film page (his order
+     * 2026-11-15 22:18 — a film with more than one part shows ALL
+     * its parts, ordered). Searches MovieBox for the film's base
+     * name, keeps only results whose base name matches exactly
+     * (no look-alikes: "Conjuring: The Beyond" and "The Nun II"
+     * do NOT match "The Conjuring"), Arabic-subtitled only,
+     * deduped by (title, year) and by (base, year, part) — the
+     * second catches duplicate listings of one part ("Saw 11"
+     * vs "Saw XI") — sorted by year then part number. The
+     * current film is included in its sorted position. Fully
+     * fail-soft: any failure returns the current film alone
+     * (the caller then shows no recommendations row). */
+    private suspend fun mbFranchiseParts(
+        title: String,
+        detailPath: String,
+        releaseDate: String?,
+        poster: String?
+    ): List<SearchResponse> {
+        val displayTitle = title.ifBlank { "MovieBox" }
+        val current = movieCard(
+            displayTitle,
+            "$mbWebBase/ar/moviedetail/$detailPath",
+            poster
+        )
+        val base = mbFranchiseBase(displayTitle)
+        if (base.length < 2) return listOfNotNull(current)
+        val token = runCatching { mbGuestToken().first }.getOrNull()
+            ?: return listOfNotNull(current)
+        val found = ArrayList<Triple<Int, Int, SearchResponse>>()
+        val seenTitleYear = HashSet<String>()
+        val seenBaseYearPart = HashSet<String>()
+        fun consider(o: JSONObject) {
+            val t = o.optString("title")
+            if (t.isBlank()) return
+            if (!mbFranchiseBase(t).equals(base, ignoreCase = true)) return
+            if (!hasArabicSub(o.optString("subtitles"))) return
+            val dp = o.optString("detailPath")
+            if (dp.isBlank()) return
+            val y = mbFranchiseYear(o.optString("releaseDate"))
+            val p = mbFranchisePart(t)
+            if (!seenTitleYear.add(t.trim().lowercase() + "|" + y)) return
+            if (!seenBaseYearPart.add(base.lowercase() + "|" + y + "|" + p)) return
+            val card = movieCard(
+                t,
+                "$mbWebBase/ar/moviedetail/$dp",
+                o.optJSONObject("cover")?.optString("url")?.ifBlank { null }
+            ) ?: return
+            found += Triple(if (y > 0) y else 9999, p, card)
+        }
+        // The search walk mirrors the verified live behaviour:
+        // pages return 6-16 items each and hasMore turns false
+        // around page 6 even while totalCount reads higher — the
+        // API's reachable window, not our cap, ends the walk.
+        var page = 1
+        while (page <= 6) {
+            val body = JSONObject().apply {
+                put("keyword", base)
+                put("page", page)
+                put("perPage", 20)
+                put("subjectType", 1)
+            }.toString()
+            val res = runCatching {
+                app.post(
+                    "$mbWebBase/wefeed-h5api-bff/subject/search",
+                    headers = mapOf(
+                        "User-Agent" to browserUA,
+                        "Accept" to "application/json",
+                        "Content-Type" to "application/json",
+                        "Authorization" to "Bearer $token",
+                        "X-MB-Token" to token
+                    ),
+                    requestBody = body.toRequestBody(
+                        "application/json".toMediaType()
+                    )
+                )
+            }.getOrNull() ?: break
+            if (res.code !in 200..299) break
+            val data = runCatching {
+                JSONObject(res.text).optJSONObject("data")
+            }.getOrNull() ?: break
+            val items = data.optJSONArray("items") ?: break
+            if (items.length() == 0) break
+            for (i in 0 until items.length()) {
+                items.optJSONObject(i)?.let { consider(it) }
+            }
+            val pager = data.optJSONObject("pager")
+            if (pager != null && pager.has("hasMore") &&
+                !pager.optBoolean("hasMore")
+            ) break
+            page++
+        }
+        if (current != null) {
+            val curYear = mbFranchiseYear(releaseDate)
+            val curPart = mbFranchisePart(displayTitle)
+            val k1 = displayTitle.trim().lowercase() + "|" + curYear
+            val k2 = base.lowercase() + "|" + curYear + "|" + curPart
+            if (seenTitleYear.add(k1) && seenBaseYearPart.add(k2)) {
+                found += Triple(
+                    if (curYear > 0) curYear else 9999, curPart, current
+                )
+            }
+        }
+        found.sortWith(
+            compareBy<Triple<Int, Int, SearchResponse>> { it.first }
+                .thenBy { it.second }
+                .thenBy { it.third.name }
+        )
+        return found.map { it.third }.take(20)
     }
 
     /** loadLinks data for MovieBox: url ||| title ||| subjectId. */
@@ -2098,17 +2342,50 @@ class HorrorMoviesProvider : MainAPI() {
         return null
     }
 
+    /** v17: CNC-faithful emit (MovieBoxProviderIN loadLinks$
+     * emitStream$2, lines 780-794 — byte-identical logic in v54's
+     * emitNetStream$2). VIDEO links get Origin + the full
+     * player-page Referer + the mobile Chrome UA + the signed
+     * cookie under the stream's own signHeaderKey (default
+     * "X-MB-Token"); every other type gets {Referer:
+     * "https://movie-box.co/", desktop Chrome 154 UA}.
+     * subDomain = the play base that returned the streams,
+     * subPath = detailPath, so the emitted Referer is exactly the
+     * player-page URL the backend validated for the play call. */
     private suspend fun emitMovieBoxLink(
         url: String,
         label: String,
         signCookie: String?,
-        referer: String,
+        signHeaderKey: String?,
+        playBase: String,
+        detailPath: String,
+        subjectId: String,
         callback: (ExtractorLink) -> Unit
     ) {
-        val headers = LinkedHashMap<String, String>()
-        headers["Referer"] = referer
-        headers["User-Agent"] = mbUaPlayChrome
-        if (!signCookie.isNullOrBlank()) headers["Cookie"] = signCookie
+        val type = when {
+            url.contains(".m3u8") -> ExtractorLinkType.M3U8
+            url.contains(".mpd") -> ExtractorLinkType.DASH
+            else -> ExtractorLinkType.VIDEO
+        }
+        val playerReferer = "$playBase/movies/$detailPath?id=$subjectId" +
+            "&type=/movie/detail&detailSe=&detailEp=&lang=en"
+        val headers: Map<String, String> =
+            if (type != ExtractorLinkType.VIDEO) {
+                mapOf(
+                    "Referer" to "https://movie-box.co/",
+                    "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36"
+                )
+            } else {
+                val m = LinkedHashMap<String, String>()
+                m["Origin"] = playBase
+                m["Referer"] = playerReferer
+                m["User-Agent"] = mbUaPlayChrome
+                if (!signCookie.isNullOrBlank()) {
+                    val key = signHeaderKey?.ifBlank { null } ?: "X-MB-Token"
+                    m[key] = signCookie
+                }
+                m
+            }
         val quality = when {
             label.contains("1080") -> Qualities.P1080.value
             label.contains("720") -> Qualities.P720.value
@@ -2119,14 +2396,13 @@ class HorrorMoviesProvider : MainAPI() {
         runCatching {
             callback(
                 newExtractorLink(
-                    name, label, url,
-                    when {
-                        url.contains(".m3u8") -> ExtractorLinkType.M3U8
-                        url.contains(".mpd") -> ExtractorLinkType.DASH
-                        else -> ExtractorLinkType.VIDEO
-                    }
+                    name, label, url, type
                 ) {
-                    this.referer = referer
+                    this.referer = if (type != ExtractorLinkType.VIDEO) {
+                        "https://movie-box.co/"
+                    } else {
+                        playerReferer
+                    }
                     this.quality = quality
                     this.headers = headers
                 }
@@ -2231,7 +2507,7 @@ class HorrorMoviesProvider : MainAPI() {
         if (subjectId.isBlank() || detailPath.isBlank()) {
             emitDebug(
                 listOf(
-                    "Horror v16·MovieBox", "srv=0", "ext=0", "dig=0",
+                    "Horror v17·MovieBox", "srv=0", "ext=0", "dig=0",
                     "relay=0", "t=${elapsed() / 1000}s", "tok=$tokVia",
                     "play=$playCode", "id-missing"
                 ),
@@ -2242,15 +2518,20 @@ class HorrorMoviesProvider : MainAPI() {
         val (token, via) = mbGuestToken()
         tokVia = via
         if (token != null) {
-            val referer = "/movies/?id=$subjectId&type=/movie/detail" +
-                "&detailSe=&detailEp=&lang=en"
             val bases = listOf("https://movie-box.co", "https://moviebox.sg")
             for (base in bases) {
                 if (emitted > 0 || elapsed() > 20000) break
+                // v17 (IN dex, loadLinks$1 ~110f-1133; v54
+                // identical): the play Referer is the FULL
+                // player-page URL on the SAME base, with the
+                // detailPath in the path — NOT the relative
+                // "/movies/?id=..." v16 sent. detailPath goes
+                // into the play URL RAW (no URL-encoding).
+                val referer = "$base/movies/$detailPath?id=$subjectId" +
+                    "&type=/movie/detail&detailSe=&detailEp=&lang=en"
                 val playUrl = "$base/wefeed-h5api-bff/subject/play" +
                     "?subjectId=$subjectId&se=0&ep=0" +
-                    "&detailPath=" +
-                    java.net.URLEncoder.encode(detailPath, "UTF-8") +
+                    "&detailPath=$detailPath" +
                     "&streamSignType=1" +
                     "&supportCodecs%5Bhevc%5D=1&supportCodecs%5Bh264%5D=1"
                 val headers = mbSignedHeaders(
@@ -2297,6 +2578,8 @@ class HorrorMoviesProvider : MainAPI() {
                     val linkUrl = mbStreamUrl(s) ?: continue
                     val signCookie = s.optString("signCookie")
                         .ifBlank { null }
+                    val signHeaderKey = s.optString("signHeaderKey")
+                        .ifBlank { null }
                     val resLabel = s.optString("resolution").ifBlank {
                         s.optJSONArray("resolutions")
                             ?.optJSONObject(0)?.optString("resolution")
@@ -2306,7 +2589,8 @@ class HorrorMoviesProvider : MainAPI() {
                         .find(resLabel)?.groupValues?.get(1)
                     val label = "MovieBox" + if (q != null) " ${q}p" else ""
                     emitMovieBoxLink(
-                        linkUrl, label, signCookie, referer, counting
+                        linkUrl, label, signCookie, signHeaderKey,
+                        base, detailPath, subjectId, counting
                     )
                 }
                 if (emitted > 0) {
@@ -2321,7 +2605,7 @@ class HorrorMoviesProvider : MainAPI() {
         if (emitted == 0) {
             emitDebug(
                 listOf(
-                    "Horror v16·MovieBox", "srv=$streamsFound",
+                    "Horror v17·MovieBox", "srv=$streamsFound",
                     "ext=$emitted", "dig=0", "relay=0",
                     "t=${elapsed() / 1000}s", "tok=$tokVia",
                     "play=$playCode"

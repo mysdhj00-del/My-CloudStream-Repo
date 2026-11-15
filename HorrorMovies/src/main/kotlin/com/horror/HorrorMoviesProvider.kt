@@ -279,6 +279,43 @@ import okhttp3.RequestBody.Companion.toRequestBody
  * MovieBox search index at all); 28 Years Later -> 2 parts.
  * DEBUG marker is now "Horror v17·MovieBox".
  *
+ * v18 (2026-11-15, MovieBox Arabic captions): the user's
+ * on-device verdict on v17 was "جيد يشتغل moivebox لكن
+ * الترجمة غير موجودة" — playback works, subtitles missing.
+ * TWO defects, both proven live from the sandbox before any
+ * code changed:
+ * (1) ROUTE: v17 fetched captions ONLY from the mobile
+ * gateway (apig.inmoviebox.com get-ext-captions /
+ * get-stream-captions) — 403 "Service not available in
+ * current region" from every US IP tested, and the web BFF
+ * caption endpoint 403s "invalid region" the same way, while
+ * playback (H5 bases) works — so on the user's US network
+ * the caption call died silently (fail-soft, no diagnostic).
+ * The H5-api-bff caption endpoint
+ * (moviebox.sg/wefeed-h5api-bff/subject/caption) answers
+ * HTTP 200 from a US IP — NOT region-gated — so it goes
+ * FIRST in v18, with the REAL stream id + format from the
+ * play response (id=subjectId alone returns an empty
+ * captions array; a missing id is a 400 "empty id"). The
+ * mobile routes stay as fallback. Detail/play responses
+ * carry NO captions (only the subtitles language-name list
+ * and an empty resource object).
+ * (2) FIELDS: v17's pick checked `language` == "ar"/"ara"
+ * and lanName for "عرب" — but the caption object fields
+ * (proven from the CNC IN dex + the CloudX model) are lan
+ * (code, e.g. "ar"), lanName (display name, e.g. "Arabic"),
+ * url — there is NO "language" field, and lanName is Latin,
+ * so neither check could ever match. v18 accepts lan /
+ * language == ar|ara, lanName containing "عرب" (normalised)
+ * or Latin "arab". The CNC dex emits SubtitleFile with
+ * (lang, url) and NO headers, so no headers are passed.
+ * NEW: the DEBUG line now carries "sub=ar" or
+ * "sub=none:<route>=<code>/..." (e.g. "none:h5=200-empty/
+ * mob=403") and is emitted even when playback links exist —
+ * a missing subtitle is never silent again. Live caption
+ * tests on the 4 films: see v18/NOTES.md.
+ * DEBUG marker is now "Horror v18·MovieBox".
+ *
  * RATING: CloudStream's card type has no rating slot in this app
  * version, so ratings ride the detail page: the plot line opens
  * with «★ التقييم: X/10» wherever the source page provides one
@@ -1409,7 +1446,7 @@ class HorrorMoviesProvider : MainAPI() {
         }
         if (emitted == 0 && allowDebug) {
             emitDebug(
-                listOf("Horror v17·$lane") + diagExtra +
+                listOf("Horror v18·$lane") + diagExtra +
                     listOf("srv=${embeds.size}", "ext=$extOk",
                         "dig=$digOk", "relay=$relayOk", "t=${elapsed() / 1000}s"),
                 callback
@@ -1480,7 +1517,7 @@ class HorrorMoviesProvider : MainAPI() {
     ): Boolean {
         val res = runCatching { app.get(data, headers = browserHeaders) }.getOrNull()
         if (res == null) {
-            emitDebug(listOf("Horror v17·EgyBest", "page-fail"), callback)
+            emitDebug(listOf("Horror v18·EgyBest", "page-fail"), callback)
             return true
         }
         val text = res.text
@@ -2410,6 +2447,23 @@ class HorrorMoviesProvider : MainAPI() {
         }
     }
 
+    /** v18: is this caption object an Arabic track? The caption
+     * object fields (proven from the CNC dex + the CloudX model)
+     * are lan (code, e.g. "ar"), lanName (display name, e.g.
+     * "Arabic"), url — there is NO "language" field, which v17
+     * checked (so v17's `language == "ar"` never matched), and
+     * lanName is Latin ("Arabic"), so the "عرب" check on it
+     * never matched either. Accept every plausible form. */
+    private fun mbIsArabicCaption(o: JSONObject): Boolean {
+        val lan = o.optString("lan").lowercase()
+        val lang = o.optString("language").lowercase()
+        if (lan == "ar" || lan == "ara" || lang == "ar" || lang == "ara") return true
+        val lanName = o.optString("lanName")
+        if (normalizeArabic(lanName).contains("عرب")) return true
+        if (lanName.lowercase().contains("arab")) return true
+        return false
+    }
+
     /** Scan one captions array for an Arabic track and attach it.
      * Returns true when an Arabic track was emitted. */
     private fun mbPickArabicCaption(
@@ -2419,13 +2473,9 @@ class HorrorMoviesProvider : MainAPI() {
         if (arr == null) return false
         for (i in 0 until arr.length()) {
             val o = arr.optJSONObject(i) ?: continue
-            val lan = o.optString("lanName")
-            val lang = o.optString("language")
             val capUrl = o.optString("url")
             if (capUrl.isBlank()) continue
-            if (normalizeArabic(lan).contains("عرب") ||
-                lang == "ar" || lang == "ara"
-            ) {
+            if (mbIsArabicCaption(o)) {
                 subtitleCallback(SubtitleFile("العربية", capUrl))
                 return true
             }
@@ -2433,17 +2483,78 @@ class HorrorMoviesProvider : MainAPI() {
         return false
     }
 
-    /** Arabic captions for a film: get-ext-captions (subjectId
-     * only) first, then get-stream-captions when the play response
-     * yielded stream/resource ids. Both fail-soft — a missing
-     * caption must never block playback. */
+    /** Captions array from a caption-endpoint body: the mobile
+     * shape (data.extCaptions) or the H5 shape (data.captions),
+     * plus top-level fallbacks. */
+    private fun mbCaptionsArray(
+        json: JSONObject?,
+        vararg keys: String
+    ): org.json.JSONArray? {
+        if (json == null) return null
+        val data = json.optJSONObject("data")
+        for (k in keys) {
+            data?.optJSONArray(k)?.let { return it }
+            json.optJSONArray(k)?.let { return it }
+        }
+        return null
+    }
+
+    /** Arabic captions for a film. Returns a diagnostic: "ar"
+     * when an Arabic track was emitted, else a compact
+     * "none:<route>=<code>/..." trail (e.g.
+     * "none:h5=200-empty/mob=403").
+     * v18: the v17 routes called ONLY the mobile gateway
+     * (apig.inmoviebox.com) — 403 "Service not available in
+     * current region" from every US IP tested (and the web BFF
+     * caption endpoint 403s "invalid region" the same way), so
+     * on the user's US network the caption call died silently
+     * while playback (H5 bases) worked. The H5-api-bff caption
+     * endpoint (moviebox.sg/wefeed-h5api-bff/subject/caption)
+     * answers HTTP 200 from a US IP — it is NOT region-gated —
+     * so it goes FIRST here, with the REAL stream id + format
+     * from the play response (id=subjectId alone returns an
+     * empty captions array; a missing id is a 400 "empty id").
+     * The mobile routes stay as fallback. The CNC dex emits
+     * SubtitleFile with (lang, url) and NO headers, so no
+     * headers are passed with the caption URL. */
     private suspend fun mbEmitArabicCaption(
         subjectId: String,
+        detailPath: String,
+        playBase: String,
         token: String,
+        h5Caps: List<Pair<String, String>>,
         streamId: String?,
         resourceId: String?,
         subtitleCallback: (SubtitleFile) -> Unit
-    ) {
+    ): String {
+        val trail = ArrayList<String>()
+        // Route H5 first: NOT region-gated (200 from a US IP).
+        for ((sid, fmt) in h5Caps) {
+            val capUrl = "$playBase/wefeed-h5api-bff/subject/caption" +
+                "?format=$fmt&id=$sid&subjectId=$subjectId" +
+                "&detailPath=$detailPath"
+            val headers = mbSignedHeaders(
+                "GET", capUrl, mbUaToken, mbClientInfoToken()
+            ) + mapOf(
+                "Authorization" to "Bearer $token",
+                "X-MB-Token" to token
+            )
+            val res = runCatching { app.get(capUrl, headers = headers) }.getOrNull()
+            val code = res?.code ?: 0
+            if (res == null || code !in 200..299) {
+                trail += "h5=$code"
+                continue
+            }
+            val json = runCatching { JSONObject(res.text) }.getOrNull()
+            val arr = mbCaptionsArray(json, "captions", "extCaptions")
+            if (arr == null || arr.length() == 0) {
+                trail += "h5=$code-empty"
+                continue
+            }
+            if (mbPickArabicCaption(arr, subtitleCallback)) return "ar"
+            trail += "h5=$code-noar"
+        }
+        // Route mobile ext-captions (subjectId only).
         runCatching {
             val extUrl = "$mbMobileBase/wefeed-mobile-bff/subject-api/" +
                 "get-ext-captions?subjectId=$subjectId"
@@ -2454,33 +2565,35 @@ class HorrorMoviesProvider : MainAPI() {
                 "X-MB-Token" to token
             )
             val extRes = app.get(extUrl, headers = extHeaders)
+            trail += "mob=${extRes.code}"
             if (extRes.code in 200..299) {
-                val extJson = runCatching { JSONObject(extRes.text) }
-                    .getOrNull()
-                val arr = extJson?.optJSONObject("data")
-                    ?.optJSONArray("extCaptions")
-                    ?: extJson?.optJSONArray("extCaptions")
-                if (mbPickArabicCaption(arr, subtitleCallback)) return
+                val extJson = runCatching { JSONObject(extRes.text) }.getOrNull()
+                val arr = mbCaptionsArray(extJson, "extCaptions", "captions")
+                if (mbPickArabicCaption(arr, subtitleCallback)) return "ar"
             }
-            if (streamId.isNullOrBlank() || resourceId.isNullOrBlank()) return
-            val streamUrl = "$mbMobileBase/wefeed-mobile-bff/subject-api/" +
-                "get-stream-captions?subjectId=$subjectId" +
-                "&streamId=$streamId&episode=0&resourceId=$resourceId"
-            val streamHeaders = mbSignedHeaders(
-                "GET", streamUrl, mbUaToken, mbClientInfoToken()
-            ) + mapOf(
-                "Authorization" to "Bearer $token",
-                "X-MB-Token" to token
-            )
-            val streamRes = app.get(streamUrl, headers = streamHeaders)
-            if (streamRes.code !in 200..299) return
-            val streamJson = runCatching { JSONObject(streamRes.text) }
-                .getOrNull() ?: return
-            val arr = streamJson.optJSONObject("data")
-                ?.optJSONArray("captions")
-                ?: streamJson.optJSONArray("captions")
-            mbPickArabicCaption(arr, subtitleCallback)
         }
+        // Route mobile stream-captions (needs stream + resource ids).
+        if (!streamId.isNullOrBlank() && !resourceId.isNullOrBlank()) {
+            runCatching {
+                val streamUrl = "$mbMobileBase/wefeed-mobile-bff/subject-api/" +
+                    "get-stream-captions?subjectId=$subjectId" +
+                    "&streamId=$streamId&episode=0&resourceId=$resourceId"
+                val streamHeaders = mbSignedHeaders(
+                    "GET", streamUrl, mbUaToken, mbClientInfoToken()
+                ) + mapOf(
+                    "Authorization" to "Bearer $token",
+                    "X-MB-Token" to token
+                )
+                val streamRes = app.get(streamUrl, headers = streamHeaders)
+                trail += "mobstr=${streamRes.code}"
+                if (streamRes.code in 200..299) {
+                    val streamJson = runCatching { JSONObject(streamRes.text) }.getOrNull()
+                    val arr = mbCaptionsArray(streamJson, "captions", "extCaptions")
+                    if (mbPickArabicCaption(arr, subtitleCallback)) return "ar"
+                }
+            }
+        }
+        return "none:" + trail.joinToString("/")
     }
 
     private suspend fun loadLinksMovieBox(
@@ -2500,6 +2613,7 @@ class HorrorMoviesProvider : MainAPI() {
         var tokVia = "none"
         var streamId: String? = null
         var resourceId: String? = null
+        var subDiag = "?"
         val counting: (ExtractorLink) -> Unit = { link ->
             emitted++
             callback(link)
@@ -2507,7 +2621,7 @@ class HorrorMoviesProvider : MainAPI() {
         if (subjectId.isBlank() || detailPath.isBlank()) {
             emitDebug(
                 listOf(
-                    "Horror v17·MovieBox", "srv=0", "ext=0", "dig=0",
+                    "Horror v18·MovieBox", "srv=0", "ext=0", "dig=0",
                     "relay=0", "t=${elapsed() / 1000}s", "tok=$tokVia",
                     "play=$playCode", "id-missing"
                 ),
@@ -2573,6 +2687,21 @@ class HorrorMoviesProvider : MainAPI() {
                             .ifBlank { null }
                     }
                 }
+                // v18: H5 caption candidates — (stream id, format)
+                // from the play response, first id per format.
+                val h5Caps = ArrayList<Pair<String, String>>()
+                for (s in streamObjs) {
+                    val sid = s.optString("id")
+                    if (sid.isBlank()) continue
+                    val surl = mbStreamUrl(s) ?: continue
+                    val fmt = when {
+                        surl.contains(".mpd") -> "DASH"
+                        surl.contains(".m3u8") -> "HLS"
+                        else -> "MP4"
+                    }
+                    if (h5Caps.none { it.first == sid }) h5Caps += sid to fmt
+                    if (h5Caps.size >= 3) break
+                }
                 for (s in streamObjs) {
                     if (emitted >= 6 || elapsed() > 25000) break
                     val linkUrl = mbStreamUrl(s) ?: continue
@@ -2594,21 +2723,23 @@ class HorrorMoviesProvider : MainAPI() {
                     )
                 }
                 if (emitted > 0) {
-                    mbEmitArabicCaption(
-                        subjectId, token, streamId, resourceId,
-                        subtitleCallback
+                    subDiag = mbEmitArabicCaption(
+                        subjectId, detailPath, base, token, h5Caps,
+                        streamId, resourceId, subtitleCallback
                     )
                     break
                 }
             }
         }
-        if (emitted == 0) {
+        if (emitted == 0 || subDiag != "ar") {
+            // v18: a missing subtitle must never be silent again —
+            // emit the DEBUG line even when playback links exist.
             emitDebug(
                 listOf(
-                    "Horror v17·MovieBox", "srv=$streamsFound",
+                    "Horror v18·MovieBox", "srv=$streamsFound",
                     "ext=$emitted", "dig=0", "relay=0",
                     "t=${elapsed() / 1000}s", "tok=$tokVia",
-                    "play=$playCode"
+                    "play=$playCode", "sub=$subDiag"
                 ),
                 callback
             )

@@ -4,7 +4,7 @@
 // plus the subtitle gear (OpenSubtitles + phone-side free AI
 // translation BOTH directions EN->AR and AR->EN, dual-always
 // "العربية + الإنجليزية") and trailer v3.
-version = 3
+version = 4
 
 android {
     namespace = "com.animegg"

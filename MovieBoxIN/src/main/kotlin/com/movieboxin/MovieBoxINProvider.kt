@@ -277,7 +277,7 @@ import okhttp3.RequestBody.Companion.toRequestBody
  * fallbacks; the mobile routes are the ones that work on his
  * phone (the original v56 WORKS there, his word). Nothing here
  * is "working" until he confirms on his phone after a full close
- * and reopen. DEBUG ("MovieBoxIN v8 | ... | sub=...") is emitted
+ * and reopen. DEBUG ("MovieBoxIN v9 | ... | sub=...") is emitted
  * whenever links are zero OR the dual is missing, so a failure
  * is never silent.
  *
@@ -583,7 +583,10 @@ class MovieBoxINProvider : MainAPI() {
     private fun parseSubject(o: JSONObject): SearchResponse? {
         val dp = o.optString("detailPath")
         if (dp.isBlank()) return null
-        val title = o.optString("title")
+        // v9 — title fallback to "name" (Rennvol's mobile
+        // items use "name" when "title" is absent; without
+        // this the card is dropped as unparseable).
+        val title = o.optString("title").ifBlank { o.optString("name") }
         if (title.isBlank()) return null
         val poster = o.optJSONObject("cover")
             ?.optString("url")?.ifBlank { null }
@@ -1397,13 +1400,16 @@ class MovieBoxINProvider : MainAPI() {
 
     /** Does this array hold at least one entry that parses as
      * a subject (non-blank detailPath + title, unwrapping a
-     * "subject" wrapper when present)? */
+     * "subject" wrapper when present)? v9 — title may also
+     * come from "name" (Rennvol's mobile items), matching
+     * the parseSubject fallback below. */
     private fun mbParsesAsSubjects(arr: JSONArray): Boolean {
         for (i in 0 until arr.length()) {
             val o = arr.optJSONObject(i) ?: continue
             val subj = o.optJSONObject("subject") ?: o
             if (subj.optString("detailPath").isNotBlank() &&
-                subj.optString("title").isNotBlank()) return true
+                (subj.optString("title").isNotBlank() ||
+                    subj.optString("name").isNotBlank())) return true
         }
         return false
     }
@@ -1432,6 +1438,51 @@ class MovieBoxINProvider : MainAPI() {
         }
         return if (mbParsesAsSubjects(merged)) {
             merged to "results[].subjects"
+        } else null
+    }
+
+    /** Concatenated subject arrays (v9 — Rennvol's subjectsOf):
+     * EVERY array that parses as subjects, in order
+     * subjectList, subjects, items, list, then
+     * results[].subjects last. MOBILE branch ONLY: the
+     * mobile search/v2 shape was never observed live, so a
+     * hit living in a second array must not be dropped by
+     * first-wins (the Naruto series may sit in an array
+     * other than the movies' one). H5 keeps mbSubjectsArray
+     * (strict first-wins — proven there: items is the hits
+     * array). Each array is gated by mbParsesAsSubjects, so
+     * an empty/wrong array still contributes nothing; dedup
+     * by subjectId happens at the merge in search(). */
+    private fun mbSubjectsAll(data: JSONObject): Pair<JSONArray, String>? {
+        val merged = JSONArray()
+        val won = ArrayList<String>()
+        for (key in listOf("subjectList", "subjects", "items", "list")) {
+            val arr = data.optJSONArray(key) ?: continue
+            if (!mbParsesAsSubjects(arr)) continue
+            won += key
+            for (i in 0 until arr.length()) {
+                arr.optJSONObject(i)?.let { merged.put(it) }
+            }
+        }
+        val results = data.optJSONArray("results")
+        if (results != null) {
+            val subs = JSONArray()
+            for (i in 0 until results.length()) {
+                val s = results.optJSONObject(i)
+                    ?.optJSONArray("subjects") ?: continue
+                for (j in 0 until s.length()) {
+                    s.optJSONObject(j)?.let { subs.put(it) }
+                }
+            }
+            if (mbParsesAsSubjects(subs)) {
+                won += "results[].subjects"
+                for (i in 0 until subs.length()) {
+                    subs.optJSONObject(i)?.let { merged.put(it) }
+                }
+            }
+        }
+        return if (merged.length() > 0) {
+            merged to ("all:" + won.joinToString("+"))
         } else null
     }
 
@@ -1477,7 +1528,11 @@ class MovieBoxINProvider : MainAPI() {
         val key: String,
         val code: String,
         val host: String = "-",
-        val tok: String = "-"
+        val tok: String = "-",
+        // v9 — cards skipped on this page (null parse or a
+        // throw inside one card's parse); surfaced as bad=
+        // in the DEBUG line so a dropping card is visible.
+        val bad: Int = 0
     )
 
     /** One page of one search route (v6): mobile search/v2
@@ -1571,18 +1626,38 @@ class MovieBoxINProvider : MainAPI() {
             val json = runCatching { JSONObject(text) }.getOrNull()
                 ?: return empty.copy(code = "parse", tok = tokVia)
             val data = json.optJSONObject("data") ?: json
-            val picked = mbSubjectsArray(data)
+            // v9 — the mobile branch concatenates EVERY
+            // parseable subject array (mbSubjectsAll, Rennvol's
+            // subjectsOf); the mobile search/v2 shape was never
+            // observed live, and a series living in a second
+            // array must not be dropped by first-wins. H5
+            // keeps strict first-wins (proven: items is the
+            // hits array there).
+            val picked = if (mobile) mbSubjectsAll(data)
+            else mbSubjectsArray(data)
             val pager = mbPager(data)
             val hits = ArrayList<MbSubjectHit>()
+            var bad = 0
             val arr = picked?.first
             if (arr != null) {
                 for (i in 0 until arr.length()) {
-                    mbParseHit(arr.optJSONObject(i))?.let { hits += it }
+                    // v9 — per-card isolation: one card that
+                    // fails to parse (null or a throw) is
+                    // skipped and counted (bad=), and NEVER
+                    // kills the whole page/branch the way an
+                    // unguarded throw in this loop used to.
+                    try {
+                        val hit = mbParseHit(arr.optJSONObject(i))
+                        if (hit != null) hits += hit else bad++
+                    } catch (e: Throwable) {
+                        if (mbIsCancellation(e)) throw e
+                        bad++
+                    }
                 }
             }
             return MbSearchPage(
                 hits, pager, picked?.second ?: "none",
-                code, host, tokVia
+                code, host, tokVia, bad
             )
         } catch (e: Throwable) {
             if (mbIsCancellation(e)) throw e
@@ -1731,7 +1806,9 @@ class MovieBoxINProvider : MainAPI() {
                     p.code == "200" -> "empty"
                     else -> "err:${p.code}"
                 }
-                return "$st:${p.hits.size}/${p.key}"
+                // v9 — middle number is the skipped-card count
+                // (bad=): ok:<hits>/<bad>/<key>.
+                return "$st:${p.hits.size}/${p.bad}/${p.key}"
             }
             mbLastSearchDebug = "src=$src key=${h5.key}/${mob.key} " +
                 "ms=${mob.hits.size} ms_key=${mob.key} hs=${h5.hits.size} " +
@@ -1740,7 +1817,7 @@ class MovieBoxINProvider : MainAPI() {
                 "tot=${h5Tot ?: mob.pager.totalCount ?: "-"} pages=$page " +
                 "shown=${out.size} " +
                 "h5=${branchStatus(h5)} mob=${branchStatus(mob)} " +
-                "tok=${h5.tok}/${mob.tok} filt=$filteredCount " +
+                "tok=${h5.tok}/${mob.tok} bad=${h5.bad + mob.bad} filt=$filteredCount " +
                 excMark.trim()
             return out.toNewSearchResponseList(hasMore)
         } catch (e: Throwable) {
@@ -1750,6 +1827,7 @@ class MovieBoxINProvider : MainAPI() {
             // on the DEBUG line.
             mbLastSearchDebug = "src=fallback " +
                 "h5=${h5.hits.size} mob=${mob.hits.size} " +
+                "bad=${h5.bad + mob.bad} " +
                 "exc=merge pages=$page shown=${h5.hits.size}"
             return h5.hits.map { it.item }.toNewSearchResponseList(false)
         }
@@ -2985,7 +3063,7 @@ class MovieBoxINProvider : MainAPI() {
         if (subjectId.isBlank() || detailPath.isBlank()) {
             emitDebug(
                 listOf(
-                    "MovieBoxIN v8", "srv=0", "ext=0",
+                    "MovieBoxIN v9", "srv=0", "ext=0",
                     "t=${elapsed() / 1000}s", "tok=$tokVia",
                     "play=$playCode", "id-missing"
                 ),
@@ -3102,7 +3180,7 @@ class MovieBoxINProvider : MainAPI() {
             // along (the home/search paths have no phone-visible
             // surface of their own).
             val diag = ArrayList<String>()
-            diag += "MovieBoxIN v8"
+            diag += "MovieBoxIN v9"
             diag += "srv=$streamsFound"
             diag += "ext=$emitted"
             diag += "dubs=$dubCount"

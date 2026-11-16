@@ -277,7 +277,7 @@ import okhttp3.RequestBody.Companion.toRequestBody
  * fallbacks; the mobile routes are the ones that work on his
  * phone (the original v56 WORKS there, his word). Nothing here
  * is "working" until he confirms on his phone after a full close
- * and reopen. DEBUG ("MovieBoxIN v11 | ... | sub=...") is emitted
+ * and reopen. DEBUG ("MovieBoxIN v12 | ... | sub=...") is emitted
  * whenever links are zero OR the dual is missing, so a failure
  * is never silent.
  *
@@ -414,6 +414,46 @@ import okhttp3.RequestBody.Companion.toRequestBody
  *   feed's truth — no invented titles (Western TV in H5,
  *   8/10, stands as the documented later-decision option).
  * Still NO trailer in v11. Still no coroutines anywhere.
+ * v12 (2026-11-16 — the original app's "Naruto: Shippuden"
+ * search shows the series FIRST (2017 8.7, then S1-S2 2009
+ * 8.7), while MovieBoxIN search shows movies only):
+ * - The mobile search/v2 cards are keyed by subjectId with
+ *   NO detailPath — but parseSubject + mbParsesAsSubjects
+ *   required a non-blank detailPath, so the mobile branch
+ *   returned ZERO usable cards on every query. H5 still
+ *   returned the movies, so the v10 diagnostic card (both
+ *   branches empty only) never showed: the failure was
+ *   completely invisible from v5 to v10. Rennvol's published
+ *   toSearchResponse requires subjectId + title only and
+ *   builds the URL "$id|0|0"; load() resolves it via
+ *   subject-api/get?subjectId= — never touching detailPath
+ *   in the search path.
+ * - MOBILE SEARCH ONLY accepts subjectId-only cards now
+ *   (allowIdOnly): parseSubject / mbParsesAsSubjects /
+ *   mbSubjectsAll / mbParseHit take the flag; H5 stays
+ *   strict (detailPath required, proven there). A
+ *   subjectId-only card gets Rennvol's "$id|0|0" URL.
+ *   subjectType 7 is a series now too (Rennvol: 2 or 7 ->
+ *   TvSeries).
+ * - load() resolves a "$id|0|0" URL by subjectId: H5
+ *   detail?subjectId= FIRST — proven live T101/T102 (the
+ *   byte-identical full detail payload as detail?detailPath=,
+ *   incl. detailPath + seasons + dubs) — then the existing
+ *   detail body runs with the canonical moviedetail URL, so
+ *   loadLinks keeps working unchanged (it needs subjectId +
+ *   detailPath). Mobile subject-api/get is the fallback when
+ *   H5 cannot resolve the id (Rennvol's route, phone-only);
+ *   if it yields no detailPath either, the detail page still
+ *   lists title/episodes but playback needs the H5-resolved
+ *   detailPath — documented, not faked.
+ * - Mobile-branch failure stays visible without polluting
+ *   results: the search DEBUG line already carries
+ *   mob=<status>:<hits>/<bad>/<key> on every episode open,
+ *   and now also idonly=<subjectId-only cards accepted from
+ *   the mobile branch>; the diagnostic card stays
+ *   both-branches-empty only. No visible card is added for
+ *   a single-branch failure — it would pollute real results.
+ * Still NO trailer in v12. Still no coroutines anywhere.
  * The 30 H5 streams for S1E1 stand (the other addons' 14 is
  * their filtered subset, not ground truth).
  */
@@ -617,12 +657,25 @@ class MovieBoxINProvider : MainAPI() {
     // ---------------------------------------------------------------
     // Home — dynamic tabs (IN: tab-operating; H5 twin as fallback)
     // ---------------------------------------------------------------
-    /** One subject JSON object -> a card. subjectType 2 is a
-     * series, everything else a movie (the dex mapping: 1 -> Movie,
-     * 2 -> TvSeries, default -> Movie). */
-    private fun parseSubject(o: JSONObject): SearchResponse? {
+    /** One subject JSON object -> a card. subjectType 2 or 7
+     * is a series, everything else a movie (Rennvol: 2 or 7
+     * -> TvSeries; the dex mapping: 1 -> Movie, 2 -> TvSeries,
+     * default -> Movie). v12 — allowIdOnly (MOBILE SEARCH
+     * ONLY): a card with no detailPath but a subjectId +
+     * title is accepted and gets Rennvol's "$id|0|0" URL,
+     * which load() resolves by subjectId. Every other path
+     * keeps the strict detailPath requirement. */
+    private fun parseSubject(
+        o: JSONObject,
+        allowIdOnly: Boolean = false
+    ): SearchResponse? {
         val dp = o.optString("detailPath")
-        if (dp.isBlank()) return null
+        val sid = o.optString("subjectId")
+        val url = when {
+            dp.isNotBlank() -> "$mbWebBase/ar/moviedetail/$dp"
+            allowIdOnly && sid.isNotBlank() -> "$sid|0|0"
+            else -> return null
+        }
         // v9 — title fallback to "name" (Rennvol's mobile
         // items use "name" when "title" is absent; without
         // this the card is dropped as unparseable).
@@ -630,8 +683,7 @@ class MovieBoxINProvider : MainAPI() {
         if (title.isBlank()) return null
         val poster = o.optJSONObject("cover")
             ?.optString("url")?.ifBlank { null }
-        val url = "$mbWebBase/ar/moviedetail/$dp"
-        return if (o.optInt("subjectType", 1) == 2) {
+        return if (o.optInt("subjectType", 1) in listOf(2, 7)) {
             newTvSeriesSearchResponse(title, url, TvType.TvSeries) {
                 this.posterUrl = poster
             }
@@ -1224,7 +1276,7 @@ class MovieBoxINProvider : MainAPI() {
         // the card reads as a contradiction (HTTP 200 = OK,
         // yet a failure card).
         val detail = if (code == "200") " بلا عناوين" else ""
-        val title = "⚠ v11 TOP100 غير متاحة — المصدر: $route، الحالة: $code$detail"
+        val title = "⚠ v12 TOP100 غير متاحة — المصدر: $route، الحالة: $code$detail"
         return newMovieSearchResponse(
             title, "mbdiag://top100/p$page/err-$code", TvType.Movie
         )
@@ -1249,7 +1301,7 @@ class MovieBoxINProvider : MainAPI() {
         mobStatus: String,
         tok: String
     ): SearchResponse {
-        val title = "⚠ v11 بحث فارغ — h5=$h5Status mob=$mobStatus tok=$tok"
+        val title = "⚠ v12 بحث فارغ — h5=$h5Status mob=$mobStatus tok=$tok"
         val slug = "h5-" + h5Status.replace(":", "-").replace("/", "-") +
             "-mob-" + mobStatus.replace(":", "-").replace("/", "-")
         return newMovieSearchResponse(
@@ -1548,12 +1600,20 @@ class MovieBoxINProvider : MainAPI() {
      * a subject (non-blank detailPath + title, unwrapping a
      * "subject" wrapper when present)? v9 — title may also
      * come from "name" (Rennvol's mobile items), matching
-     * the parseSubject fallback below. */
-    private fun mbParsesAsSubjects(arr: JSONArray): Boolean {
+     * the parseSubject fallback below. v12 — allowIdOnly
+     * (MOBILE SEARCH ONLY): a subjectId + title also counts,
+     * matching parseSubject's id-only acceptance; every other
+     * caller keeps the strict detailPath gate. */
+    private fun mbParsesAsSubjects(
+        arr: JSONArray,
+        allowIdOnly: Boolean = false
+    ): Boolean {
         for (i in 0 until arr.length()) {
             val o = arr.optJSONObject(i) ?: continue
             val subj = o.optJSONObject("subject") ?: o
-            if (subj.optString("detailPath").isNotBlank() &&
+            val hasId = subj.optString("detailPath").isNotBlank() ||
+                (allowIdOnly && subj.optString("subjectId").isNotBlank())
+            if (hasId &&
                 (subj.optString("title").isNotBlank() ||
                     subj.optString("name").isNotBlank())) return true
         }
@@ -1598,13 +1658,20 @@ class MovieBoxINProvider : MainAPI() {
      * (strict first-wins — proven there: items is the hits
      * array). Each array is gated by mbParsesAsSubjects, so
      * an empty/wrong array still contributes nothing; dedup
-     * by subjectId happens at the merge in search(). */
-    private fun mbSubjectsAll(data: JSONObject): Pair<JSONArray, String>? {
+     * by subjectId happens at the merge in search(). v12 —
+     * allowIdOnly threads through: the mobile search/v2 cards
+     * are keyed by subjectId with no detailPath (proven by
+     * the diagnosis), so the gate must accept them here; the
+     * TOP100 mobile loop calls with the default (strict). */
+    private fun mbSubjectsAll(
+        data: JSONObject,
+        allowIdOnly: Boolean = false
+    ): Pair<JSONArray, String>? {
         val merged = JSONArray()
         val won = ArrayList<String>()
         for (key in listOf("subjectList", "subjects", "items", "list")) {
             val arr = data.optJSONArray(key) ?: continue
-            if (!mbParsesAsSubjects(arr)) continue
+            if (!mbParsesAsSubjects(arr, allowIdOnly)) continue
             won += key
             for (i in 0 until arr.length()) {
                 arr.optJSONObject(i)?.let { merged.put(it) }
@@ -1620,7 +1687,7 @@ class MovieBoxINProvider : MainAPI() {
                     s.optJSONObject(j)?.let { subs.put(it) }
                 }
             }
-            if (mbParsesAsSubjects(subs)) {
+            if (mbParsesAsSubjects(subs, allowIdOnly)) {
                 won += "results[].subjects"
                 for (i in 0 until subs.length()) {
                     subs.optJSONObject(i)?.let { merged.put(it) }
@@ -1633,11 +1700,17 @@ class MovieBoxINProvider : MainAPI() {
     }
 
     /** One subject JSON object -> a hit carrying its own id
-     * (v6 — merge dedup is by subjectId). */
-    private fun mbParseHit(o: JSONObject?): MbSubjectHit? {
+     * (v6 — merge dedup is by subjectId). v12 — allowIdOnly
+     * (MOBILE SEARCH ONLY): a subjectId-only card parses via
+     * parseSubject's id-only acceptance; the hit id is the
+     * subjectId itself, so the merge dedup still works. */
+    private fun mbParseHit(
+        o: JSONObject?,
+        allowIdOnly: Boolean = false
+    ): MbSubjectHit? {
         if (o == null) return null
         val subj = o.optJSONObject("subject") ?: o
-        val item = parseSubject(subj) ?: return null
+        val item = parseSubject(subj, allowIdOnly) ?: return null
         val sid = subj.optString("subjectId")
             .ifBlank { subj.optString("detailPath") }
         return MbSubjectHit(sid, item)
@@ -1678,7 +1751,12 @@ class MovieBoxINProvider : MainAPI() {
         // v9 — cards skipped on this page (null parse or a
         // throw inside one card's parse); surfaced as bad=
         // in the DEBUG line so a dropping card is visible.
-        val bad: Int = 0
+        val bad: Int = 0,
+        // v12 — subjectId-only cards accepted on this page
+        // (mobile search only, "$id|0|0" URLs); surfaced as
+        // idonly= in the DEBUG line so the phone evidence can
+        // prove the fix worked even when H5 movies dominate.
+        val idOnly: Int = 0
     )
 
     /** One page of one search route (v6): mobile search/v2
@@ -1811,12 +1889,17 @@ class MovieBoxINProvider : MainAPI() {
             // observed live, and a series living in a second
             // array must not be dropped by first-wins. H5
             // keeps strict first-wins (proven: items is the
-            // hits array there).
-            val picked = if (mobile) mbSubjectsAll(data)
+            // hits array there). v12 — the mobile branch also
+            // accepts subjectId-only cards (allowIdOnly): the
+            // search/v2 cards carry subjectId with no
+            // detailPath, and the strict gate dropped every
+            // one of them; H5 stays strict.
+            val picked = if (mobile) mbSubjectsAll(data, allowIdOnly = true)
             else mbSubjectsArray(data)
             val pager = mbPager(data)
             val hits = ArrayList<MbSubjectHit>()
             var bad = 0
+            var idOnly = 0
             val arr = picked?.first
             if (arr != null) {
                 for (i in 0 until arr.length()) {
@@ -1826,8 +1909,13 @@ class MovieBoxINProvider : MainAPI() {
                     // kills the whole page/branch the way an
                     // unguarded throw in this loop used to.
                     try {
-                        val hit = mbParseHit(arr.optJSONObject(i))
-                        if (hit != null) hits += hit else bad++
+                        val hit = mbParseHit(
+                            arr.optJSONObject(i), allowIdOnly = mobile
+                        )
+                        if (hit != null) {
+                            hits += hit
+                            if (hit.item.url.endsWith("|0|0")) idOnly++
+                        } else bad++
                     } catch (e: Throwable) {
                         if (mbIsCancellation(e)) throw e
                         bad++
@@ -1836,7 +1924,7 @@ class MovieBoxINProvider : MainAPI() {
             }
             return MbSearchPage(
                 hits, pager, picked?.second ?: "none",
-                code, host, tokVia, bad
+                code, host, tokVia, bad, idOnly
             )
         } catch (e: Throwable) {
             if (mbIsCancellation(e)) throw e
@@ -2015,6 +2103,7 @@ class MovieBoxINProvider : MainAPI() {
                 "shown=${out.size} " +
                 "h5=${branchStatus(h5)} mob=${branchStatus(mob)} " +
                 "tok=${h5.tok}/${mob.tok} bad=${h5.bad + mob.bad} filt=$filteredCount " +
+                "idonly=${h5.idOnly + mob.idOnly} " +
                 "diag=${if (showDiag) 1 else 0} " +
                 excMark.trim()
             if (showDiag) {
@@ -2034,6 +2123,7 @@ class MovieBoxINProvider : MainAPI() {
             mbLastSearchDebug = "src=fallback " +
                 "h5=${h5.hits.size} mob=${mob.hits.size} " +
                 "bad=${h5.bad + mob.bad} " +
+                "idonly=${h5.idOnly + mob.idOnly} " +
                 "exc=merge pages=$page shown=${h5.hits.size}"
             return h5.hits.map { it.item }.toNewSearchResponseList(false)
         }
@@ -2082,7 +2172,73 @@ class MovieBoxINProvider : MainAPI() {
         }.getOrNull()
     }
 
+    /** v12 — subjectId-keyed card URLs ("<sid>|0|0", Rennvol's
+     * search URL form). Resolves the subject by id, then runs
+     * the normal detail body with the canonical moviedetail
+     * URL, so loadLinks keeps working unchanged (it needs
+     * subjectId + detailPath). H5 detail?subjectId= FIRST —
+     * proven live T101/T102 (the byte-identical full detail
+     * payload as detail?detailPath=, incl. detailPath +
+     * seasons + dubs). Mobile subject-api/get SECOND
+     * (Rennvol's route, phone-only): its data is the subject
+     * itself, so it is wrapped as {"subject": data}; seasons
+     * come from fetchMobileSeasons as usual. If the mobile
+     * data carries no detailPath either, the detail page
+     * still lists title/episodes, but playback needs the
+     * H5-resolved detailPath — documented, not faked. */
+    private suspend fun loadBySubjectId(sid: String, url: String): LoadResponse {
+        val h5 = runCatching {
+            mbH5Get(
+                "/wefeed-h5api-bff/detail?subjectId=" +
+                    java.net.URLEncoder.encode(sid, "UTF-8"),
+                mbJsonHeaders
+            )?.first
+        }.getOrNull()
+        val h5Data = runCatching {
+            JSONObject(h5 ?: "").optJSONObject("data")
+        }.getOrNull()
+        val h5Subj = h5Data?.optJSONObject("subject")
+        if (h5Subj != null && h5Subj.optString("detailPath").isNotBlank()) {
+            val canon = "$mbWebBase/ar/moviedetail/${h5Subj.optString("detailPath")}"
+            return loadFromH5Detail(h5Data, canon)
+        }
+        // Mobile fallback (Rennvol's subject-api/get).
+        val mob = runCatching {
+            val mUrl = "$mbApi3Base/wefeed-mobile-bff/subject-api/get?subjectId=$sid"
+            val headers = mbSignedHeaders(
+                "GET", mUrl, mbUaToken, mbClientInfoToken()
+            ).toMutableMap()
+            val (token, _) = mbGuestToken()
+            if (!token.isNullOrBlank()) {
+                headers["Authorization"] = "Bearer $token"
+                headers["X-MB-Token"] = token
+            }
+            val res = app.get(mUrl, headers = headers)
+            mbAbsorbToken(res.headers["x-user"] ?: res.headers["X-User"], res.code)
+            if (res.code !in 200..299 || res.text.isBlank()) null else res.text
+        }.getOrNull()
+        val mobData = runCatching {
+            val root = JSONObject(mob ?: "")
+            root.optJSONObject("data") ?: root.optJSONObject("subject")
+        }.getOrNull()
+        if (mobData != null && mobData.length() > 0) {
+            val mobDp = mobData.optString("detailPath")
+            val canon = if (mobDp.isNotBlank()) {
+                "$mbWebBase/ar/moviedetail/$mobDp"
+            } else url
+            val wrapped = JSONObject().put("subject", mobData)
+            return loadFromH5Detail(wrapped, canon)
+        }
+        return movieFallback(url)
+    }
+
     override suspend fun load(url: String): LoadResponse {
+        // v12 — subjectId-keyed card URL ("<sid>|0|0"): resolve
+        // by subjectId first; the moviedetail path below is
+        // unchanged.
+        val sidKey = Regex("""^(\d{10,})\|0\|0$""")
+            .find(url.trim())?.groupValues?.get(1)
+        if (sidKey != null) return loadBySubjectId(sidKey, url)
         val dp = url.substringAfter("/moviedetail/")
             .substringBefore("?").substringBefore("#").trim()
         if (dp.isBlank()) return movieFallback(url)
@@ -2096,6 +2252,17 @@ class MovieBoxINProvider : MainAPI() {
         val data = runCatching {
             JSONObject(json ?: "").optJSONObject("data")
         }.getOrNull()
+        return loadFromH5Detail(data, url)
+    }
+
+    /** The detail body shared by the moviedetail path and the
+     * v12 subjectId path: builds the movie/series response
+     * from an H5 detail data object (or a mobile-get subject
+     * wrapped as {"subject": ...}). */
+    private suspend fun loadFromH5Detail(
+        data: JSONObject?,
+        url: String
+    ): LoadResponse {
         val subj = data?.optJSONObject("subject")
             ?: return movieFallback(url)
         val title = subj.optString("title")
@@ -2111,7 +2278,9 @@ class MovieBoxINProvider : MainAPI() {
             if (desc.isNotBlank()) append(desc)
         }.ifBlank { null }
         val subjectId = subj.optString("subjectId")
-        val isSeries = subj.optInt("subjectType", 1) == 2
+        // v12 — subjectType 7 is a series too (Rennvol: 2 or 7
+        // -> TvSeries), matching parseSubject.
+        val isSeries = subj.optInt("subjectType", 1) in listOf(2, 7)
         if (!isSeries) {
             return newMovieLoadResponse(
                 title.ifBlank { "MovieBox" }, url, TvType.Movie,
@@ -3301,7 +3470,7 @@ class MovieBoxINProvider : MainAPI() {
         if (subjectId.isBlank() || detailPath.isBlank()) {
             emitDebug(
                 listOf(
-                    "MovieBoxIN v11", "srv=0", "ext=0",
+                    "MovieBoxIN v12", "srv=0", "ext=0",
                     "t=${elapsed() / 1000}s", "tok=$tokVia",
                     "play=$playCode", "id-missing"
                 ),
@@ -3418,7 +3587,7 @@ class MovieBoxINProvider : MainAPI() {
             // along (the home/search paths have no phone-visible
             // surface of their own).
             val diag = ArrayList<String>()
-            diag += "MovieBoxIN v11"
+            diag += "MovieBoxIN v12"
             diag += "srv=$streamsFound"
             diag += "ext=$emitted"
             diag += "dubs=$dubCount"

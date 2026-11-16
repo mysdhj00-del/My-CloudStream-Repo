@@ -5,12 +5,12 @@ import com.lagradost.cloudstream3.HomePageList
 import com.lagradost.cloudstream3.HomePageResponse
 import com.lagradost.cloudstream3.LoadResponse
 import com.lagradost.cloudstream3.MainAPI
+import com.lagradost.cloudstream3.MainPageData
 import com.lagradost.cloudstream3.MainPageRequest
 import com.lagradost.cloudstream3.SearchResponse
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.TvType
 import com.lagradost.cloudstream3.app
-import com.lagradost.cloudstream3.mainPageOf
 import com.lagradost.cloudstream3.newEpisode
 import com.lagradost.cloudstream3.newHomePageResponse
 import com.lagradost.cloudstream3.newMovieLoadResponse
@@ -30,7 +30,7 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.toRequestBody
 
 /**
- * MovieBoxIN v1 — faithful clean-room reimplementation of the
+ * MovieBoxIN v2 — faithful clean-room reimplementation of the
  * CNC MovieBoxProviderIN flow (CNC Verse, verified live 2026-11-16:
  * still v56, 92,272 B, fileHash sha256-376043d8…8236ab — no newer
  * version; NO Kotlin source is published anywhere, everything here
@@ -92,6 +92,30 @@ import okhttp3.RequestBody.Companion.toRequestBody
  *   he wants it): no youtubeTrailerId, no trailerFor, no trailer
  *   code anywhere in this module.
  *
+ * v2 (his three on-device v1 fixes, 2026-11-16):
+ * - SEARCH is comprehensive now: every page of search/v2, then
+ *   every page of H5 search (was: page 1 only, max 20). Proven
+ *   live: "love" totalCount 452, pp.1-4 = 15/18/14/15 new cards.
+ * - HOME paginates per row now: one mainPage entry per tab
+ *   section; rank sections (genreTopId = the ranking-list id)
+ *   paginate through H5 ranking-list/content (proven live:
+ *   Horror Movies 17/15/18 new per page, zero overlap), with a
+ *   per-section seen-set — a row stops only on a page with zero
+ *   new cards. The "tabs" entry stays first (cache refresh +
+ *   non-rank sections + session-1 expansion fallback).
+ * - CAPTIONS are a UNION across every route now (v1 stopped at
+ *   the first array holding Arabic, so English from another
+ *   stream/route was never consulted — the Prison Break S1E1
+ *   shape), and the mobile caption URLs match IN exactly
+ *   (ext-captions: subjectId + resourceId + episode=0 hardcoded;
+ *   stream-captions: subjectId + streamId only). The series
+ *   detail lists English in its subtitles field, so the track
+ *   is claimed to exist; whether S1E1's streams actually carry
+ *   it can only be proven on his phone (play returns empty
+ *   streams from a datacenter IP, so no real stream id exists
+ *   in the sandbox). No OpenSubtitles, no rebuild — his order.
+ *   Still NO trailer in v2.
+ *
  * HONEST LIMIT (proven live, see NOTES.md): the mobile gateway
  * (tab-operating, search/v2, season-info, captions) answers 403
  * "Service not available in current region" from a US datacenter
@@ -102,7 +126,7 @@ import okhttp3.RequestBody.Companion.toRequestBody
  * fallbacks; the mobile routes are the ones that work on his
  * phone (the original v56 WORKS there, his word). Nothing here
  * is "working" until he confirms on his phone after a full close
- * and reopen. DEBUG ("MovieBoxIN v1 | ... | sub=...") is emitted
+ * and reopen. DEBUG ("MovieBoxIN v2 | ... | sub=...") is emitted
  * whenever links are zero OR the dual is missing, so a failure
  * is never silent.
  */
@@ -114,9 +138,40 @@ class MovieBoxINProvider : MainAPI() {
     override val hasQuickSearch = false
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries)
 
-    override val mainPage = mainPageOf(
-        "tabs" to "MovieBoxIN"
+    /** Home sections, cached from the last tab-operating fetch.
+     * One mainPage entry per section: rank sections (a
+     * genreTopId — the ranking-list id, e.g. Horror Movies =
+     * 8614980535946986176) paginate through the H5 ranking-list;
+     * tab sections (no genreTopId) show their tab-operating
+     * subjects only. The "tabs" entry is always first, so every
+     * home load refreshes the cache and serves the non-rank
+     * sections. The app freezes mainPage when the home is first
+     * opened, so on the very first session only "tabs" exists
+     * and row expansion falls back to getMainPage(page, "tabs")
+     * (all sections' next page at once); from the second home
+     * open the per-section entries exist and expansion is
+     * precise per row. */
+    private data class MbHomeSection(
+        val title: String,
+        val genreTopId: String,
+        val opId: String,
+        val subjects: List<SearchResponse>
     )
+
+    @Volatile
+    private var mbHomeSections: List<MbHomeSection> = emptyList()
+
+    override val mainPage: List<MainPageData>
+        get() {
+            val entries = ArrayList<MainPageData>()
+            entries += MainPageData("MovieBoxIN", "tabs", true)
+            for (s in mbHomeSections) {
+                val data = if (s.genreTopId.isNotBlank()) "rank:${s.genreTopId}"
+                else "tab:${s.opId}"
+                entries += MainPageData(s.title, data, true)
+            }
+            return entries
+        }
 
     private val browserUA =
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
@@ -257,108 +312,287 @@ class MovieBoxINProvider : MainAPI() {
         }.getOrNull()
     }
 
+    /** Seen detailPaths per ranking-list section (keyed by
+     * genreTopId) — the dedup that stops a section only when a
+     * page brings zero NEW cards. Seeded with the tab-operating
+     * subjects on the tabs fetch (so a session-1 page-2 call
+     * never re-emits a card the row already shows), cleared on
+     * page<=1 of the ranking-list path (fresh start). */
+    private val mbRankSeen = HashMap<String, MutableSet<String>>()
+    private val mbRankSeenLock = Any()
+
+    /** Tab-operating sections as home records (mobile first, H5
+     * twin fallback). Titles deduped (first non-empty wins —
+     * the app keys rows by title); empty sections skipped.
+     * Populates mbHomeSections (the mainPage entries for the
+     * next home load) and seeds the rank seen-sets. */
+    private suspend fun fetchTabSections(): List<MbHomeSection> {
+        val sections = fetchMobileTabs() ?: fetchH5Tabs() ?: return emptyList()
+        val out = ArrayList<MbHomeSection>()
+        val seenTitles = HashSet<String>()
+        for (i in 0 until sections.length()) {
+            val section = sections.optJSONObject(i) ?: continue
+            val cards = sectionSubjects(section)
+            if (cards.isEmpty()) continue
+            val title = section.optString("title").ifBlank { "✨Top Picks" }
+            if (!seenTitles.add(title)) continue
+            val genreTopId = section.optString("genreTopId")
+            out += MbHomeSection(
+                title, genreTopId, section.optString("opId"), cards
+            )
+            if (genreTopId.isNotBlank()) {
+                synchronized(mbRankSeenLock) {
+                    val seen = mbRankSeen.getOrPut(genreTopId) { HashSet() }
+                    // Seed with detailPaths (the same key
+                    // fetchRankPage dedups on) so a session-1
+                    // page-2 call never re-emits a card the row
+                    // already shows.
+                    for (c in cards) {
+                        val dp = c.url.substringAfter("/moviedetail/")
+                            .substringBefore("?").substringBefore("#").trim()
+                        if (dp.isNotBlank()) seen.add(dp)
+                    }
+                }
+            }
+        }
+        mbHomeSections = out
+        return out
+    }
+
+    /** One page of a ranking-list section (H5, no token, proven
+     * live 2026-11-16: Horror Movies pp.1-3 = 17/15/18 new
+     * cards, Popular Series 16/15/13, zero overlap, hasMore
+     * true throughout). Returns (newCards, hasMore): hasMore
+     * is false when the pager says so OR the page brought zero
+     * new cards (a clamped past-the-end page). */
+    private suspend fun fetchRankPage(
+        genreTopId: String,
+        page: Int
+    ): Pair<List<SearchResponse>, Boolean> {
+        val url = "$mbWebBase/wefeed-h5api-bff/ranking-list/content" +
+            "?id=$genreTopId&page=$page&perPage=20"
+        val res = runCatching { app.get(url, headers = mbJsonHeaders) }
+            .getOrNull() ?: return emptyList<SearchResponse>() to false
+        if (res.code !in 200..299) return emptyList<SearchResponse>() to false
+        val json = runCatching { JSONObject(res.text) }.getOrNull()
+            ?: return emptyList<SearchResponse>() to false
+        val data = json.optJSONObject("data")
+            ?: return emptyList<SearchResponse>() to false
+        val arr = data.optJSONArray("subjectList")
+            ?: return emptyList<SearchResponse>() to false
+        val pager = data.optJSONObject("pager")
+        val hasMore = when (val hm = pager?.opt("hasMore")) {
+            is Boolean -> hm
+            is String -> hm.equals("true", ignoreCase = true)
+            else -> false
+        }
+        val seen = synchronized(mbRankSeenLock) {
+            mbRankSeen.getOrPut(genreTopId) { HashSet() }.also {
+                if (page <= 1) it.clear()
+            }
+        }
+        val out = ArrayList<SearchResponse>()
+        synchronized(mbRankSeenLock) {
+            for (i in 0 until arr.length()) {
+                val o = arr.optJSONObject(i) ?: continue
+                val dp = o.optString("detailPath")
+                if (dp.isBlank() || !seen.add(dp)) continue
+                parseSubject(o)?.let { out += it }
+            }
+        }
+        return out to (hasMore && out.isNotEmpty())
+    }
+
+    /** The "tabs" request. Page 1 refreshes the tab cache and
+     * returns every section's first page (hasNext = any rank
+     * section exists). Page>1 is the session-1 expansion
+     * fallback — the frozen mainPage has no per-section entries
+     * yet, so the app re-calls "tabs": return every rank
+     * section's next ranking-list page at once. */
+    private suspend fun getMainPageTabs(page: Int): HomePageResponse {
+        if (page <= 1) {
+            val sections = fetchTabSections()
+            if (sections.isEmpty()) return newHomePageResponse(emptyList(), false)
+            val lists = sections.map { s ->
+                HomePageList(s.title, s.subjects, isHorizontalImages = true)
+            }
+            val hasNext = sections.any { it.genreTopId.isNotBlank() }
+            return newHomePageResponse(lists, hasNext)
+        }
+        var anyMore = false
+        val lists = ArrayList<HomePageList>()
+        for (s in mbHomeSections) {
+            if (s.genreTopId.isBlank()) continue
+            val (cards, hasMore) = fetchRankPage(s.genreTopId, page)
+            if (hasMore) anyMore = true
+            lists += HomePageList(s.title, cards, isHorizontalImages = true)
+        }
+        return newHomePageResponse(lists, anyMore)
+    }
+
     override suspend fun getMainPage(
         page: Int,
         request: MainPageRequest
     ): HomePageResponse {
-        // IN's tab-operating URL hardcodes page=1: the home is a
-        // single fetch; there is no page 2 (the H5 twin returns
-        // the same 36 sections for page=2, verified live).
-        if (page > 1) return newHomePageResponse(emptyList(), false)
-        val sections = fetchMobileTabs() ?: fetchH5Tabs()
-            ?: return newHomePageResponse(emptyList(), false)
-        val lists = ArrayList<HomePageList>()
-        for (i in 0 until sections.length()) {
-            val section = sections.optJSONObject(i) ?: continue
-            val title = section.optString("title")
-                .ifBlank { "✨Top Picks" }
-            val cards = sectionSubjects(section)
-            if (cards.isEmpty()) continue
-            lists += HomePageList(title, cards, isHorizontalImages = true)
+        return when {
+            request.data == "tabs" -> getMainPageTabs(page)
+            request.data.startsWith("rank:") -> {
+                val gid = request.data.removePrefix("rank:")
+                if (gid.isBlank()) return newHomePageResponse(emptyList(), false)
+                val (cards, hasMore) = fetchRankPage(gid, page)
+                newHomePageResponse(
+                    listOf(
+                        HomePageList(request.name, cards, isHorizontalImages = true)
+                    ),
+                    hasMore
+                )
+            }
+            request.data.startsWith("tab:") -> {
+                // Non-rank sections (e.g. Coming Soon): their
+                // tab-operating subjects only, no further pages.
+                if (page > 1) return newHomePageResponse(emptyList(), false)
+                val opId = request.data.removePrefix("tab:")
+                var cards = mbHomeSections
+                    .firstOrNull { it.opId == opId }?.subjects
+                if (cards == null) {
+                    fetchTabSections()
+                    cards = mbHomeSections
+                        .firstOrNull { it.opId == opId }?.subjects
+                }
+                newHomePageResponse(
+                    listOf(
+                        HomePageList(
+                            request.name, cards ?: emptyList(),
+                            isHorizontalImages = true
+                        )
+                    ),
+                    false
+                )
+            }
+            else -> newHomePageResponse(emptyList(), false)
         }
-        return newHomePageResponse(lists, false)
     }
 
     // ---------------------------------------------------------------
     // Search — mobile search/v2 first (IN), H5 search fallback
     // ---------------------------------------------------------------
-    private fun searchItems(root: JSONObject?): List<SearchResponse> {
-        if (root == null) return emptyList()
+    /** Parse one search page: (newItems, hasMore). Dedup by
+     * detailPath against the caller's seen-set (the site itself
+     * repeats titles across pages — different detailPaths are
+     * different records). */
+    private fun searchPageItems(
+        root: JSONObject?,
+        seen: MutableSet<String>
+    ): Pair<List<SearchResponse>, Boolean> {
+        if (root == null) return emptyList<SearchResponse>() to false
         val data = root.optJSONObject("data") ?: root
         val arr = data.optJSONArray("items")
             ?: data.optJSONArray("subjectList")
-            ?: data.optJSONArray("list") ?: return emptyList()
+            ?: data.optJSONArray("list")
+            ?: return emptyList<SearchResponse>() to false
+        val pager = data.optJSONObject("pager")
+        val hasMore = when (val hm = pager?.opt("hasMore")) {
+            is Boolean -> hm
+            is String -> hm.equals("true", ignoreCase = true)
+            else -> false
+        }
         val out = ArrayList<SearchResponse>()
-        val seen = HashSet<String>()
         for (i in 0 until arr.length()) {
             val o = arr.optJSONObject(i) ?: continue
             val dp = o.optString("detailPath")
             if (dp.isBlank() || !seen.add(dp)) continue
             parseSubject(o)?.let { out += it }
-            if (out.size >= 30) break
+        }
+        return out to hasMore
+    }
+
+    /** One page of one search route (mobile search/v2 when
+     * mobile=true, H5 subject/search otherwise). Both routes
+     * need the guest token (H5 without one is a 400 "invalid
+     * token", proven live). */
+    private suspend fun searchRoutePage(
+        query: String,
+        page: Int,
+        mobile: Boolean,
+        seen: MutableSet<String>
+    ): Pair<List<SearchResponse>, Boolean> {
+        return runCatching {
+            val (token, _) = mbGuestToken()
+            val body = JSONObject().apply {
+                put("page", page)
+                put("perPage", 20)
+                put("keyword", query)
+            }.toString()
+            val res = if (mobile) {
+                val url = "$mbApi3Base/wefeed-mobile-bff/subject-api/search/v2"
+                val headers = mbSignedHeaders(
+                    "POST", url, mbUaToken, mbClientInfoToken(),
+                    body = body, contentType = "application/json; charset=utf-8"
+                ).toMutableMap()
+                if (!token.isNullOrBlank()) {
+                    headers["Authorization"] = "Bearer $token"
+                    headers["X-MB-Token"] = token
+                }
+                app.post(
+                    url, headers = headers,
+                    requestBody = body.toRequestBody(
+                        "application/json; charset=utf-8".toMediaType()
+                    )
+                )
+            } else {
+                val headers = mutableMapOf(
+                    "User-Agent" to browserUA,
+                    "Accept" to "application/json",
+                    "Content-Type" to "application/json"
+                )
+                if (!token.isNullOrBlank()) {
+                    headers["Authorization"] = "Bearer $token"
+                    headers["X-MB-Token"] = token
+                }
+                app.post(
+                    "$mbWebBase/wefeed-h5api-bff/subject/search",
+                    headers = headers,
+                    requestBody = body.toRequestBody(
+                        "application/json".toMediaType()
+                    )
+                )
+            }
+            if (res.code !in 200..299) return emptyList<SearchResponse>() to false
+            searchPageItems(
+                runCatching { JSONObject(res.text) }.getOrNull(), seen
+            )
+        }.getOrDefault(emptyList<SearchResponse>() to false)
+    }
+
+    /** ALL pages of one search route. Stops on hasMore=false, a
+     * page with zero NEW items, or 8 pages (~160 results — the
+     * bound that keeps search fast). Proven live on H5:
+     * "love" totalCount 452, pp.1-4 = 15/18/14/15 new cards;
+     * "prison break" p1 11 + p2 7 new. v1 fetched page 1 only
+     * (max 20, capped at 30 in the parser) — that was the
+     * "limited results" complaint. */
+    private suspend fun searchRoute(
+        query: String,
+        mobile: Boolean
+    ): List<SearchResponse> {
+        val out = ArrayList<SearchResponse>()
+        val seen = HashSet<String>()
+        for (page in 1..8) {
+            val (items, hasMore) = searchRoutePage(query, page, mobile, seen)
+            out += items
+            if (!hasMore || items.isEmpty()) break
         }
         return out
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
         if (query.isBlank()) return emptyList()
-        // Route 1 — IN's own search/v2 (signed POST on api3).
-        runCatching {
-            val url = "$mbApi3Base/wefeed-mobile-bff/subject-api/search/v2"
-            val body = JSONObject().apply {
-                put("page", 1)
-                put("perPage", 20)
-                put("keyword", query)
-            }.toString()
-            val headers = mbSignedHeaders(
-                "POST", url, mbUaToken, mbClientInfoToken(),
-                body = body, contentType = "application/json; charset=utf-8"
-            ).toMutableMap()
-            val (token, _) = mbGuestToken()
-            if (!token.isNullOrBlank()) {
-                headers["Authorization"] = "Bearer $token"
-                headers["X-MB-Token"] = token
-            }
-            val res = app.post(
-                url, headers = headers,
-                requestBody = body.toRequestBody(
-                    "application/json; charset=utf-8".toMediaType()
-                )
-            )
-            if (res.code in 200..299) {
-                val items = searchItems(
-                    runCatching { JSONObject(res.text) }.getOrNull()
-                )
-                if (items.isNotEmpty()) return items
-            }
-        }
-        // Route 2 — H5 search (proven live from the sandbox).
-        return runCatching {
-            val (token, _) = mbGuestToken()
-            val body = JSONObject().apply {
-                put("keyword", query)
-                put("page", 1)
-                put("perPage", 20)
-            }.toString()
-            val headers = mutableMapOf(
-                "User-Agent" to browserUA,
-                "Accept" to "application/json",
-                "Content-Type" to "application/json"
-            )
-            if (!token.isNullOrBlank()) {
-                headers["Authorization"] = "Bearer $token"
-                headers["X-MB-Token"] = token
-            }
-            val res = app.post(
-                "$mbWebBase/wefeed-h5api-bff/subject/search",
-                headers = headers,
-                requestBody = body.toRequestBody(
-                    "application/json".toMediaType()
-                )
-            )
-            if (res.code !in 200..299) return emptyList()
-            searchItems(runCatching { JSONObject(res.text) }.getOrNull())
-        }.getOrDefault(emptyList())
+        // Route 1 — IN's own search/v2 (signed POST on api3),
+        // ALL pages now, not just page 1.
+        val mob = searchRoute(query, mobile = true)
+        if (mob.isNotEmpty()) return mob
+        // Route 2 — H5 search, ALL pages.
+        return searchRoute(query, mobile = false)
     }
 
     // ---------------------------------------------------------------
@@ -967,19 +1201,19 @@ class MovieBoxINProvider : MainAPI() {
         }.getOrNull()
     }
 
-    /** Emit subtitles from one captions array, in his literal
-     * order: «الإنجليزية», «العربية», «الإنجليزية + العربية»
-     * (dual). Returns the sub diagnostic: "ar+en" when the dual
-     * option was emitted, "ar" / "en" for a single side, "ar+mf"
-     * when both sides exist but no dual file could be built
-     * (merge + local fallback both failed — the singles are
-     * still emitted), or null when the array holds neither. */
-    private suspend fun mbEmitFromArray(
-        arr: JSONArray?,
+    /** Emit English, Arabic and (when both exist) the dual from
+     * already-found caption URLs, in his literal order:
+     * «الإنجليزية», «العربية», «الإنجليزية + العربية» (dual).
+     * Returns the sub diagnostic: "ar+en" when the dual option
+     * was emitted, "ar" / "en" for a single side, "ar+mf" when
+     * both sides exist but no dual file could be built (merge +
+     * local fallback both failed — the singles are still
+     * emitted). */
+    private suspend fun mbEmitUnion(
+        ara: String?,
+        eng: String?,
         subtitleCallback: (SubtitleFile) -> Unit
-    ): String? {
-        val (ara, eng) = mbPickCaptions(arr)
-        if (ara == null && eng == null) return null
+    ): String {
         if (eng != null) subtitleCallback(SubtitleFile("الإنجليزية", eng))
         if (ara != null) subtitleCallback(SubtitleFile("العربية", ara))
         if (ara != null && eng != null) {
@@ -1021,17 +1255,27 @@ class MovieBoxINProvider : MainAPI() {
         return null
     }
 
-    /** Captions for a title. Returns a diagnostic: "ar+en" when
-     * the dual option was emitted, "ar" / "en" for a single side,
-     * "ar+mf" when both sides exist but no dual file could be
-     * built, else a compact "none:<route>=<code>/..." trail.
-     * Route H5 first: NOT region-gated (200 from a US IP), with
-     * the REAL stream id + format from the play response
-     * (id=subjectId alone returns an empty captions array; a
-     * missing id is a 400 "empty id"). The mobile routes stay as
-     * fallback. The CNC dex emits SubtitleFile with (lang, url)
-     * and NO headers, so no headers are passed with the caption
-     * URL. */
+    /** Captions for a title — UNION across every route, never
+     * an early return on a partial hit. v1 stopped at the first
+     * array that held Arabic, so English from another stream or
+     * route was never consulted (the Prison Break S1E1 failure
+     * shape: Arabic present, English missing). Routes, in
+     * order: H5 caption per stream id (moviebox.sg first — the
+     * verified base — then the play base), mobile ext-captions
+     * (IN-exact: subjectId + resourceId + episode=0 HARDCODED,
+     * even for episodes — v1 sent subjectId only), mobile
+     * stream-captions (IN-exact: subjectId + streamId ONLY —
+     * v1 wrongly added episode + resourceId). Stops early only
+     * once BOTH sides are found. Returns the sub diagnostic:
+     * "ar+en" / "ar" / "en" / "ar+mf", else a compact
+     * "none:<route>=<code>/..." trail. Route H5 first: NOT
+     * region-gated (200 from a US IP), with the REAL stream id
+     * + format from the play response (id=subjectId alone
+     * returns an empty captions array — proven live on Prison
+     * Break, with and without se/ep params; a missing id is a
+     * 400 "empty id"). The CNC dex emits SubtitleFile with
+     * (lang, url) and NO headers, so no headers are passed
+     * with the caption URL. */
     private suspend fun mbEmitCaptions(
         subjectId: String,
         detailPath: String,
@@ -1040,60 +1284,78 @@ class MovieBoxINProvider : MainAPI() {
         h5Caps: List<Pair<String, String>>,
         streamId: String?,
         resourceId: String?,
-        episode: Int,
         subtitleCallback: (SubtitleFile) -> Unit
     ): String {
         val trail = ArrayList<String>()
-        // Route H5 first: NOT region-gated (200 from a US IP).
+        var ara: String? = null
+        var eng: String? = null
+        fun absorb(arr: JSONArray?) {
+            val (a, e) = mbPickCaptions(arr)
+            if (ara == null) ara = a
+            if (eng == null) eng = e
+        }
+        fun bothFound(): Boolean = ara != null && eng != null
+        // Route H5 first: every (stream id, format) pair,
+        // moviebox.sg first, then the play base if different.
+        val h5Bases = listOf(mbWebBase, playBase).distinct()
         for ((sid, fmt) in h5Caps) {
-            val capUrl = "$playBase/wefeed-h5api-bff/subject/caption" +
-                "?format=$fmt&id=$sid&subjectId=$subjectId" +
-                "&detailPath=$detailPath"
-            val headers = mbSignedHeaders(
-                "GET", capUrl, mbUaToken, mbClientInfoToken()
-            ) + mapOf(
-                "Authorization" to "Bearer $token",
-                "X-MB-Token" to token
-            )
-            val res = runCatching { app.get(capUrl, headers = headers) }.getOrNull()
-            val code = res?.code ?: 0
-            if (res == null || code !in 200..299) {
-                trail += "h5=$code"
-                continue
-            }
-            val json = runCatching { JSONObject(res.text) }.getOrNull()
-            val arr = mbCaptionsArray(json, "captions", "extCaptions")
-            if (arr == null || arr.length() == 0) {
-                trail += "h5=$code-empty"
-                continue
-            }
-            mbEmitFromArray(arr, subtitleCallback)?.let { return it }
-            trail += "h5=$code-nocap"
-        }
-        // Route mobile ext-captions (subjectId only).
-        runCatching {
-            val extUrl = "$mbMobileBase/wefeed-mobile-bff/subject-api/" +
-                "get-ext-captions?subjectId=$subjectId"
-            val extHeaders = mbSignedHeaders(
-                "GET", extUrl, mbUaToken, mbClientInfoToken()
-            ) + mapOf(
-                "Authorization" to "Bearer $token",
-                "X-MB-Token" to token
-            )
-            val extRes = app.get(extUrl, headers = extHeaders)
-            trail += "mob=${extRes.code}"
-            if (extRes.code in 200..299) {
-                val extJson = runCatching { JSONObject(extRes.text) }.getOrNull()
-                val arr = mbCaptionsArray(extJson, "extCaptions", "captions")
-                mbEmitFromArray(arr, subtitleCallback)?.let { return it }
+            if (bothFound()) break
+            for (base in h5Bases) {
+                if (bothFound()) break
+                val capUrl = "$base/wefeed-h5api-bff/subject/caption" +
+                    "?format=$fmt&id=$sid&subjectId=$subjectId" +
+                    "&detailPath=$detailPath"
+                val headers = mbSignedHeaders(
+                    "GET", capUrl, mbUaToken, mbClientInfoToken()
+                ) + mapOf(
+                    "Authorization" to "Bearer $token",
+                    "X-MB-Token" to token
+                )
+                val res = runCatching { app.get(capUrl, headers = headers) }.getOrNull()
+                val code = res?.code ?: 0
+                if (res == null || code !in 200..299) {
+                    trail += "h5=$code"
+                    continue
+                }
+                val json = runCatching { JSONObject(res.text) }.getOrNull()
+                val arr = mbCaptionsArray(json, "captions", "extCaptions")
+                if (arr == null || arr.length() == 0) {
+                    trail += "h5=$code-empty"
+                    continue
+                }
+                absorb(arr)
+                trail += "h5=$code-ok"
             }
         }
-        // Route mobile stream-captions (needs stream + resource ids).
-        if (!streamId.isNullOrBlank() && !resourceId.isNullOrBlank()) {
+        // Route mobile ext-captions (IN-exact: subjectId +
+        // resourceId + episode=0 hardcoded).
+        if (!bothFound()) {
+            runCatching {
+                var extUrl = "$mbMobileBase/wefeed-mobile-bff/subject-api/" +
+                    "get-ext-captions?subjectId=$subjectId"
+                if (!resourceId.isNullOrBlank()) extUrl += "&resourceId=$resourceId"
+                extUrl += "&episode=0"
+                val extHeaders = mbSignedHeaders(
+                    "GET", extUrl, mbUaToken, mbClientInfoToken()
+                ) + mapOf(
+                    "Authorization" to "Bearer $token",
+                    "X-MB-Token" to token
+                )
+                val extRes = app.get(extUrl, headers = extHeaders)
+                trail += "mob=${extRes.code}"
+                if (extRes.code in 200..299) {
+                    val extJson = runCatching { JSONObject(extRes.text) }.getOrNull()
+                    val arr = mbCaptionsArray(extJson, "extCaptions", "captions")
+                    absorb(arr)
+                }
+            }
+        }
+        // Route mobile stream-captions (IN-exact: subjectId +
+        // streamId only — no episode, no resourceId).
+        if (!bothFound() && !streamId.isNullOrBlank()) {
             runCatching {
                 val streamUrl = "$mbMobileBase/wefeed-mobile-bff/subject-api/" +
-                    "get-stream-captions?subjectId=$subjectId" +
-                    "&streamId=$streamId&episode=$episode&resourceId=$resourceId"
+                    "get-stream-captions?subjectId=$subjectId&streamId=$streamId"
                 val streamHeaders = mbSignedHeaders(
                     "GET", streamUrl, mbUaToken, mbClientInfoToken()
                 ) + mapOf(
@@ -1105,11 +1367,12 @@ class MovieBoxINProvider : MainAPI() {
                 if (streamRes.code in 200..299) {
                     val streamJson = runCatching { JSONObject(streamRes.text) }.getOrNull()
                     val arr = mbCaptionsArray(streamJson, "captions", "extCaptions")
-                    mbEmitFromArray(arr, subtitleCallback)?.let { return it }
+                    absorb(arr)
                 }
             }
         }
-        return "none:" + trail.joinToString("/")
+        if (ara == null && eng == null) return "none:" + trail.joinToString("/")
+        return mbEmitUnion(ara, eng, subtitleCallback)
     }
 
     override suspend fun loadLinks(
@@ -1141,7 +1404,7 @@ class MovieBoxINProvider : MainAPI() {
         if (subjectId.isBlank() || detailPath.isBlank()) {
             emitDebug(
                 listOf(
-                    "MovieBoxIN v1", "srv=0", "ext=0",
+                    "MovieBoxIN v2", "srv=0", "ext=0",
                     "t=${elapsed() / 1000}s", "tok=$tokVia",
                     "play=$playCode", "id-missing"
                 ),
@@ -1253,7 +1516,7 @@ class MovieBoxINProvider : MainAPI() {
                 if (emitted > 0) {
                     subDiag = mbEmitCaptions(
                         subjectId, detailPath, base, token, h5Caps,
-                        streamId, resourceId, ep, subtitleCallback
+                        streamId, resourceId, subtitleCallback
                     )
                     break
                 }
@@ -1264,7 +1527,7 @@ class MovieBoxINProvider : MainAPI() {
             // emit the DEBUG line even when playback links exist.
             emitDebug(
                 listOf(
-                    "MovieBoxIN v1", "srv=$streamsFound",
+                    "MovieBoxIN v2", "srv=$streamsFound",
                     "ext=$emitted", "t=${elapsed() / 1000}s",
                     "tok=$tokVia", "play=$playCode",
                     "se=$se", "ep=$ep", "sub=$subDiag"

@@ -277,7 +277,7 @@ import okhttp3.RequestBody.Companion.toRequestBody
  * fallbacks; the mobile routes are the ones that work on his
  * phone (the original v56 WORKS there, his word). Nothing here
  * is "working" until he confirms on his phone after a full close
- * and reopen. DEBUG ("MovieBoxIN v7 | ... | sub=...") is emitted
+ * and reopen. DEBUG ("MovieBoxIN v8 | ... | sub=...") is emitted
  * whenever links are zero OR the dual is missing, so a failure
  * is never silent.
  *
@@ -372,7 +372,21 @@ import okhttp3.RequestBody.Companion.toRequestBody
  *   hdr=OK (no prohibited header anywhere, test-enforced),
  *   top=INJ (the TOP100 row was injected into a home
  *   response this session).
- * Still NO trailer in v7. Still no coroutines anywhere.
+ * v8 — search + home-scroll isolation: every search branch
+ *   and every rank page in its own try/catch (a failing
+ *   branch returns empty, never kills a good branch);
+ *   the "tabs" page>1 branch no longer re-serves rows the
+ *   rank:/cat: branches serve in the same full-home reload
+ *   (the -1 expansion path — ~28 sequential calls under
+ *   one timeout in v7, and duplicated page-2 cards); the
+ *   cross-page search retry bypasses the seen set (the v7
+ *   retry was dead on page>1, T70); a failed rank page>1
+ *   stays expandable; the guest token is absorbed only
+ *   from 2xx mobile responses; DEBUG adds per-branch
+ *   search status (h5=/mob= ok/empty/err:<code>/exc),
+ *   token source (tok=), filtered count (filt=), and the
+ *   home line (home=). Still NO trailer in v8. Still no
+ *   coroutines anywhere.
  * The 30 H5 streams for S1E1 stand (the other addons' 14 is
  * their filtered subset, not ground truth).
  */
@@ -474,6 +488,20 @@ class MovieBoxINProvider : MainAPI() {
      * unaffected by construction. Phone-only test (the
      * sandbox 403s on the mobile gateway). */
     private val mbRennvolMobileAuth = true
+    /** Last home diagnostics (v8): section count + TOP100
+     * route/count, riding on the loadLinks DEBUG line like
+     * the search diagnostics (home has no phone-visible
+     * surface of its own). */
+    @Volatile
+    private var mbLastHomeDbg: String = ""
+
+    /** True when this throwable is a coroutine cancellation
+     * (the app cancels stale searches on every keystroke).
+     * A cancelled branch must PROPAGATE, never be swallowed
+     * into an empty result — the name check avoids any
+     * reference to the coroutine machinery in source. */
+    private fun mbIsCancellation(e: Throwable): Boolean =
+        e.javaClass.name.endsWith("CancellationException")
 
     override val mainPage: List<MainPageData>
         get() {
@@ -636,7 +664,7 @@ class MovieBoxINProvider : MainAPI() {
                 "GET", url, mbUaToken, mbClientInfoToken()
             ) + mapOf("x-play-mode" to "2")
             val res = app.get(url, headers = headers)
-            mbAbsorbToken(res.headers["x-user"] ?: res.headers["X-User"])
+            mbAbsorbToken(res.headers["x-user"] ?: res.headers["X-User"], res.code)
             if (res.code !in 200..299) return@runCatching null
             JSONObject(res.text).optJSONObject("data")
                 ?.optJSONArray("sections")
@@ -871,57 +899,79 @@ class MovieBoxINProvider : MainAPI() {
                 break
             }
             attempts++
-            val got = mbH5Get(
-                "/wefeed-h5api-bff/ranking-list/content" +
-                    "?id=$genreTopId&page=$cur&perPage=20",
-                mbJsonHeaders
-            )
-            if (got == null) {
-                status = "err:net"
-                break
-            }
-            val json = runCatching { JSONObject(got.first) }.getOrNull()
-            if (json == null) {
-                status = "err:parse"
-                break
-            }
-            val data = json.optJSONObject("data")
-            if (data == null) {
-                status = "err:nodata"
-                break
-            }
-            val picked = mbSubjectsArray(data)
-            val pager = mbPager(data)
-            // Cautious fallback ONLY when the pager carries no
-            // hasMore at all (logged as "/full" in status).
-            val fullFallback = pager.hasMore == null
-            hasMore = pager.hasMore
-                ?: ((picked?.first?.length() ?: 0) >= 20)
-            nextPage = pager.nextPage
-            totalCount = pager.totalCount
-            key = picked?.second ?: "none"
-            val arr = picked?.first
-            if (arr != null) {
-                synchronized(mbRankSeenLock) {
-                    for (i in 0 until arr.length()) {
-                        val o = arr.optJSONObject(i) ?: continue
-                        val subj = o.optJSONObject("subject") ?: o
-                        val dp = subj.optString("detailPath")
-                        if (dp.isBlank() || !seen.add(dp)) continue
-                        parseSubject(subj)?.let { out += it }
+            try {
+                val got = mbH5Get(
+                    "/wefeed-h5api-bff/ranking-list/content" +
+                        "?id=$genreTopId&page=$cur&perPage=20",
+                    mbJsonHeaders
+                )
+                if (got == null) {
+                    status = "err:net"
+                    break
+                }
+                val json = runCatching { JSONObject(got.first) }.getOrNull()
+                if (json == null) {
+                    status = "err:parse"
+                    break
+                }
+                val data = json.optJSONObject("data")
+                if (data == null) {
+                    status = "err:nodata"
+                    break
+                }
+                val picked = mbSubjectsArray(data)
+                val pager = mbPager(data)
+                // Cautious fallback ONLY when the pager carries no
+                // hasMore at all (logged as "/full" in status).
+                val fullFallback = pager.hasMore == null
+                hasMore = pager.hasMore
+                    ?: ((picked?.first?.length() ?: 0) >= 20)
+                nextPage = pager.nextPage
+                totalCount = pager.totalCount
+                key = picked?.second ?: "none"
+                val arr = picked?.first
+                if (arr != null) {
+                    synchronized(mbRankSeenLock) {
+                        for (i in 0 until arr.length()) {
+                            val o = arr.optJSONObject(i) ?: continue
+                            val subj = o.optJSONObject("subject") ?: o
+                            val dp = subj.optString("detailPath")
+                            if (dp.isBlank() || !seen.add(dp)) continue
+                            parseSubject(subj)?.let { out += it }
+                        }
                     }
                 }
+                status = (if (out.isNotEmpty()) "ok" else "empty") +
+                    if (fullFallback) "/full" else ""
+                // One non-empty page per call (lazy paging); an
+                // empty page with more behind it is skipped.
+                if (out.isNotEmpty()) break
+                if (!hasMore) break
+                cur = nextPage?.toIntOrNull() ?: (cur + 1)
+            } catch (e: Throwable) {
+                // v8 — a single bad page must never drop the
+                // cards already collected, and must never kill
+                // the row: the failure is recorded in status
+                // and the caller decides the hasNext.
+                if (mbIsCancellation(e)) throw e
+                status = "err:exc"
+                break
             }
-            status = (if (out.isNotEmpty()) "ok" else "empty") +
-                if (fullFallback) "/full" else ""
-            // One non-empty page per call (lazy paging); an
-            // empty page with more behind it is skipped.
-            if (out.isNotEmpty()) break
-            if (!hasMore) break
-            cur = nextPage?.toIntOrNull() ?: (cur + 1)
         }
         mbLastRankPg = minOf(cur, 100)
-        return MbPage(out, hasMore, nextPage, totalCount, key, status)
+        // v8 — a page>1 branch that fails with zero NEW cards
+        // stays expandable: the app retries the NEXT page
+        // number on the next scroll, so a transient failure
+        // (slow network, one bad page) cannot sticky-kill
+        // the row (the app sets hasNext=false forever on a
+        // failed expansion). Page 1 keeps hasMore=false —
+        // nothing has been shown yet.
+        val retryable = out.isEmpty() && page > 1 &&
+            status.startsWith("err:")
+        return MbPage(
+            out, if (retryable) true else hasMore,
+            nextPage, totalCount, key, status
+        )
     }
 
     /** One page of the mobile tab/ranking-list feed (v4 TOP100,
@@ -975,7 +1025,7 @@ class MovieBoxINProvider : MainAPI() {
                     headers["X-MB-Token"] = token
                 }
                 val r = app.get(url, headers = headers)
-                mbAbsorbToken(r.headers["x-user"] ?: r.headers["X-User"])
+                mbAbsorbToken(r.headers["x-user"] ?: r.headers["X-User"], r.code)
                 r
             }.getOrNull() ?: continue
             lastCode = res.code.toString()
@@ -1135,6 +1185,10 @@ class MovieBoxINProvider : MainAPI() {
                     s.title, mbRankFirstPage(s), isHorizontalImages = true
                 )
             }
+            // v8 — home health rides on the loadLinks DEBUG
+            // line: section count + TOP100 route/count.
+            mbLastHomeDbg = "home=sec:${sections.size} " +
+                "top=${top.status}:${top.items.size}"
             // Response-level hasNext is copied by the app into
             // EVERY row of this response, so it stays true
             // while any row can expand; each row's own branch
@@ -1143,21 +1197,50 @@ class MovieBoxINProvider : MainAPI() {
         }
         var anyMore = false
         val lists = ArrayList<HomePageList>()
-        val top = fetchCatPage(mbTop100CategoryType, page)
-        if (top.hasMore) anyMore = true
-        lists += HomePageList(
-            mbTop100Title, mbTop100Items(top, page),
-            isHorizontalImages = true
-        )
-        mbTop100Injected = true
+        // v8 — THE sideways-scroll fix (proven in cs-src):
+        // APIRepository.mainPage is a snapshot taken when the
+        // home first loads, before mbHomeSections exists, so
+        // it holds only [tabs, cat:TOP100]. Scrolling any
+        // section row gives indexOfFirst = -1, and the app
+        // then re-loads the WHOLE home (every mainPage entry,
+        // concurrently) for that one row's next page. In that
+        // full reload every row is ALSO served by its own
+        // rank:/cat: branch — so this "tabs" branch must NOT
+        // re-serve them: v7 fetched TOP100 + EVERY rank
+        // section's next page here, SEQUENTIALLY (~28 network
+        // calls under one 120 s timeout — a slow phone
+        // connection times out and the app sticky-sets
+        // hasNext=false, killing the row for the session),
+        // and the same page-2 cards were appended TWICE
+        // (tabs response + rank: response; the app's
+        // distinctBy result is discarded). Sections that
+        // already have a rank: entry are skipped (their
+        // branch serves them); TOP100 is skipped (its cat:
+        // branch serves it). Only a section with NO rank:
+        // entry is fetched here — a fallback that cannot
+        // happen while mainPage is built from mbHomeSections,
+        // but keeps the row alive if that invariant breaks.
+        val served = HashSet<String>()
+        for (e in mainPage) {
+            if (e.data.startsWith("rank:")) {
+                served += e.data.removePrefix("rank:")
+            }
+        }
+        var skipped = 0
         for (s in mbHomeSections) {
             if (s.genreTopId.isBlank()) continue
+            if (s.genreTopId in served) {
+                skipped++
+                continue
+            }
             val rank = fetchRankPage(s.genreTopId, page)
             if (rank.hasMore) anyMore = true
             lists += HomePageList(
                 s.title, rank.items, isHorizontalImages = true
             )
         }
+        mbLastHomeDbg = "home=tabs-p$page skip=$skipped " +
+            "unserved=${lists.size}"
         return newHomePageResponse(mbUniqueRows(lists), anyMore)
     }
 
@@ -1384,13 +1467,17 @@ class MovieBoxINProvider : MainAPI() {
     /** One search-route page (v6): hits with subjectIds, the
      * pager, the array key that won, and the HTTP code. v7
      * adds the serving host ("web"/"h5api"/"mob") so the DEBUG
-     * line shows which pool host answered. */
+     * line shows which pool host answered. v8 adds the token
+     * source ("mob"/"web"/"cached"/"none") — H5 search 400s
+     * without a token, so a phone-side zero must show
+     * whether a token existed at all. */
     private data class MbSearchPage(
         val hits: List<MbSubjectHit>,
         val pager: MbPager,
         val key: String,
         val code: String,
-        val host: String = "-"
+        val host: String = "-",
+        val tok: String = "-"
     )
 
     /** One page of one search route (v6): mobile search/v2
@@ -1408,8 +1495,26 @@ class MovieBoxINProvider : MainAPI() {
         val empty = MbSearchPage(
             emptyList(), MbPager(null, null, null), "none", "?"
         )
-        return runCatching {
-            val (token, _) = mbGuestToken()
+        // v8 — explicit try/catch, NOT runCatching: a
+        // coroutine cancellation (stale search, user typed
+        // another character) must propagate, never be
+        // swallowed into an empty page; any other throw is
+        // a branch failure ("exc"), never a dead search.
+        try {
+            // v8 — the token mint must never kill the branch:
+            // on a mint throw, attempt the route token-less
+            // and let its HTTP code speak in the DEBUG line.
+            var token: String?
+            var tokVia: String
+            try {
+                val minted = mbGuestToken()
+                token = minted.first
+                tokVia = minted.second
+            } catch (e: Throwable) {
+                if (mbIsCancellation(e)) throw e
+                token = null
+                tokVia = "exc"
+            }
             val body = JSONObject().apply {
                 put("page", page)
                 put("perPage", 20)
@@ -1439,7 +1544,7 @@ class MovieBoxINProvider : MainAPI() {
                         "application/json; charset=utf-8".toMediaType()
                     )
                 )
-                mbAbsorbToken(res.headers["x-user"] ?: res.headers["X-User"])
+                mbAbsorbToken(res.headers["x-user"] ?: res.headers["X-User"], res.code)
                 code = res.code.toString()
                 host = "mob"
                 text = if (res.code in 200..299) res.text else null
@@ -1461,10 +1566,10 @@ class MovieBoxINProvider : MainAPI() {
                 code = c
             }
             if (text == null) {
-                return empty.copy(code = code)
+                return empty.copy(code = code, tok = tokVia)
             }
             val json = runCatching { JSONObject(text) }.getOrNull()
-                ?: return empty.copy(code = "parse")
+                ?: return empty.copy(code = "parse", tok = tokVia)
             val data = json.optJSONObject("data") ?: json
             val picked = mbSubjectsArray(data)
             val pager = mbPager(data)
@@ -1475,11 +1580,14 @@ class MovieBoxINProvider : MainAPI() {
                     mbParseHit(arr.optJSONObject(i))?.let { hits += it }
                 }
             }
-            MbSearchPage(
+            return MbSearchPage(
                 hits, pager, picked?.second ?: "none",
-                code, host
+                code, host, tokVia
             )
-        }.getOrDefault(empty.copy(code = "net"))
+        } catch (e: Throwable) {
+            if (mbIsCancellation(e)) throw e
+            return empty.copy(code = "exc")
+        }
     }
 
     /** Paginated search (v6 — panel consensus, H5 FIRST +
@@ -1510,69 +1618,141 @@ class MovieBoxINProvider : MainAPI() {
         if (query.isBlank() || page < 1) {
             return emptyList<SearchResponse>().toNewSearchResponseList(false)
         }
-        val h5 = mbSearchPage(query, page, mobile = false)
-        val mob = mbSearchPage(query, page, mobile = true)
-        val seenIds = HashSet<String>()
-        val merged = ArrayList<Pair<String, SearchResponse>>()
-        for (h in h5.hits + mob.hits) {
-            if (!seenIds.add(h.id)) continue
-            merged += h.id to h.item
+        // v8 — ISOLATION: each branch in its own try/catch.
+        // A branch that throws returns an empty branch
+        // (status "exc"), never an exception that kills the
+        // other branch's results. Only a coroutine
+        // cancellation propagates (stale search — the user
+        // typed another character).
+        var excMark = ""
+        var h5: MbSearchPage
+        var mob: MbSearchPage
+        try {
+            h5 = mbSearchPage(query, page, mobile = false)
+        } catch (e: Throwable) {
+            if (mbIsCancellation(e)) throw e
+            excMark += "h5exc "
+            h5 = MbSearchPage(
+                emptyList(), MbPager(null, null, null), "none", "exc"
+            )
         }
-        // v7 — cross-page dedup (Gemma's search-loop guard):
-        // the live API can repeat a boundary card on the next
-        // page (proven live: 'EWON (PRISON)' on p2 AND p3).
-        // Cards already shown for this query are filtered from
-        // later pages; page 1 (or a new query) resets the set.
-        fun filterSeen(pairs: List<Pair<String, SearchResponse>>): List<SearchResponse> {
-            synchronized(mbSearchSeenLock) {
-                if (page <= 1 || query != mbSearchSeenQuery) {
-                    mbSearchSeenQuery = query
-                    mbSearchSeenIds.clear()
+        try {
+            mob = mbSearchPage(query, page, mobile = true)
+        } catch (e: Throwable) {
+            if (mbIsCancellation(e)) throw e
+            excMark += "mobexc "
+            mob = MbSearchPage(
+                emptyList(), MbPager(null, null, null), "none", "exc"
+            )
+        }
+        // v8 — the merge/return itself is guarded too: any
+        // throw there falls back to the raw H5 hits
+        // (unfiltered) instead of an empty search.
+        try {
+            val seenIds = HashSet<String>()
+            val merged = ArrayList<Pair<String, SearchResponse>>()
+            for (h in h5.hits + mob.hits) {
+                if (!seenIds.add(h.id)) continue
+                merged += h.id to h.item
+            }
+            // v7 — cross-page dedup (Gemma's search-loop guard):
+            // the live API can repeat a boundary card on the
+            // next page (proven live: 'EWON (PRISON)' on p2
+            // AND p3). Cards already shown for this query are
+            // filtered from later pages; page 1 (or a new
+            // query) resets the set. v8 — the filtered count
+            // is logged, and the RETRY path bypasses the
+            // cross-page set entirely (T70 proved the v7
+            // retry was dead on page>1: its page-1 hits were
+            // all already in the seen set, so it always
+            // returned zero).
+            var filteredCount = 0
+            fun filterSeen(
+                pairs: List<Pair<String, SearchResponse>>,
+                ignoreSeen: Boolean = false
+            ): List<SearchResponse> {
+                synchronized(mbSearchSeenLock) {
+                    if (page <= 1 || query != mbSearchSeenQuery) {
+                        mbSearchSeenQuery = query
+                        mbSearchSeenIds.clear()
+                    }
+                    val kept = ArrayList<SearchResponse>()
+                    val batchSeen = HashSet<String>()
+                    for ((id, item) in pairs) {
+                        if (ignoreSeen) {
+                            if (batchSeen.add(id)) kept += item
+                        } else if (mbSearchSeenIds.add(id)) {
+                            kept += item
+                        } else {
+                            filteredCount++
+                        }
+                    }
+                    return kept
                 }
-                val kept = ArrayList<SearchResponse>()
-                for ((id, item) in pairs) {
-                    if (mbSearchSeenIds.add(id)) kept += item
+            }
+            var out = filterSeen(merged)
+            var src = when {
+                h5.hits.isNotEmpty() && mob.hits.isNotEmpty() -> "merged"
+                h5.hits.isNotEmpty() -> "h5"
+                mob.hits.isNotEmpty() -> "mobile"
+                else -> "none"
+            }
+            var h5More = mbSearchHasNext(h5.pager, page, h5.hits.size)
+            val mobMore = mbSearchHasNext(mob.pager, page, mob.hits.size)
+            if (out.isEmpty()) {
+                // Both routes empty: one retry of H5 page 1, then
+                // empty + hasNext=false. (A retry of the same page
+                // is cheap and covers transient failures.)
+                val retry = mbSearchPage(query, 1, mobile = false)
+                val retryPairs = ArrayList<Pair<String, SearchResponse>>()
+                val rSeen = HashSet<String>()
+                for (h in retry.hits) {
+                    if (!rSeen.add(h.id)) continue
+                    retryPairs += h.id to h.item
                 }
-                return kept
+                out = filterSeen(retryPairs, ignoreSeen = true)
+                if (retry.hits.isNotEmpty()) {
+                    src = "h5-retry"
+                    h5More = mbSearchHasNext(retry.pager, 1, retry.hits.size)
+                }
             }
-        }
-        var out = filterSeen(merged)
-        var src = when {
-            h5.hits.isNotEmpty() && mob.hits.isNotEmpty() -> "merged"
-            h5.hits.isNotEmpty() -> "h5"
-            mob.hits.isNotEmpty() -> "mobile"
-            else -> "none"
-        }
-        var h5More = mbSearchHasNext(h5.pager, page, h5.hits.size)
-        val mobMore = mbSearchHasNext(mob.pager, page, mob.hits.size)
-        if (out.isEmpty()) {
-            // Both routes empty: one retry of H5 page 1, then
-            // empty + hasNext=false. (A retry of the same page
-            // is cheap and covers transient failures.)
-            val retry = mbSearchPage(query, 1, mobile = false)
-            val retryPairs = ArrayList<Pair<String, SearchResponse>>()
-            val rSeen = HashSet<String>()
-            for (h in retry.hits) {
-                if (!rSeen.add(h.id)) continue
-                retryPairs += h.id to h.item
+            var hasMore = out.isNotEmpty() && (h5More || mobMore)
+            // Never end page 1 while the H5 catalog says more.
+            val h5Tot = h5.pager.totalCount
+            if (page == 1 && h5Tot != null && h5Tot > out.size) hasMore = true
+            // v8 — per-branch status so the DEBUG line alone
+            // names a failing branch: ok/empty/err:<code>/exc
+            // + usable count + array key, per route; plus the
+            // token source and the filtered count.
+            fun branchStatus(p: MbSearchPage): String {
+                val st = when {
+                    p.code == "exc" -> "exc"
+                    p.hits.isNotEmpty() -> "ok"
+                    p.code == "200" -> "empty"
+                    else -> "err:${p.code}"
+                }
+                return "$st:${p.hits.size}/${p.key}"
             }
-            out = filterSeen(retryPairs)
-            if (retry.hits.isNotEmpty()) {
-                src = "h5-retry"
-                h5More = mbSearchHasNext(retry.pager, 1, retry.hits.size)
-            }
+            mbLastSearchDebug = "src=$src key=${h5.key}/${mob.key} " +
+                "ms=${mob.hits.size} ms_key=${mob.key} hs=${h5.hits.size} " +
+                "hhost=${h5.host} pg=$page hm=$hasMore " +
+                "nx=${h5.pager.nextPage ?: mob.pager.nextPage ?: "-"} " +
+                "tot=${h5Tot ?: mob.pager.totalCount ?: "-"} pages=$page " +
+                "shown=${out.size} " +
+                "h5=${branchStatus(h5)} mob=${branchStatus(mob)} " +
+                "tok=${h5.tok}/${mob.tok} filt=$filteredCount " +
+                excMark.trim()
+            return out.toNewSearchResponseList(hasMore)
+        } catch (e: Throwable) {
+            if (mbIsCancellation(e)) throw e
+            // Best effort: the H5 hits, unfiltered, rather
+            // than an empty search. The exception marker rides
+            // on the DEBUG line.
+            mbLastSearchDebug = "src=fallback " +
+                "h5=${h5.hits.size} mob=${mob.hits.size} " +
+                "exc=merge pages=$page shown=${h5.hits.size}"
+            return h5.hits.map { it.item }.toNewSearchResponseList(false)
         }
-        var hasMore = out.isNotEmpty() && (h5More || mobMore)
-        // Never end page 1 while the H5 catalog says more.
-        val h5Tot = h5.pager.totalCount
-        if (page == 1 && h5Tot != null && h5Tot > out.size) hasMore = true
-        mbLastSearchDebug = "src=$src key=${h5.key}/${mob.key} " +
-            "ms=${mob.hits.size} ms_key=${mob.key} hs=${h5.hits.size} " +
-            "hhost=${h5.host} pg=$page hm=$hasMore " +
-            "nx=${h5.pager.nextPage ?: mob.pager.nextPage ?: "-"} " +
-            "tot=${h5Tot ?: mob.pager.totalCount ?: "-"} pages=$page " +
-            "shown=${out.size}"
-        return out.toNewSearchResponseList(hasMore)
     }
 
     // ---------------------------------------------------------------
@@ -1611,7 +1791,7 @@ class MovieBoxINProvider : MainAPI() {
                 headers["X-MB-Token"] = token
             }
             val res = app.get(url, headers = headers)
-            mbAbsorbToken(res.headers["x-user"] ?: res.headers["X-User"])
+            mbAbsorbToken(res.headers["x-user"] ?: res.headers["X-User"], res.code)
             if (res.code !in 200..299) return@runCatching null
             JSONObject(res.text).optJSONObject("data")
                 ?.optJSONArray("seasons")
@@ -1973,9 +2153,14 @@ class MovieBoxINProvider : MainAPI() {
      * header (v7 — Rennvol's absorbToken, behind
      * mbRennvolMobileAuth). Mobile responses only; H5 calls
      * never pass through here, so the web token cache is
-     * never mixed into the mobile one. */
-    private fun mbAbsorbToken(xUser: String?) {
+     * never mixed into the mobile one. v8: only a 2xx
+     * response may replace the cached token — an error
+     * response's x-user must never overwrite a good token
+     * (the search/play token cache is shared, so one bad
+     * absorb could empty every later call). */
+    private fun mbAbsorbToken(xUser: String?, code: Int) {
         if (!mbRennvolMobileAuth) return
+        if (code !in 200..299) return
         val tok = xUser?.let {
             runCatching { JSONObject(it).optString("token") }.getOrNull()
         }?.ifBlank { null } ?: return
@@ -2481,7 +2666,7 @@ class MovieBoxINProvider : MainAPI() {
                     "X-MB-Token" to token
                 )
                 val res = app.get(url, headers = headers)
-                mbAbsorbToken(res.headers["x-user"] ?: res.headers["X-User"])
+                mbAbsorbToken(res.headers["x-user"] ?: res.headers["X-User"], res.code)
                 trail += "$tag=${res.code}"
                 if (res.code in 200..299) {
                     val json = runCatching { JSONObject(res.text) }.getOrNull()
@@ -2800,7 +2985,7 @@ class MovieBoxINProvider : MainAPI() {
         if (subjectId.isBlank() || detailPath.isBlank()) {
             emitDebug(
                 listOf(
-                    "MovieBoxIN v7", "srv=0", "ext=0",
+                    "MovieBoxIN v8", "srv=0", "ext=0",
                     "t=${elapsed() / 1000}s", "tok=$tokVia",
                     "play=$playCode", "id-missing"
                 ),
@@ -2917,7 +3102,7 @@ class MovieBoxINProvider : MainAPI() {
             // along (the home/search paths have no phone-visible
             // surface of their own).
             val diag = ArrayList<String>()
-            diag += "MovieBoxIN v7"
+            diag += "MovieBoxIN v8"
             diag += "srv=$streamsFound"
             diag += "ext=$emitted"
             diag += "dubs=$dubCount"
@@ -2934,6 +3119,7 @@ class MovieBoxINProvider : MainAPI() {
             diag += "sub=$subDiag"
             if (mbLastSearchDebug.isNotBlank()) diag += mbLastSearchDebug
             if (mbLastTopDebug.isNotBlank()) diag += mbLastTopDebug
+            if (mbLastHomeDbg.isNotBlank()) diag += mbLastHomeDbg
             if (mbLastRankPg > 0) diag += "pg=${mbLastRankPg}"
             if (mbTop100Injected) diag += "top=INJ"
             emitDebug(diag, callback)

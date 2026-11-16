@@ -277,7 +277,7 @@ import okhttp3.RequestBody.Companion.toRequestBody
  * fallbacks; the mobile routes are the ones that work on his
  * phone (the original v56 WORKS there, his word). Nothing here
  * is "working" until he confirms on his phone after a full close
- * and reopen. DEBUG ("MovieBoxIN v14 | ... | sub=...") is emitted
+ * and reopen. DEBUG ("MovieBoxIN v15 | ... | sub=...") is emitted
  * whenever links are zero OR the dual is missing, so a failure
  * is never silent.
  *
@@ -1283,7 +1283,7 @@ class MovieBoxINProvider : MainAPI() {
         // the card reads as a contradiction (HTTP 200 = OK,
         // yet a failure card).
         val detail = if (code == "200") " بلا عناوين" else ""
-        val title = "⚠ v14 TOP100 غير متاحة — المصدر: $route، الحالة: $code$detail"
+        val title = "⚠ v15 TOP100 غير متاحة — المصدر: $route، الحالة: $code$detail"
         return newMovieSearchResponse(
             title, "mbdiag://top100/p$page/err-$code", TvType.Movie
         )
@@ -1308,7 +1308,7 @@ class MovieBoxINProvider : MainAPI() {
         mobStatus: String,
         tok: String
     ): SearchResponse {
-        val title = "⚠ v14 بحث فارغ — h5=$h5Status mob=$mobStatus tok=$tok"
+        val title = "⚠ v15 بحث فارغ — h5=$h5Status mob=$mobStatus tok=$tok"
         val slug = "h5-" + h5Status.replace(":", "-").replace("/", "-") +
             "-mob-" + mobStatus.replace(":", "-").replace("/", "-")
         return newMovieSearchResponse(
@@ -3014,62 +3014,118 @@ class MovieBoxINProvider : MainAPI() {
 
     /** Fetch both caption files on the phone's network (which
      * reaches MovieBox), merge locally and host the result on
-     * the subtitle relay. Returns the stored dual URL, or null
-     * when any step fails. */
+     * the subtitle relay. Returns (stored dual URL, stage):
+     * stage is "ok", "fetch-fail" (a file could not be fetched
+     * or came back blank), "parse-fail" (a fetched file parsed
+     * to zero cues), or "store-fail" (the /relay/store POST
+     * failed). fetchText is the caller's cached fetcher — one
+     * URL is fetched once per loadLinks. */
     private suspend fun mbMergeCaptionsLocal(
         araUrl: String,
-        engUrl: String
-    ): String? {
-        return runCatching {
-            val araText = app.get(araUrl).text
-            val engText = app.get(engUrl).text
-            if (araText.isBlank() || engText.isBlank()) return@runCatching null
-            val araCues = mbParseSubCues(araText)
-            val engCues = mbParseSubCues(engText)
-            if (araCues.isEmpty() || engCues.isEmpty()) return@runCatching null
-            val vtt = mbBuildDualVTT(araCues, engCues)
+        engUrl: String,
+        fetchText: suspend (String) -> String?
+    ): Pair<String?, String> {
+        val araText = fetchText(araUrl)
+        val engText = fetchText(engUrl)
+        if (araText == null || engText == null) return null to "fetch-fail"
+        val araCues = mbParseSubCues(araText)
+        val engCues = mbParseSubCues(engText)
+        if (araCues.isEmpty() || engCues.isEmpty()) return null to "parse-fail"
+        val vtt = mbBuildDualVTT(araCues, engCues)
+        val stored = runCatching {
             val res = app.post(
                 "$mbSubsRelayBase/relay/store",
                 data = mapOf("vtt" to vtt)
             )
             JSONObject(res.text).optString("url").ifEmpty { null }
         }.getOrNull()
+        return if (stored != null) stored to "ok" else null to "store-fail"
     }
 
-    /** Emit English, Arabic and (when both exist) the dual from
-     * already-found caption URLs, in his literal order:
-     * «الإنجليزية», «العربية», «الإنجليزية + العربية» (dual).
-     * Returns the sub diagnostic: "ar+en" when the dual option
-     * was emitted, "ar" / "en" for a single side, "ar+mf" when
-     * both sides exist but no dual file could be built (merge +
-     * local fallback both failed — the singles are still
-     * emitted). */
+    /** Emit the dual «الإنجليزية + العربية» FIRST (the default —
+     * cs-src GeneratorPlayer.addAndSelectSubtitles selects
+     * subtitleData.first()), then the singles «الإنجليزية»,
+     * «العربية» — whenever both sides exist, from ANY stage or
+     * dub (v15: candidates from every stage are tried in order,
+     * not just the first-found pair — a bad URL from one stage
+     * must not kill the dual when a later stage holds a good
+     * one for the same language). Relay merge first, local
+     * merge + /relay/store fallback per pair (as in HorrorMovies
+     * v19). Returns the sub diagnostic: "ar+en" when the dual
+     * was emitted, "ar" / "en" for a single side,
+     * "ar+mf:dual=<stage>" when both sides exist but no dual
+     * file could be built — stage is the last failure:
+     * relay-fail (the relay mergesubs GET failed), fetch-fail
+     * (a caption file could not be fetched), parse-fail (a
+     * fetched file parsed to zero cues), store-fail (the
+     * /relay/store POST failed). The singles are still emitted
+     * in that case. */
     private suspend fun mbEmitUnion(
         ara: String?,
         eng: String?,
-        subtitleCallback: (SubtitleFile) -> Unit
+        subtitleCallback: (SubtitleFile) -> Unit,
+        araAlts: List<String> = emptyList(),
+        engAlts: List<String> = emptyList()
     ): String {
-        if (eng != null) subtitleCallback(SubtitleFile("الإنجليزية", eng))
-        if (ara != null) subtitleCallback(SubtitleFile("العربية", ara))
-        if (ara != null && eng != null) {
+        if (ara == null && eng == null) return "en"
+        // Candidate pairs in order: the primary pair first, then
+        // one side swapped for its next candidate (max 3 pairs —
+        // bounded work on a slow phone connection).
+        val pairs = ArrayList<Pair<String, String>>()
+        if (ara != null && eng != null) pairs += ara to eng
+        val araPool = (listOfNotNull(ara) + araAlts).distinct()
+        val engPool = (listOfNotNull(eng) + engAlts).distinct()
+        for (a in araPool) {
+            for (e in engPool) {
+                if (pairs.size >= 3) break
+                val p = a to e
+                if (p !in pairs) pairs += p
+            }
+            if (pairs.size >= 3) break
+        }
+        // One URL is fetched once per loadLinks (shared by the
+        // local-merge attempts of every pair).
+        val fetchCache = HashMap<String, String?>()
+        suspend fun fetchText(url: String): String? {
+            if (fetchCache.containsKey(url)) return fetchCache[url]
+            val t = runCatching {
+                val r = app.get(url, headers = mbJsonHeaders)
+                if (r.code in 200..299) r.text else null
+            }.getOrNull()?.takeIf { !it.isBlank() }
+            fetchCache[url] = t
+            return t
+        }
+        fun emitDualThenSingles(dualUrl: String) {
+            subtitleCallback(SubtitleFile("الإنجليزية + العربية", dualUrl))
+            if (eng != null) subtitleCallback(SubtitleFile("الإنجليزية", eng))
+            if (ara != null) subtitleCallback(SubtitleFile("العربية", ara))
+        }
+        var lastStage = "relay-fail"
+        for ((a, e) in pairs) {
+            // (1) Relay merge first (server-side fetch + merge).
             val mergeUrl = "$mbSubsRelayBase/relay/mergesubs?eng=" +
-                java.net.URLEncoder.encode(eng, "UTF-8") +
-                "&ara=" + java.net.URLEncoder.encode(ara, "UTF-8")
+                java.net.URLEncoder.encode(e, "UTF-8") +
+                "&ara=" + java.net.URLEncoder.encode(a, "UTF-8")
             val mergeOk = runCatching {
                 val r = app.get(mergeUrl)
                 r.code in 200..299 && r.text.contains("WEBVTT")
             }.getOrDefault(false)
             if (mergeOk) {
-                subtitleCallback(SubtitleFile("الإنجليزية + العربية", mergeUrl))
+                emitDualThenSingles(mergeUrl)
                 return "ar+en"
             }
-            val stored = mbMergeCaptionsLocal(ara, eng)
+            // (2) Local merge fallback for the same pair.
+            val (stored, stage) = mbMergeCaptionsLocal(a, e) { url -> fetchText(url) }
             if (stored != null) {
-                subtitleCallback(SubtitleFile("الإنجليزية + العربية", stored))
+                emitDualThenSingles(stored)
                 return "ar+en"
             }
-            return "ar+mf"
+            lastStage = stage
         }
+        // No pair built a dual — singles only (unchanged).
+        if (eng != null) subtitleCallback(SubtitleFile("الإنجليزية", eng))
+        if (ara != null) subtitleCallback(SubtitleFile("العربية", ara))
+        if (ara != null && eng != null) return "ar+mf:dual=$lastStage"
         if (ara != null) return "ar"
         return "en"
     }
@@ -3267,11 +3323,22 @@ class MovieBoxINProvider : MainAPI() {
         val dubTriedIds = ArrayList<String>()
         var ara: String? = seedAra
         var eng: String? = seedEng
+        // v15 — later stages may hold a fetchable URL for a
+        // language whose first-found URL is dead: keep up to 2
+        // alternates per side for the dual attempts.
+        val araAlts = ArrayList<String>()
+        val engAlts = ArrayList<String>()
         if (ara != null || eng != null) trail += "seed=ok"
         fun absorb(arr: JSONArray?) {
             val (a, e) = mbPickCaptions(arr)
-            if (ara == null) ara = a
-            if (eng == null) eng = e
+            if (a != null) {
+                if (ara == null) ara = a
+                else if (a != ara && a !in araAlts && araAlts.size < 2) araAlts += a
+            }
+            if (e != null) {
+                if (eng == null) eng = e
+                else if (e != eng && e !in engAlts && engAlts.size < 2) engAlts += e
+            }
         }
         fun bothFound(): Boolean = ara != null && eng != null
         // One mobile caption GET: signed headers like every
@@ -3491,13 +3558,19 @@ class MovieBoxINProvider : MainAPI() {
         }
         // v7 — dedupe by language code before the dual build:
         // if the same file was picked for both languages (one
-        // entry labeled twice), keep it once (Arabic) instead
-        // of merging a file with itself.
+        // entry labeled twice), drop the English side and
+        // promote its next candidate instead of merging a file
+        // with itself.
         if (ara != null && ara == eng) {
-            eng = null
             trail += "dupcap=1"
+            eng = engAlts.firstOrNull()
+            if (eng != null) engAlts.removeAt(0)
         }
-        return mbEmitUnion(ara, eng, subtitleCallback)
+        val union = mbEmitUnion(ara, eng, subtitleCallback, araAlts, engAlts)
+        if (union.startsWith("ar+mf")) {
+            return union + "|st=" + trail.takeLast(3).joinToString("/")
+        }
+        return union
     }
 
     /** Dub subjects for a title (v5): H5 detail's
@@ -3757,7 +3830,7 @@ class MovieBoxINProvider : MainAPI() {
             // "id-missing" the v12 screenshot showed.
             emitDebug(
                 listOf(
-                    "MovieBoxIN v14", "srv=0", "ext=0",
+                    "MovieBoxIN v15", "srv=0", "ext=0",
                     "t=${elapsed() / 1000}s", "tok=$tokVia",
                     "play=$playCode", "id-missing",
                     mbLastLoadDiag.ifBlank { "load=?" }
@@ -4011,7 +4084,7 @@ class MovieBoxINProvider : MainAPI() {
             // along (the home/search paths have no phone-visible
             // surface of their own).
             val diag = ArrayList<String>()
-            diag += "MovieBoxIN v14"
+            diag += "MovieBoxIN v15"
             diag += "srv=$streamsFound"
             diag += "ext=$emitted"
             diag += "dubs=$dubCount"

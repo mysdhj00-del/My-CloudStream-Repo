@@ -277,7 +277,7 @@ import okhttp3.RequestBody.Companion.toRequestBody
  * fallbacks; the mobile routes are the ones that work on his
  * phone (the original v56 WORKS there, his word). Nothing here
  * is "working" until he confirms on his phone after a full close
- * and reopen. DEBUG ("MovieBoxIN v12 | ... | sub=...") is emitted
+ * and reopen. DEBUG ("MovieBoxIN v13 | ... | sub=...") is emitted
  * whenever links are zero OR the dual is missing, so a failure
  * is never silent.
  *
@@ -574,6 +574,13 @@ class MovieBoxINProvider : MainAPI() {
      * surface of its own). */
     @Volatile
     private var mbLastHomeDbg: String = ""
+    /** Last load() resolution for a subjectId-keyed card
+     * (v13): which step of loadBySubjectId failed, e.g.
+     * "load=h5:fail mob:403" — rides on the loadLinks DEBUG
+     * line so the phone names the failed step instead of
+     * the generic "id-missing". */
+    @Volatile
+    private var mbLastLoadDiag: String = ""
 
     /** True when this throwable is a coroutine cancellation
      * (the app cancels stale searches on every keystroke).
@@ -1276,7 +1283,7 @@ class MovieBoxINProvider : MainAPI() {
         // the card reads as a contradiction (HTTP 200 = OK,
         // yet a failure card).
         val detail = if (code == "200") " بلا عناوين" else ""
-        val title = "⚠ v12 TOP100 غير متاحة — المصدر: $route، الحالة: $code$detail"
+        val title = "⚠ v13 TOP100 غير متاحة — المصدر: $route، الحالة: $code$detail"
         return newMovieSearchResponse(
             title, "mbdiag://top100/p$page/err-$code", TvType.Movie
         )
@@ -1301,7 +1308,7 @@ class MovieBoxINProvider : MainAPI() {
         mobStatus: String,
         tok: String
     ): SearchResponse {
-        val title = "⚠ v12 بحث فارغ — h5=$h5Status mob=$mobStatus tok=$tok"
+        val title = "⚠ v13 بحث فارغ — h5=$h5Status mob=$mobStatus tok=$tok"
         val slug = "h5-" + h5Status.replace(":", "-").replace("/", "-") +
             "-mob-" + mobStatus.replace(":", "-").replace("/", "-")
         return newMovieSearchResponse(
@@ -2147,7 +2154,17 @@ class MovieBoxINProvider : MainAPI() {
     private suspend fun movieFallback(url: String): LoadResponse {
         val name = url.trimEnd('/').substringAfterLast('/')
             .replace('-', ' ').trim().ifBlank { "MovieBox" }
-        return newMovieLoadResponse(name, url, TvType.Movie, mbData(url, name, "", 0, 0))
+        // v13 — a subjectId-keyed card ("<sid>|0|0", or the
+        // literally reversed "0|0|<sid>") keeps its id in the
+        // episode data even when detail resolution failed, so
+        // loadLinks can still try the mobile play-info route
+        // by subjectId instead of dying with an empty id (the
+        // v12 Naruto failure: movieFallback passed "" and
+        // loadLinks bailed with "id-missing").
+        val sid = if (url.contains("|")) {
+            Regex("""\d{10,}""").findAll(url).lastOrNull()?.value ?: ""
+        } else ""
+        return newMovieLoadResponse(name, url, TvType.Movie, mbData(url, name, sid, 0, 0))
     }
 
     /** Seasons from the mobile season-info endpoint (IN's route):
@@ -2187,6 +2204,13 @@ class MovieBoxINProvider : MainAPI() {
      * still lists title/episodes, but playback needs the
      * H5-resolved detailPath — documented, not faked. */
     private suspend fun loadBySubjectId(sid: String, url: String): LoadResponse {
+        // v13 — H5 detail?subjectId= FIRST (proven live T101
+        // for subjects the H5 index holds). T106 proved the
+        // Naruto Shippuden sid is NOT in the H5 index (404
+        // "subject not found") — a mobile-only subject, so
+        // the H5 step fails deterministically here and the
+        // mobile step below is the only resolution path.
+        var h5Code = "fail"
         val h5 = runCatching {
             mbH5Get(
                 "/wefeed-h5api-bff/detail?subjectId=" +
@@ -2199,45 +2223,85 @@ class MovieBoxINProvider : MainAPI() {
         }.getOrNull()
         val h5Subj = h5Data?.optJSONObject("subject")
         if (h5Subj != null && h5Subj.optString("detailPath").isNotBlank()) {
+            mbLastLoadDiag = "load=h5:200"
             val canon = "$mbWebBase/ar/moviedetail/${h5Subj.optString("detailPath")}"
-            return loadFromH5Detail(h5Data, canon)
+            return loadFromH5Detail(h5Data, canon, sid)
         }
-        // Mobile fallback (Rennvol's subject-api/get).
-        val mob = runCatching {
-            val mUrl = "$mbApi3Base/wefeed-mobile-bff/subject-api/get?subjectId=$sid"
-            val headers = mbSignedHeaders(
-                "GET", mUrl, mbUaToken, mbClientInfoToken()
-            ).toMutableMap()
-            val (token, _) = mbGuestToken()
-            if (!token.isNullOrBlank()) {
-                headers["Authorization"] = "Bearer $token"
-                headers["X-MB-Token"] = token
+        h5Code = when {
+            h5 == null -> "fail"
+            h5Subj == null -> "200-nosubj"
+            else -> "200-nodp"
+        }
+        // Mobile fallback (Rennvol's subject-api/get), v13:
+        // the two-host pool with the retry rule (a 403/429/5xx
+        // moves to the next host; first 2xx with a body wins)
+        // — the v12 single-host call failed on the phone with
+        // no surviving evidence, and the single-host shape is
+        // the code-proven suspect. The response shape is read
+        // tolerantly (data / subject / data.subject nested),
+        // and the subjectId + title fall back like Rennvol
+        // (subjectId ?: id ?: requested sid; title ?: name).
+        var mobCode = "?"
+        var mobRoot: JSONObject? = null
+        for (base in listOf(mbMobileBase, mbApi3Base)) {
+            val mUrl = "$base/wefeed-mobile-bff/subject-api/get?subjectId=$sid"
+            val res = runCatching {
+                val headers = mbSignedHeaders(
+                    "GET", mUrl, mbUaToken, mbClientInfoToken()
+                ).toMutableMap()
+                val (token, _) = mbGuestToken()
+                if (!token.isNullOrBlank()) {
+                    headers["Authorization"] = "Bearer $token"
+                    headers["X-MB-Token"] = token
+                }
+                val r = app.get(mUrl, headers = headers)
+                mbAbsorbToken(r.headers["x-user"] ?: r.headers["X-User"], r.code)
+                r
+            }.getOrNull() ?: continue
+            mobCode = res.code.toString()
+            if (res.code !in 200..299 || res.text.isBlank()) {
+                if (res.code in listOf(403, 407, 429, 500, 502, 503, 504)) continue
+                break
             }
-            val res = app.get(mUrl, headers = headers)
-            mbAbsorbToken(res.headers["x-user"] ?: res.headers["X-User"], res.code)
-            if (res.code !in 200..299 || res.text.isBlank()) null else res.text
-        }.getOrNull()
+            mobRoot = runCatching { JSONObject(res.text) }.getOrNull()
+            if (mobRoot != null) break
+        }
+        if (mobRoot == null && mobCode == "200") mobCode = "200-empty"
         val mobData = runCatching {
-            val root = JSONObject(mob ?: "")
-            root.optJSONObject("data") ?: root.optJSONObject("subject")
+            val root = mobRoot ?: JSONObject()
+            root.optJSONObject("data")?.optJSONObject("subject")
+                ?: root.optJSONObject("data")
+                ?: root.optJSONObject("subject")
         }.getOrNull()
         if (mobData != null && mobData.length() > 0) {
             val mobDp = mobData.optString("detailPath")
             val canon = if (mobDp.isNotBlank()) {
                 "$mbWebBase/ar/moviedetail/$mobDp"
             } else url
+            mbLastLoadDiag = "load=h5:$h5Code mob:$mobCode"
             val wrapped = JSONObject().put("subject", mobData)
-            return loadFromH5Detail(wrapped, canon)
+            return loadFromH5Detail(wrapped, canon, sid)
         }
+        mbLastLoadDiag = "load=h5:$h5Code mob:$mobCode"
         return movieFallback(url)
     }
 
     override suspend fun load(url: String): LoadResponse {
         // v12 — subjectId-keyed card URL ("<sid>|0|0"): resolve
         // by subjectId first; the moviedetail path below is
-        // unchanged.
+        // unchanged. v13 — tolerant fallback (Rennvol's
+        // extraction): if the strict form does not match, take
+        // the last 10+-digit run in a pipe-separated URL, so a
+        // literally reversed "0|0|<sid>" URL still resolves
+        // (the v12 phone screenshot showed "0|0|<sid>" —
+        // proven by code to be the bidi-flipped rendering of
+        // "<sid>|0|0", since parseSubject is the only producer
+        // of a "|0|0" URL — but the fallback costs nothing).
         val sidKey = Regex("""^(\d{10,})\|0\|0$""")
             .find(url.trim())?.groupValues?.get(1)
+            ?: if (url.contains("|")) {
+                Regex("""\d{10,}""").findAll(url).lastOrNull()?.value
+            } else null
         if (sidKey != null) return loadBySubjectId(sidKey, url)
         val dp = url.substringAfter("/moviedetail/")
             .substringBefore("?").substringBefore("#").trim()
@@ -2261,11 +2325,19 @@ class MovieBoxINProvider : MainAPI() {
      * wrapped as {"subject": ...}). */
     private suspend fun loadFromH5Detail(
         data: JSONObject?,
-        url: String
+        url: String,
+        fallbackSid: String = ""
     ): LoadResponse {
         val subj = data?.optJSONObject("subject")
             ?: return movieFallback(url)
-        val title = subj.optString("title")
+        // v13 — mobile subjects may carry "name" instead of
+        // "title" and "id" instead of "subjectId" (Rennvol
+        // reads both); and a subject that somehow carries
+        // neither still keeps the requested sid, so the
+        // episode data never loses the id (the v12 Naruto
+        // failure: episodes built with "" and loadLinks
+        // bailed with "id-missing").
+        val title = subj.optString("title").ifBlank { subj.optString("name") }
         val poster = subj.optJSONObject("cover")
             ?.optString("url")?.ifBlank { null }
         val desc = subj.optString("description")
@@ -2278,6 +2350,7 @@ class MovieBoxINProvider : MainAPI() {
             if (desc.isNotBlank()) append(desc)
         }.ifBlank { null }
         val subjectId = subj.optString("subjectId")
+            .ifBlank { subj.optString("id") }.ifBlank { fallbackSid }
         // v12 — subjectType 7 is a series too (Rennvol: 2 or 7
         // -> TvSeries), matching parseSubject.
         val isSeries = subj.optInt("subjectType", 1) in listOf(2, 7)
@@ -3435,6 +3508,62 @@ class MovieBoxINProvider : MainAPI() {
         return MbPlayResult(emptyList(), null, playCode, null)
     }
 
+    /** Mobile play-info (v13 — Rennvol's play route by
+     * subjectId, the ONLY play route for a mobile-only
+     * subject: the H5 dubs/play path needs a real
+     * detailPath, which the H5 index never has for such a
+     * subject — T106 proved detail?subjectId= returns 404
+     * "subject not found" for the Naruto Shippuden sid.
+     * Two-host pool + the same signed + Bearer-token shape
+     * as every other mobile call; first 2xx with streams
+     * wins. Streams carry the same fields as the H5 play
+     * response (url, id, resolution(s), signCookie,
+     * signHeaderKey, resourceId). */
+    private suspend fun mbFetchMobilePlay(
+        sid: String,
+        se: Int,
+        ep: Int,
+        token: String
+    ): MbPlayResult {
+        var playCode = "?"
+        for (base in listOf(mbMobileBase, mbApi3Base)) {
+            val playUrl = "$base/wefeed-mobile-bff/subject-api/play-info" +
+                "?subjectId=$sid&se=$se&ep=$ep"
+            val res = runCatching {
+                val headers = mbSignedHeaders(
+                    "GET", playUrl, mbUaToken, mbClientInfoToken()
+                ).toMutableMap()
+                headers["Authorization"] = "Bearer $token"
+                headers["X-MB-Token"] = token
+                val r = app.get(playUrl, headers = headers)
+                mbAbsorbToken(r.headers["x-user"] ?: r.headers["X-User"], r.code)
+                r
+            }.getOrNull() ?: continue
+            playCode = res.code.toString()
+            if (res.code !in 200..299 || res.text.isBlank()) {
+                if (res.code in listOf(403, 407, 429, 500, 502, 503, 504)) continue
+                break
+            }
+            val d = runCatching {
+                val root = JSONObject(res.text)
+                root.optJSONObject("data") ?: root
+            }.getOrNull() ?: continue
+            val streamObjs = ArrayList<JSONObject>()
+            var arr = d.optJSONArray("streams")
+            if (arr == null) arr = d.optJSONObject("data")?.optJSONArray("streams")
+            if (arr != null) {
+                for (i in 0 until arr.length()) {
+                    arr.optJSONObject(i)?.let { streamObjs += it }
+                }
+            }
+            if (streamObjs.isEmpty()) continue
+            val rid = d.optString("resourceId").ifBlank { null }
+                ?: streamObjs[0].optString("resourceId").ifBlank { null }
+            return MbPlayResult(streamObjs, base, playCode, rid)
+        }
+        return MbPlayResult(emptyList(), null, playCode, null)
+    }
+
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -3468,11 +3597,16 @@ class MovieBoxINProvider : MainAPI() {
             callback(link)
         }
         if (subjectId.isBlank() || detailPath.isBlank()) {
+            // v13 — the load() resolution trail rides along,
+            // so the phone names the failed step
+            // ("load=h5:404 mob:403") instead of the bare
+            // "id-missing" the v12 screenshot showed.
             emitDebug(
                 listOf(
-                    "MovieBoxIN v12", "srv=0", "ext=0",
+                    "MovieBoxIN v13", "srv=0", "ext=0",
                     "t=${elapsed() / 1000}s", "tok=$tokVia",
-                    "play=$playCode", "id-missing"
+                    "play=$playCode", "id-missing",
+                    mbLastLoadDiag.ifBlank { "load=?" }
                 ),
                 callback
             )
@@ -3572,6 +3706,69 @@ class MovieBoxINProvider : MainAPI() {
                 }
                 if (emitted >= 40 || elapsed() > 25000) break
             }
+            if (emitted == 0) {
+                // v13 — mobile-only subject (no H5 detailPath):
+                // the H5 dubs/play loop above can never return
+                // streams (it needs a real detailPath), so try
+                // Rennvol's mobile play-info route by subjectId.
+                // Runs only when H5 yielded nothing, so the
+                // proven H5 path keeps priority everywhere.
+                val mobPlay = mbFetchMobilePlay(subjectId, se, ep, token)
+                playCode = mobPlay.code
+                if (mobPlay.base != null && mobPlay.streams.isNotEmpty()) {
+                    if (resourceId == null) resourceId = mobPlay.resourceId
+                    streamsFound += mobPlay.streams.size
+                    val capsHere = ArrayList<Pair<String, String>>()
+                    for (s in mobPlay.streams) {
+                        val id = s.optString("id")
+                        if (id.isBlank()) continue
+                        val surl = mbStreamUrl(s) ?: continue
+                        val fmt = when {
+                            surl.contains(".mpd") -> "DASH"
+                            surl.contains(".m3u8") -> "HLS"
+                            else -> "MP4"
+                        }
+                        if (capsHere.none { it.first == id }) capsHere += id to fmt
+                    }
+                    mainCaps += capsHere
+                    mainStreamIds = mobPlay.streams.mapNotNull { o ->
+                        o.optString("id").ifBlank { null }
+                    }.distinct()
+                    mainPlayBase = mobPlay.base
+                    for ((idx, s) in mobPlay.streams.withIndex()) {
+                        if (emitted >= 40) {
+                            capDropCount += mobPlay.streams.size - idx
+                            break
+                        }
+                        if (elapsed() > 25000) break
+                        val linkUrl = mbStreamUrl(s)
+                        if (linkUrl == null) {
+                            noUrlCount++
+                            continue
+                        }
+                        if (!emittedUrls.add(linkUrl)) {
+                            dupCount++
+                            continue
+                        }
+                        val signCookie = s.optString("signCookie").ifBlank { null }
+                        val signHeaderKey = s.optString("signHeaderKey").ifBlank { null }
+                        val resLabel = s.optString("resolution").ifBlank {
+                            s.optJSONArray("resolutions")
+                                ?.optJSONObject(0)?.optString("resolution")
+                                .orEmpty()
+                        }.ifBlank {
+                            s.optString("resolutions")
+                        }
+                        val q = Regex("""(2160|1440|1080|720|480|360)""")
+                            .find(resLabel)?.groupValues?.get(1)
+                        val label = "MovieBox" + if (q != null) " ${q}p" else ""
+                        emitMovieBoxLink(
+                            linkUrl, label, signCookie, signHeaderKey,
+                            mobPlay.base, detailPath, subjectId, se, ep, counting
+                        )
+                    }
+                }
+            }
             if (emitted > 0) {
                 subDiag = mbEmitCaptions(
                     subjectId, detailPath, mainPlayBase ?: mbWebBase,
@@ -3587,7 +3784,7 @@ class MovieBoxINProvider : MainAPI() {
             // along (the home/search paths have no phone-visible
             // surface of their own).
             val diag = ArrayList<String>()
-            diag += "MovieBoxIN v12"
+            diag += "MovieBoxIN v13"
             diag += "srv=$streamsFound"
             diag += "ext=$emitted"
             diag += "dubs=$dubCount"
@@ -3605,6 +3802,7 @@ class MovieBoxINProvider : MainAPI() {
             if (mbLastSearchDebug.isNotBlank()) diag += mbLastSearchDebug
             if (mbLastTopDebug.isNotBlank()) diag += mbLastTopDebug
             if (mbLastHomeDbg.isNotBlank()) diag += mbLastHomeDbg
+            if (mbLastLoadDiag.isNotBlank()) diag += mbLastLoadDiag
             if (mbLastRankPg > 0) diag += "pg=${mbLastRankPg}"
             if (mbTop100Injected) diag += "top=INJ"
             emitDebug(diag, callback)

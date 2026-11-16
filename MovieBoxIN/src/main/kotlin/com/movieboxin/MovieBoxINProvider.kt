@@ -277,7 +277,7 @@ import okhttp3.RequestBody.Companion.toRequestBody
  * fallbacks; the mobile routes are the ones that work on his
  * phone (the original v56 WORKS there, his word). Nothing here
  * is "working" until he confirms on his phone after a full close
- * and reopen. DEBUG ("MovieBoxIN v10 | ... | sub=...") is emitted
+ * and reopen. DEBUG ("MovieBoxIN v11 | ... | sub=...") is emitted
  * whenever links are zero OR the dual is missing, so a failure
  * is never silent.
  *
@@ -387,6 +387,33 @@ import okhttp3.RequestBody.Companion.toRequestBody
  *   token source (tok=), filtered count (filt=), and the
  *   home line (home=). Still NO trailer in v8. Still no
  *   coroutines anywhere.
+ * v11 (2026-11-16 — his screenshot 16:29: the expanded
+ * "Must-watch Top 100" row showed 6 real cards then 4
+ * IDENTICAL diagnostic cards "TOP100 غير متاحة — المصدر:
+ * mobile، الحالة: 200"):
+ * - The mobile feed returns 200 with zero usable titles on
+ *   pages 2+ (a silent failure). The old TOP100 fallback
+ *   threw away the pager's own verdict and hardcoded
+ *   hasMore=true + err:<code>, so the app paged forever and
+ *   every failed page grew another card. Now the pager is
+ *   trusted: exhausted (hasMore=false) is a clean end
+ *   (status "empty", no card, hasNext=false); anything else
+ *   gets ONE retry only (empty-streak), then pagination ends.
+ * - The diagnostic card appears at most ONCE per load
+ *   (mbTop100DiagShown) and its title now proves the build
+ *   ("v11") and says "200 بلا عناوين" for the 200-empty case.
+ * - The mobile feed parser is Rennvol's subjectsOf for this
+ *   endpoint (mbSubjectsAll: EVERY parseable array, not
+ *   first-wins) — the code-proven suspect for the p2+ empty
+ *   (p1 shows only 6 cards while the app shows 100).
+ * - The cat: branch trusts the TOP100 fetch's own hasMore
+ *   (the old formula forced hasNext=true for every empty
+ *   page, overriding the end decision). TOP100 source
+ *   UNCHANGED (mobile cat:4741626294545400336); if the
+ *   mobile feed truly delivers only 6 titles, that is the
+ *   feed's truth — no invented titles (Western TV in H5,
+ *   8/10, stands as the documented later-decision option).
+ * Still NO trailer in v11. Still no coroutines anywhere.
  * The 30 H5 streams for S1E1 stand (the other addons' 14 is
  * their filtered subset, not ground truth).
  */
@@ -430,6 +457,19 @@ class MovieBoxINProvider : MainAPI() {
      * keys rows by name, HomeViewModel initial load). */
     @Volatile
     private var mbTop100TabCards: List<SearchResponse> = emptyList()
+
+    /** v11 — TOP100 empty-page streak + diagnostic-card guard.
+     * The phone's 16:29 screenshot showed 6 real cards then 4
+     * IDENTICAL diagnostic cards: every failed page (200 with
+     * zero usable titles) grew another card, because the old
+     * fallback hardcoded hasMore=true and mbTop100Items added
+     * a card per failed page. The streak counts CONSECUTIVE
+     * zero-new-card TOP100 pages (reset on any page with real
+     * cards and on page 1): the first stays retryable, the
+     * second ends pagination. The flag allows ONE diagnostic
+     * card per load (reset on the same occasions). */
+    private var mbTop100EmptyStreak = 0
+    private var mbTop100DiagShown = false
 
     /** One parsed list-endpoint page (v6 — the pager contract):
      * items, hasMore from the pager (never from page size while
@@ -985,11 +1025,13 @@ class MovieBoxINProvider : MainAPI() {
      * fallback — both are mobile hosts; the phone reaches them
      * (tok=mob proves the token mint works there), the sandbox
      * gets 403 on both. Response items: the strict
-     * mbSubjectsArray (data.subjects[] in the dex shape, with
-     * the other keys as fallbacks); the pager is read with the
-     * v6 contract (hasMore from the pager only, nextPage as a
-     * STRING). Dedup by detailPath in a per-feed seen-set
-     * (cleared on page 1).
+     * Response items: mbSubjectsAll — Rennvol's subjectsOf
+     * for this endpoint (EVERY parseable array: subjectList
+     * + subjects + items + results[].subjects, v11; the v6
+     * first-wins parser dropped cards split across arrays);
+     * the pager is read with the v6 contract (hasMore from
+     * the pager only, nextPage as a STRING). Dedup by
+     * detailPath in a per-feed seen-set (cleared on page 1).
      * v6 fallbacks — a 403 / non-200 / empty first page does
      * NOT end the row:
      * - any categoryType EXCEPT the TOP100 id: the H5
@@ -999,7 +1041,11 @@ class MovieBoxINProvider : MainAPI() {
      *   list, T55/T56 — a wrong list, not the app's TOP100);
      *   instead the mobile tab-operating "Must-watch Top 100"
      *   section's own subjects (the row's true first page) on
-     *   page 1, and an empty retryable page after that.
+     *   page 1, and an empty page after that — v11: the pager
+     *   is trusted (exhausted = clean end, no card) and any
+     *   other empty page gets ONE retry only (empty-streak),
+     *   then pagination ends; the diagnostic card appears at
+     *   most once per load.
      * The row is NEVER dropped by the caller: this returns the
      * status (ok/empty/err:<code>) + route so the DEBUG line
      * can show top= and the row stays expandable. */
@@ -1011,6 +1057,12 @@ class MovieBoxINProvider : MainAPI() {
             return MbPage(emptyList(), false, null, null, "none", "err:bad-arg")
         }
         val isTop100 = categoryType == mbTop100CategoryType
+        // v11 — a fresh page-1 load is a new incident: reset
+        // the empty-streak and the diagnostic-card guard.
+        if (isTop100 && page <= 1) {
+            mbTop100EmptyStreak = 0
+            mbTop100DiagShown = false
+        }
         val (token, _) = mbGuestToken()
         val bases = listOf(mbMobileBase, mbApi3Base)
         var lastCode = "?"
@@ -1036,7 +1088,15 @@ class MovieBoxINProvider : MainAPI() {
             val json = runCatching { JSONObject(res.text) }.getOrNull()
                 ?: continue
             val data = json.optJSONObject("data") ?: continue
-            val picked = mbSubjectsArray(data) ?: continue
+            // v11 — Rennvol's subjectsOf for THIS endpoint
+            // concatenates EVERY parseable array (subjectList
+            // + subjects + items + results[].subjects); the
+            // v6 first-wins parser drops cards that live in a
+            // second array (the mobile p1 shows only 6 cards
+            // while the app shows 100 — a split response is
+            // the code-proven suspect for the p2+ 200-empty).
+            // H5 fetchRankPage keeps first-wins (proven there).
+            val picked = mbSubjectsAll(data) ?: continue
             val pager = mbPager(data)
             // Cautious fallback ONLY when the pager carries no
             // hasMore at all (logged as "/full" in status).
@@ -1066,10 +1126,21 @@ class MovieBoxINProvider : MainAPI() {
                 picked.second, status
             )
             if (out.isNotEmpty()) {
+                if (isTop100) {
+                    mbTop100EmptyStreak = 0
+                    mbTop100DiagShown = false
+                }
                 updateTopDebug(result, "mobile")
                 return result
             }
+            // v11 — keep the most permissive empty verdict:
+            // if ANY base's pager says more pages exist, the
+            // list is not exhausted (the fallback below must
+            // not call it a clean end on the other base's word).
             if (mobileEmpty == null) mobileEmpty = result
+            else if (result.hasMore && !mobileEmpty.hasMore) {
+                mobileEmpty = result
+            }
         }
         // --- fallback (mobile feed 403 / empty on both bases) ---
         if (isTop100) {
@@ -1083,6 +1154,8 @@ class MovieBoxINProvider : MainAPI() {
                 }
                 val cards = mbTop100TabCards
                 if (cards.isNotEmpty()) {
+                    mbTop100EmptyStreak = 0
+                    mbTop100DiagShown = false
                     val result = MbPage(
                         cards, true, "2", null, "tabs", "ok"
                     )
@@ -1090,9 +1163,28 @@ class MovieBoxINProvider : MainAPI() {
                     return result
                 }
             }
+            // v11 — the old code threw away the pager's own
+            // verdict (mobileEmpty) and hardcoded hasMore=true
+            // with status err:<code>: the app paged forever
+            // and every failed page grew another identical
+            // diagnostic card (the 4-card screenshot, 16:29).
+            // - Pager says exhausted (hasMore=false): a clean
+            //   end, not an error — status "empty", hasNext
+            //   false, NO diagnostic card.
+            // - Anything else: ONE retry only (the streak),
+            //   then pagination ends; the diagnostic card is
+            //   capped at one per load (mbTop100Items).
+            if (mobileEmpty != null && !mobileEmpty.hasMore) {
+                val result = MbPage(
+                    emptyList(), false, null, null, "none", "empty"
+                )
+                updateTopDebug(result, "mobile")
+                return result
+            }
+            mbTop100EmptyStreak++
             val result = MbPage(
-                emptyList(), true, null, null, "none",
-                "err:$lastCode"
+                emptyList(), mbTop100EmptyStreak <= 1, null, null,
+                "none", "err:$lastCode"
             )
             updateTopDebug(result, "mobile")
             return result
@@ -1125,7 +1217,14 @@ class MovieBoxINProvider : MainAPI() {
      * dedups against another's. */
     private fun mbTop100DiagCard(page: Int, status: String, route: String): SearchResponse {
         val code = status.removePrefix("err:")
-        val title = "⚠ TOP100 غير متاحة — المصدر: $route، الحالة: $code"
+        // v11 — the card proves the build on the phone (the
+        // 16:29 screenshot carried no version), and a 200 is
+        // not a server error: it means the call succeeded but
+        // carried zero usable titles. Say so in the title, or
+        // the card reads as a contradiction (HTTP 200 = OK,
+        // yet a failure card).
+        val detail = if (code == "200") " بلا عناوين" else ""
+        val title = "⚠ v11 TOP100 غير متاحة — المصدر: $route، الحالة: $code$detail"
         return newMovieSearchResponse(
             title, "mbdiag://top100/p$page/err-$code", TvType.Movie
         )
@@ -1150,7 +1249,7 @@ class MovieBoxINProvider : MainAPI() {
         mobStatus: String,
         tok: String
     ): SearchResponse {
-        val title = "⚠ v10 بحث فارغ — h5=$h5Status mob=$mobStatus tok=$tok"
+        val title = "⚠ v11 بحث فارغ — h5=$h5Status mob=$mobStatus tok=$tok"
         val slug = "h5-" + h5Status.replace(":", "-").replace("/", "-") +
             "-mob-" + mobStatus.replace(":", "-").replace("/", "-")
         return newMovieSearchResponse(
@@ -1159,9 +1258,17 @@ class MovieBoxINProvider : MainAPI() {
     }
 
     /** TOP100 display items (v7): the real cards, or the one
-     * diagnostic card when the fetch failed. */
+     * diagnostic card when the fetch failed. v11 — at most ONE
+     * diagnostic card per load (mbTop100DiagShown): the phone's
+     * 16:29 screenshot showed the same card 4 times, once per
+     * failed page, because every failed page added its own.
+     * A later failed page in the same load contributes nothing
+     * visible; the streak in fetchCatPage ends pagination
+     * after one retry. */
     private fun mbTop100Items(page: MbPage, num: Int): List<SearchResponse> {
         if (page.items.isEmpty() && page.status.startsWith("err:")) {
+            if (mbTop100DiagShown) return emptyList()
+            mbTop100DiagShown = true
             return listOf(mbTop100DiagCard(num, page.status, "mobile"))
         }
         return page.items
@@ -1356,7 +1463,19 @@ class MovieBoxINProvider : MainAPI() {
                     )
                 } else {
                     val cat = fetchCatPage(ct, page)
-                    val hasNext = !(cat.items.isNotEmpty() && !cat.hasMore)
+                    val hasNext = if (ct == mbTop100CategoryType) {
+                        // v11 — the TOP100 fetch now decides
+                        // itself: a 200-empty page ends
+                        // pagination after one retry (streak),
+                        // and an exhausted pager ends it at
+                        // once. The old formula forced
+                        // hasNext=true for EVERY empty page,
+                        // which overrode that decision and
+                        // paged forever (the 4-card screenshot).
+                        cat.hasMore
+                    } else {
+                        !(cat.items.isNotEmpty() && !cat.hasMore)
+                    }
                     val items = if (ct == mbTop100CategoryType) {
                         mbTop100Injected = true
                         mbTop100Items(cat, page)
@@ -3182,7 +3301,7 @@ class MovieBoxINProvider : MainAPI() {
         if (subjectId.isBlank() || detailPath.isBlank()) {
             emitDebug(
                 listOf(
-                    "MovieBoxIN v10", "srv=0", "ext=0",
+                    "MovieBoxIN v11", "srv=0", "ext=0",
                     "t=${elapsed() / 1000}s", "tok=$tokVia",
                     "play=$playCode", "id-missing"
                 ),
@@ -3299,7 +3418,7 @@ class MovieBoxINProvider : MainAPI() {
             // along (the home/search paths have no phone-visible
             // surface of their own).
             val diag = ArrayList<String>()
-            diag += "MovieBoxIN v10"
+            diag += "MovieBoxIN v11"
             diag += "srv=$streamsFound"
             diag += "ext=$emitted"
             diag += "dubs=$dubCount"

@@ -8,6 +8,7 @@ import com.lagradost.cloudstream3.MainAPI
 import com.lagradost.cloudstream3.MainPageData
 import com.lagradost.cloudstream3.MainPageRequest
 import com.lagradost.cloudstream3.SearchResponse
+import com.lagradost.cloudstream3.SearchResponseList
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.TvType
 import com.lagradost.cloudstream3.app
@@ -17,6 +18,7 @@ import com.lagradost.cloudstream3.newMovieLoadResponse
 import com.lagradost.cloudstream3.newMovieSearchResponse
 import com.lagradost.cloudstream3.newTvSeriesLoadResponse
 import com.lagradost.cloudstream3.newTvSeriesSearchResponse
+import com.lagradost.cloudstream3.toNewSearchResponseList
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
@@ -220,6 +222,51 @@ import okhttp3.RequestBody.Companion.toRequestBody
  * (section-url id + overlap matching, mirror-verified 23/23).
  * Still NO trailer in v4.
  *
+ * v5 (his direct order 2026-11-16 12:00 — «يا رجل، لا داعي
+ * للتشخيص — عندك الإضافات، خذ منها وابدأ، أنا أعطيك الأمر» —
+ * after v4 failed on his phone 09:31 «لا يعمل v4 نفس الوضع»):
+ * the CNC IN copy is the LIMITED one; the OTHER MovieBox
+ * addons (AllForU v96, Rennvol v9 — both studied from their
+ * published files in ~/workspace/movieboxin-addon/candidates/)
+ * search the whole site, bring subtitles correctly, and show
+ * 14 sources for Prison Break vs our srv=5. What v5 takes
+ * from them (proven live via the H5 chain, T45–T52):
+ * - SEARCH is the paginated API now (rennvol's shape): the
+ *   app calls search(query, page) and the base implementation
+ *   wraps the legacy search(query) list with hasNext=false
+ *   ALWAYS (MainAPI.kt:641-655) — that was the structural
+ *   "limited search": one call, no further pages, ever. v5
+ *   overrides search(query, page) itself, one route-page per
+ *   call, hasNext from the route's pager, so the app pages
+ *   through the whole catalog ("prison break" totalCount 128,
+ *   "love" 452 — T48). The response-shape parser now also
+ *   reads data.subjects + data.results[].subjects (rennvol
+ *   subjectsOf, allforu parseSubjects: items first, then
+ *   subjects) — the v4 parser missed "subjects", the mobile
+ *   dex shape.
+ * - SOURCES are ALL of them now (rennvol's 3-stage loadLinks,
+ *   H5-ported): H5 detail gives data.subject.dubs[] (11 for
+ *   PB, 6 for Other Mommy — the app's own picker, verbatim);
+ *   v5 plays EVERY dub subject (main + Arabic sub + French
+ *   dub + ...) and emits every stream, deduped by URL.
+ *   Counted live (T46b): 30 distinct streams / 30 unique
+ *   URLs for PB S1E1 (5+5+2+3+1+3+4+1+1+2+3) — more than
+ *   the 14 the other addons show, and every one a real file.
+ *   The mobile-only stages (resourceDetectors, resource list)
+ *   have NO H5 twin (H5 detail: 0 detectors, T45/T49/T51;
+ *   H5 subject/resource: 404, T47) so they are not ported —
+ *   nothing is faked from them. Labels carry the dub name
+ *   ("MovieBox Arabic sub 1080p") so the player shows which
+ *   encode each source is.
+ * - SUBTITLES gain Phase C: the first MP4 id of each dub
+ *   (T52: French MP4 id -> 1 French caption; other dub ids
+ *   -> 0; the Arabic-sub version's ids -> 0, T36). The ar+en
+ *   union still comes from the main subject's web-play ids
+ *   (Phase B, v4) — dub ids can only add a missing side.
+ * - TOP100 is UNCHANGED (v4's identification stands: neither
+ *   candidate has any TOP100/Top Series string at all).
+ * Still NO trailer in v5.
+ *
  * HONEST LIMIT (proven live, see NOTES.md): the mobile gateway
  * (tab-operating, search/v2, season-info, captions) answers 403
  * "Service not available in current region" from a US datacenter
@@ -230,7 +277,7 @@ import okhttp3.RequestBody.Companion.toRequestBody
  * fallbacks; the mobile routes are the ones that work on his
  * phone (the original v56 WORKS there, his word). Nothing here
  * is "working" until he confirms on his phone after a full close
- * and reopen. DEBUG ("MovieBoxIN v4 | ... | sub=...") is emitted
+ * and reopen. DEBUG ("MovieBoxIN v5 | ... | sub=...") is emitted
  * whenever links are zero OR the dual is missing, so a failure
  * is never silent.
  */
@@ -673,11 +720,7 @@ class MovieBoxINProvider : MainAPI() {
             val json = runCatching { JSONObject(res.text) }.getOrNull()
                 ?: continue
             val data = json.optJSONObject("data") ?: continue
-            val arr = data.optJSONArray("subjects")
-                ?: data.optJSONArray("subjectList")
-                ?: data.optJSONArray("items")
-                ?: data.optJSONArray("list")
-                ?: continue
+            val arr = mbSubjectsArray(data) ?: continue
             val pager = data.optJSONObject("pager")
             val pagerMore = when (val hm = pager?.opt("hasMore")) {
                 is Boolean -> hm
@@ -816,21 +859,46 @@ class MovieBoxINProvider : MainAPI() {
      * detailPath against the caller's seen-set (the site itself
      * repeats titles across pages — different detailPaths are
      * different records). */
+    /** Response-shape tolerance for list endpoints (v5 —
+     * rennvol subjectsOf + allforu parseSubjects): data.items
+     * (H5 search, proven live T48: items only, totalCount 128)
+     * / data.subjects (the mobile dex shape) / data.subjectList
+     * / data.list / data.results[].subjects. Order matters: H5
+     * carries items only; the mobile routes carry subjects /
+     * subjectList. The v4 parser missed "subjects" entirely —
+     * the mobile search/v2 response shape. */
+    private fun mbSubjectsArray(data: JSONObject): JSONArray? {
+        data.optJSONArray("items")?.let { return it }
+        data.optJSONArray("subjects")?.let { return it }
+        data.optJSONArray("subjectList")?.let { return it }
+        data.optJSONArray("list")?.let { return it }
+        val results = data.optJSONArray("results") ?: return null
+        val merged = JSONArray()
+        for (i in 0 until results.length()) {
+            val subs = results.optJSONObject(i)
+                ?.optJSONArray("subjects") ?: continue
+            for (j in 0 until subs.length()) {
+                subs.optJSONObject(j)?.let { merged.put(it) }
+            }
+        }
+        return if (merged.length() > 0) merged else null
+    }
+
     private fun searchPageItems(
         root: JSONObject?,
         seen: MutableSet<String>
     ): Pair<List<SearchResponse>, Boolean> {
         if (root == null) return emptyList<SearchResponse>() to false
         val data = root.optJSONObject("data") ?: root
-        val arr = data.optJSONArray("items")
-            ?: data.optJSONArray("subjectList")
-            ?: data.optJSONArray("list")
+        val arr = mbSubjectsArray(data)
             ?: return emptyList<SearchResponse>() to false
         val pager = data.optJSONObject("pager")
         val hasMore = when (val hm = pager?.opt("hasMore")) {
             is Boolean -> hm
             is String -> hm.equals("true", ignoreCase = true)
-            else -> false
+            // No pager at all: a full page means "more" (the
+            // mobile routes may not send a pager object).
+            else -> arr.length() >= 20
         }
         val out = ArrayList<SearchResponse>()
         for (i in 0 until arr.length()) {
@@ -921,6 +989,35 @@ class MovieBoxINProvider : MainAPI() {
         return out
     }
 
+    /** Paginated search (v5 — rennvol's shape). The app calls
+     * THIS, not the legacy list form: the base implementation
+     * wraps the legacy list with hasNext=false ALWAYS
+     * (MainAPI.kt:641-655), so v1–v4 search could never page
+     * past the one call's walk — the structural "limited
+     * search". One route-page per call here; hasNext comes
+     * from the route's pager, so the app pages through the
+     * whole catalog (totalCount 128 for "prison break", 452
+     * for "love", T48). Mobile route first, H5 fallback per
+     * page. */
+    override suspend fun search(
+        query: String,
+        page: Int
+    ): SearchResponseList? {
+        if (query.isBlank() || page < 1) {
+            return emptyList<SearchResponse>().toNewSearchResponseList(false)
+        }
+        val seen = HashSet<String>()
+        val (mobItems, mobMore) = searchRoutePage(query, page, true, seen)
+        if (mobItems.isNotEmpty()) {
+            return mobItems.toNewSearchResponseList(mobMore)
+        }
+        val (h5Items, h5More) = searchRoutePage(query, page, false, seen)
+        return h5Items.toNewSearchResponseList(h5More && h5Items.isNotEmpty())
+    }
+
+    /** Legacy single-call search: kept for any caller that
+     * still uses it — the v4 behaviour (all pages of the
+     * mobile route, then all pages of H5). */
     override suspend fun search(query: String): List<SearchResponse> {
         if (query.isBlank()) return emptyList()
         // Route 1 — IN's own search/v2 (signed POST on api3),
@@ -1720,6 +1817,11 @@ class MovieBoxINProvider : MainAPI() {
      * (the play ids) does not find BOTH sides, mint a WEB
      * token, call play on the web base, and run the H5 route
      * with THOSE ids (trail "wh5=...", "/wids=<web ids>").
+     * v5 adds Phase C: the first MP4 id of each dub subject
+     * (T52 — French MP4 id -> 1 French caption; other dub ids
+     * -> 0; the Arabic-sub version's ids -> 0, T36), run after
+     * Phase B; it can only add a missing side (trail "dh5=...",
+     * "/dids=<dub ids>").
      * Playback itself is untouched (mobile token). Mobile
      * ext-captions 400 in v2/v3 because resourceId is null —
      * the field exists in NO response and IN's dex never reads
@@ -1741,11 +1843,13 @@ class MovieBoxINProvider : MainAPI() {
         se: Int,
         ep: Int,
         t0: Long,
+        dubCaps: List<Pair<String, String>> = emptyList(),
         subtitleCallback: (SubtitleFile) -> Unit
     ): String {
         val trail = ArrayList<String>()
         val triedIds = ArrayList<String>()
         val webTriedIds = ArrayList<String>()
+        val dubTriedIds = ArrayList<String>()
         var ara: String? = null
         var eng: String? = null
         fun absorb(arr: JSONArray?) {
@@ -1889,13 +1993,124 @@ class MovieBoxINProvider : MainAPI() {
                 }
             }
         }
+        // Phase C (v5): first MP4 id of each dub subject (T52:
+        // French MP4 id -> 1 French caption; other dub ids -> 0;
+        // the Arabic-sub version's ids -> 0, T36). Cheap (one
+        // id per dub) and can only add a missing side.
+        if (!bothFound() && dubCaps.isNotEmpty()) {
+            h5Pass(dubCaps, "dh5", dubTriedIds)
+        }
         if (ara == null && eng == null) {
             var out = "none:" + trail.joinToString("/")
             if (triedIds.isNotEmpty()) out += "/ids=" + triedIds.joinToString(",")
             if (webTriedIds.isNotEmpty()) out += "/wids=" + webTriedIds.joinToString(",")
+            if (dubTriedIds.isNotEmpty()) out += "/dids=" + dubTriedIds.joinToString(",")
             return out
         }
         return mbEmitUnion(ara, eng, subtitleCallback)
+    }
+
+    /** Dub subjects for a title (v5): H5 detail's
+     * data.subject.dubs[] — (subjectId, detailPath, lanName),
+     * the app's own "اختر الترجمة" picker verbatim (T45: PB 11
+     * entries, T49: Other Mommy 6). Main subject first, then
+     * the rest in server order. Detail failure -> empty (the
+     * caller falls back to a single-entry list). */
+    private suspend fun mbFetchDubs(
+        detailPath: String,
+        mainSubjectId: String
+    ): List<Triple<String, String, String>> {
+        val out = ArrayList<Triple<String, String, String>>()
+        val json = runCatching {
+            app.get(
+                "$mbWebBase/wefeed-h5api-bff/detail?detailPath=" +
+                    java.net.URLEncoder.encode(detailPath, "UTF-8"),
+                headers = mbJsonHeaders
+            ).text
+        }.getOrNull() ?: return out
+        val subj = runCatching {
+            JSONObject(json).optJSONObject("data")?.optJSONObject("subject")
+        }.getOrNull() ?: return out
+        val dubs = subj.optJSONArray("dubs") ?: return out
+        val seen = HashSet<String>()
+        for (i in 0 until dubs.length()) {
+            val o = dubs.optJSONObject(i) ?: continue
+            val sid = o.optString("subjectId")
+            val dp = o.optString("detailPath")
+            val lan = o.optString("lanName").ifBlank { "Original Audio" }
+            if (sid.isBlank() || dp.isBlank() || !seen.add(sid)) continue
+            out += Triple(sid, dp, lan)
+        }
+        val main = out.firstOrNull { it.first == mainSubjectId }
+        val rest = out.filter { it.first != mainSubjectId }
+        return if (main != null) listOf(main) + rest else out
+    }
+
+    private data class MbPlayResult(
+        val streams: List<JSONObject>,
+        val base: String?,
+        val code: String,
+        val resourceId: String?
+    )
+
+    /** One subject's H5 play (v5): movie-box.co first, then
+     * moviebox.sg — first base with streams wins (the v4
+     * rule, unchanged). The Referer is the FULL player-page
+     * URL for THIS subject's own detailPath, with its real
+     * se/ep (the v17 shape proven on-device). */
+    private suspend fun mbFetchPlayStreams(
+        sid: String,
+        dp: String,
+        se: Int,
+        ep: Int,
+        token: String
+    ): MbPlayResult {
+        var playCode = "?"
+        for (base in listOf("https://movie-box.co", "https://moviebox.sg")) {
+            val seEp = if (se == 0 && ep == 0) {
+                "detailSe=&detailEp="
+            } else {
+                "detailSe=$se&detailEp=$ep"
+            }
+            val referer = "$base/movies/$dp?id=$sid" +
+                "&type=/movie/detail&$seEp&lang=en"
+            val playUrl = "$base/wefeed-h5api-bff/subject/play" +
+                "?subjectId=$sid&se=$se&ep=$ep" +
+                "&detailPath=$dp" +
+                "&streamSignType=1" +
+                "&supportCodecs%5Bhevc%5D=1&supportCodecs%5Bh264%5D=1"
+            val headers = mbSignedHeaders(
+                "GET", playUrl, mbUaPlayChrome, mbClientInfoPlay()
+            ) + mapOf(
+                "Referer" to referer,
+                "Authorization" to "Bearer $token",
+                "X-MB-Token" to token,
+                "x-play-mode" to "1",
+                "x-request-lang" to "en",
+                "x-vip-restrict" to "0",
+                "x-no-high-risk-restrict" to "0",
+                "x-source" to ""
+            )
+            val res = runCatching { app.get(playUrl, headers = headers) }
+                .getOrNull() ?: continue
+            playCode = res.code.toString()
+            if (res.code !in 200..299 || res.text.isBlank()) continue
+            val d = runCatching {
+                JSONObject(res.text).optJSONObject("data")
+            }.getOrNull() ?: continue
+            val streamObjs = ArrayList<JSONObject>()
+            for (key in listOf("streams", "dash", "hls")) {
+                val arr = d.optJSONArray(key) ?: continue
+                for (i in 0 until arr.length()) {
+                    arr.optJSONObject(i)?.let { streamObjs += it }
+                }
+            }
+            if (streamObjs.isEmpty()) continue
+            val rid = d.optString("resourceId").ifBlank { null }
+                ?: streamObjs[0].optString("resourceId").ifBlank { null }
+            return MbPlayResult(streamObjs, base, playCode, rid)
+        }
+        return MbPlayResult(emptyList(), null, playCode, null)
     }
 
     override suspend fun loadLinks(
@@ -1919,6 +2134,7 @@ class MovieBoxINProvider : MainAPI() {
         var tokVia = "none"
         var resourceId: String? = null
         var subDiag = "?"
+        var dubCount = 0
         val counting: (ExtractorLink) -> Unit = { link ->
             emitted++
             callback(link)
@@ -1926,7 +2142,7 @@ class MovieBoxINProvider : MainAPI() {
         if (subjectId.isBlank() || detailPath.isBlank()) {
             emitDebug(
                 listOf(
-                    "MovieBoxIN v4", "srv=0", "ext=0",
+                    "MovieBoxIN v5", "srv=0", "ext=0",
                     "t=${elapsed() / 1000}s", "tok=$tokVia",
                     "play=$playCode", "id-missing"
                 ),
@@ -1937,91 +2153,61 @@ class MovieBoxINProvider : MainAPI() {
         val (token, via) = mbGuestToken()
         tokVia = via
         if (token != null) {
-            val bases = listOf("https://movie-box.co", "https://moviebox.sg")
-            for (base in bases) {
-                if (emitted > 0 || elapsed() > 20000) break
-                // The play Referer is the FULL player-page URL on
-                // the SAME base, with the detailPath in the path.
-                // detailPath goes into the play URL RAW (no
-                // URL-encoding). Movies play with se=0&ep=0 and
-                // carry EMPTY detailSe/detailEp in the Referer
-                // (the v17 shape proven on-device); episodes
-                // carry their real se/ep in both places — the
-                // same rule emitMovieBoxLink applies to the
-                // emitted links, so both Referers always match.
-                val seEp = if (se == 0 && ep == 0) {
-                    "detailSe=&detailEp="
-                } else {
-                    "detailSe=$se&detailEp=$ep"
-                }
-                val referer = "$base/movies/$detailPath?id=$subjectId" +
-                    "&type=/movie/detail&$seEp&lang=en"
-                val playUrl = "$base/wefeed-h5api-bff/subject/play" +
-                    "?subjectId=$subjectId&se=$se&ep=$ep" +
-                    "&detailPath=$detailPath" +
-                    "&streamSignType=1" +
-                    "&supportCodecs%5Bhevc%5D=1&supportCodecs%5Bh264%5D=1"
-                val headers = mbSignedHeaders(
-                    "GET", playUrl, mbUaPlayChrome, mbClientInfoPlay()
-                ) + mapOf(
-                    "Referer" to referer,
-                    "Authorization" to "Bearer $token",
-                    "X-MB-Token" to token,
-                    "x-play-mode" to "1",
-                    "x-request-lang" to "en",
-                    "x-vip-restrict" to "0",
-                    "x-no-high-risk-restrict" to "0",
-                    "x-source" to ""
-                )
-                val res = runCatching { app.get(playUrl, headers = headers) }
-                    .getOrNull() ?: continue
-                playCode = res.code.toString()
-                if (res.code !in 200..299) continue
-                val body = res.text
-                if (body.isBlank()) continue
-                val d = runCatching {
-                    JSONObject(body).optJSONObject("data")
-                }.getOrNull() ?: continue
-                resourceId = d.optString("resourceId").ifBlank { null }
-                    ?: resourceId
-                val streamObjs = ArrayList<JSONObject>()
-                for (key in listOf("streams", "dash", "hls")) {
-                    val arr = d.optJSONArray(key) ?: continue
-                    for (i in 0 until arr.length()) {
-                        arr.optJSONObject(i)?.let { streamObjs += it }
-                    }
-                }
-                streamsFound += streamObjs.size
-                if (streamObjs.isNotEmpty()) {
-                    if (resourceId == null) {
-                        resourceId = streamObjs[0].optString("resourceId")
-                            .ifBlank { null }
-                    }
-                }
-                // H5 caption candidates — (stream id, format)
-                // from the play response, first id per format.
-                // v3: ALL stream ids (was: first 3) — the
-                // phone's v2 DEBUG showed 6x h5=200-empty while
-                // every id of S1E1 returns real captions live,
-                // so the phone's play response must carry
-                // different ids; widening the net costs one
-                // fast call per id and the tried ids are logged
-                // in the DEBUG trail.
-                val h5Caps = ArrayList<Pair<String, String>>()
-                for (s in streamObjs) {
-                    val sid = s.optString("id")
-                    if (sid.isBlank()) continue
+            // v5 — ALL sources (rennvol's per-dub iteration,
+            // H5-ported): the dubs list from H5 detail, then
+            // one H5 play per dub subject. Counted live (T46b):
+            // 30 distinct streams for PB S1E1 (main 5 + Arabic
+            // 5 + French 2 + Indonesian 3 + Kurdish 1 + Russian
+            // sub 3 + Russian dub 4 + Spanish sub 1 + Spanish
+            // dub 1 + esla 2 + ptbr 3) — more than the 14 the
+            // other addons show, every one a real file.
+            var dubs = mbFetchDubs(detailPath, subjectId)
+            if (dubs.isEmpty()) {
+                dubs = listOf(Triple(subjectId, detailPath, "Original Audio"))
+            }
+            dubCount = dubs.size
+            val emittedUrls = HashSet<String>()
+            val mainCaps = ArrayList<Pair<String, String>>()
+            var mainStreamIds = emptyList<String>()
+            var mainPlayBase: String? = null
+            val dubCaps = ArrayList<Pair<String, String>>()
+            for ((sid, dp, lan) in dubs) {
+                if (elapsed() > 20000) break
+                val play = mbFetchPlayStreams(sid, dp, se, ep, token)
+                playCode = play.code
+                if (play.base == null || play.streams.isEmpty()) continue
+                if (resourceId == null) resourceId = play.resourceId
+                streamsFound += play.streams.size
+                // Caption candidates for this subject: first id
+                // per format (the v4 shape). The main subject's
+                // go to Phase A; each dub's first MP4 id goes to
+                // Phase C.
+                val capsHere = ArrayList<Pair<String, String>>()
+                for (s in play.streams) {
+                    val id = s.optString("id")
+                    if (id.isBlank()) continue
                     val surl = mbStreamUrl(s) ?: continue
                     val fmt = when {
                         surl.contains(".mpd") -> "DASH"
                         surl.contains(".m3u8") -> "HLS"
                         else -> "MP4"
                     }
-                    if (h5Caps.none { it.first == sid }) h5Caps += sid to fmt
+                    if (capsHere.none { it.first == id }) capsHere += id to fmt
                 }
-                for (s in streamObjs) {
-                    if (emitted >= 6 || elapsed() > 25000) break
+                if (sid == subjectId) {
+                    mainCaps += capsHere
+                    mainStreamIds = play.streams.mapNotNull { o ->
+                        o.optString("id").ifBlank { null }
+                    }.distinct()
+                    mainPlayBase = play.base
+                } else {
+                    capsHere.firstOrNull { it.second == "MP4" }
+                        ?.let { dubCaps += it }
+                }
+                for (s in play.streams) {
+                    if (emitted >= 40 || elapsed() > 25000) break
                     val linkUrl = mbStreamUrl(s) ?: continue
+                    if (!emittedUrls.add(linkUrl)) continue
                     val signCookie = s.optString("signCookie")
                         .ifBlank { null }
                     val signHeaderKey = s.optString("signHeaderKey")
@@ -2033,23 +2219,26 @@ class MovieBoxINProvider : MainAPI() {
                     }
                     val q = Regex("""(2160|1440|1080|720|480|360)""")
                         .find(resLabel)?.groupValues?.get(1)
-                    val label = "MovieBox" + if (q != null) " ${q}p" else ""
+                    // The dub name in the label, so the player
+                    // shows which encode each source is.
+                    val label = if (sid == subjectId) {
+                        "MovieBox" + if (q != null) " ${q}p" else ""
+                    } else {
+                        "MovieBox $lan" + if (q != null) " ${q}p" else ""
+                    }
                     emitMovieBoxLink(
                         linkUrl, label, signCookie, signHeaderKey,
-                        base, detailPath, subjectId, se, ep, counting
+                        play.base, dp, sid, se, ep, counting
                     )
                 }
-                if (emitted > 0) {
-                    val streamIds = streamObjs.mapNotNull { o ->
-                        o.optString("id").ifBlank { null }
-                    }.distinct()
-                    subDiag = mbEmitCaptions(
-                        subjectId, detailPath, base, token, h5Caps,
-                        streamIds, resourceId, se, ep, t0,
-                        subtitleCallback
-                    )
-                    break
-                }
+                if (emitted >= 40 || elapsed() > 25000) break
+            }
+            if (emitted > 0) {
+                subDiag = mbEmitCaptions(
+                    subjectId, detailPath, mainPlayBase ?: mbWebBase,
+                    token, mainCaps, mainStreamIds, resourceId,
+                    se, ep, t0, dubCaps, subtitleCallback
+                )
             }
         }
         if (emitted == 0 || subDiag != "ar+en") {
@@ -2057,8 +2246,9 @@ class MovieBoxINProvider : MainAPI() {
             // emit the DEBUG line even when playback links exist.
             emitDebug(
                 listOf(
-                    "MovieBoxIN v4", "srv=$streamsFound",
-                    "ext=$emitted", "t=${elapsed() / 1000}s",
+                    "MovieBoxIN v5", "srv=$streamsFound",
+                    "ext=$emitted", "dubs=$dubCount",
+                    "t=${elapsed() / 1000}s",
                     "tok=$tokVia", "play=$playCode",
                     "se=$se", "ep=$ep", "sub=$subDiag"
                 ),

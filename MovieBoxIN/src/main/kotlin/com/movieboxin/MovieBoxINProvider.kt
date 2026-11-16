@@ -277,7 +277,7 @@ import okhttp3.RequestBody.Companion.toRequestBody
  * fallbacks; the mobile routes are the ones that work on his
  * phone (the original v56 WORKS there, his word). Nothing here
  * is "working" until he confirms on his phone after a full close
- * and reopen. DEBUG ("MovieBoxIN v9 | ... | sub=...") is emitted
+ * and reopen. DEBUG ("MovieBoxIN v10 | ... | sub=...") is emitted
  * whenever links are zero OR the dual is missing, so a failure
  * is never silent.
  *
@@ -1131,6 +1131,33 @@ class MovieBoxINProvider : MainAPI() {
         )
     }
 
+    /** One diagnostic card for a failed SEARCH (v10 — the
+     * search screen itself must diagnose: the phone zero
+     * for "Naruto" never came with a DEBUG line, because
+     * the DEBUG rides on loadLinks and needs an episode
+     * opened. Shown ONLY on page 1 when BOTH branches
+     * return zero usable cards even after the H5 retry —
+     * never on later pages (empty there is a normal
+     * end-of-list) and never when any card exists. The
+     * title carries the version (so the screenshot proves
+     * which build the phone runs) + both branch states +
+     * token sources. Tapping it lands on the harmless
+     * movieFallback page (no detailPath, no playback).
+     * The URL carries the status codes so the fallback
+     * page title shows them too. */
+    private fun mbSearchDiagCard(
+        h5Status: String,
+        mobStatus: String,
+        tok: String
+    ): SearchResponse {
+        val title = "⚠ v10 بحث فارغ — h5=$h5Status mob=$mobStatus tok=$tok"
+        val slug = "h5-" + h5Status.replace(":", "-").replace("/", "-") +
+            "-mob-" + mobStatus.replace(":", "-").replace("/", "-")
+        return newMovieSearchResponse(
+            title, "mbdiag://search-diag/$slug", TvType.Movie
+        )
+    }
+
     /** TOP100 display items (v7): the real cards, or the one
      * diagnostic card when the fetch failed. */
     private fun mbTop100Items(page: MbPage, num: Int): List<SearchResponse> {
@@ -1556,19 +1583,52 @@ class MovieBoxINProvider : MainAPI() {
         // swallowed into an empty page; any other throw is
         // a branch failure ("exc"), never a dead search.
         try {
-            // v8 — the token mint must never kill the branch:
-            // on a mint throw, attempt the route token-less
-            // and let its HTTP code speak in the DEBUG line.
+            // v10 — TOKEN ROUTING (the v9 phone zero, T90–T97):
+            // the sandbox ALWAYS tested H5 search with a WEB
+            // token (the mobile mint 403s here, so the fallback
+            // web mint won), while the phone ALWAYS used a
+            // MOBILE token (its mobile mint succeeds) — the two
+            // environments never exercised the same token for
+            // H5 search, and search NEVER worked on the phone.
+            // So the H5 branch now mints a WEB token first
+            // (proven live for H5 search, T90/T95 — and the
+            // token carries no region claim, T96); only if
+            // the web mint fails does it fall back to the
+            // guest token. The mobile branch keeps the guest
+            // token. A mint throw never kills the branch.
+            // And when NO token exists at all, the H5 branch
+            // is SKIPPED (code "notok") instead of calling
+            // token-less: token-less H5 search is a proven
+            // 400 "invalid token" (T91), so the call would
+            // only waste a round trip and mislabel the
+            // failure as a server error. The mobile branch
+            // still attempts token-less (its token-less
+            // behaviour is unproven either way).
             var token: String?
             var tokVia: String
             try {
-                val minted = mbGuestToken()
-                token = minted.first
-                tokVia = minted.second
+                if (!mobile) {
+                    val web = mbWebToken()
+                    if (web.first != null) {
+                        token = web.first
+                        tokVia = web.second
+                    } else {
+                        val guest = mbGuestToken()
+                        token = guest.first
+                        tokVia = guest.second
+                    }
+                } else {
+                    val minted = mbGuestToken()
+                    token = minted.first
+                    tokVia = minted.second
+                }
             } catch (e: Throwable) {
                 if (mbIsCancellation(e)) throw e
                 token = null
                 tokVia = "exc"
+            }
+            if (!mobile && token.isNullOrBlank()) {
+                return empty.copy(code = "notok", tok = tokVia)
             }
             val body = JSONObject().apply {
                 put("page", page)
@@ -1798,10 +1858,12 @@ class MovieBoxINProvider : MainAPI() {
             // v8 — per-branch status so the DEBUG line alone
             // names a failing branch: ok/empty/err:<code>/exc
             // + usable count + array key, per route; plus the
-            // token source and the filtered count.
+            // token source and the filtered count. v10 adds
+            // "notok" (branch skipped: no token at all).
             fun branchStatus(p: MbSearchPage): String {
                 val st = when {
                     p.code == "exc" -> "exc"
+                    p.code == "notok" -> "notok"
                     p.hits.isNotEmpty() -> "ok"
                     p.code == "200" -> "empty"
                     else -> "err:${p.code}"
@@ -1810,6 +1872,22 @@ class MovieBoxINProvider : MainAPI() {
                 // (bad=): ok:<hits>/<bad>/<key>.
                 return "$st:${p.hits.size}/${p.bad}/${p.key}"
             }
+            // v10 — the short status for the diagnostic card
+            // title (no counts, no key).
+            fun shortStatus(p: MbSearchPage): String = when (p.code) {
+                "exc" -> "exc"
+                "notok" -> "notok"
+                "200" -> if (p.hits.isNotEmpty()) "ok" else "empty"
+                else -> "err:${p.code}"
+            }
+            // v10 — the diagnostic card: page 1 and BOTH
+            // branches empty even after the retry means the
+            // search itself failed (not "no results") — show
+            // ONE card that says so, carrying the version +
+            // branch states, instead of a black empty screen.
+            // Never on page>1 (empty there is a normal
+            // end-of-list) and never when any card exists.
+            val showDiag = out.isEmpty() && page == 1
             mbLastSearchDebug = "src=$src key=${h5.key}/${mob.key} " +
                 "ms=${mob.hits.size} ms_key=${mob.key} hs=${h5.hits.size} " +
                 "hhost=${h5.host} pg=$page hm=$hasMore " +
@@ -1818,7 +1896,16 @@ class MovieBoxINProvider : MainAPI() {
                 "shown=${out.size} " +
                 "h5=${branchStatus(h5)} mob=${branchStatus(mob)} " +
                 "tok=${h5.tok}/${mob.tok} bad=${h5.bad + mob.bad} filt=$filteredCount " +
+                "diag=${if (showDiag) 1 else 0} " +
                 excMark.trim()
+            if (showDiag) {
+                return listOf(
+                    mbSearchDiagCard(
+                        shortStatus(h5), shortStatus(mob),
+                        "${h5.tok}/${mob.tok}"
+                    )
+                ).toNewSearchResponseList(false)
+            }
             return out.toNewSearchResponseList(hasMore)
         } catch (e: Throwable) {
             if (mbIsCancellation(e)) throw e
@@ -2108,13 +2195,17 @@ class MovieBoxINProvider : MainAPI() {
 
     /** Read the guest JWT from one call: the token arrives in the
      * "x-user" response header (a JSON string with a "token"
-     * field) or, failing that, in the JSON body. */
+     * field) or, failing that, in the JSON body. Returns
+     * (token, httpCode): code is -1 when no response arrived
+     * at all (network failure) so the caller can tell a
+     * transient blip (retryable) from an HTTP refusal
+     * (systematic — retrying a 403 cannot mint a token). */
     private suspend fun mbTokenFrom(
         url: String,
         signed: Boolean,
         clientInfo: String?,
         ua: String
-    ): String? {
+    ): Pair<String?, Int> {
         return try {
             val headers = if (signed && clientInfo != null) {
                 mbSignedHeaders("GET", url, ua, clientInfo)
@@ -2125,55 +2216,78 @@ class MovieBoxINProvider : MainAPI() {
                 )
             }
             val res = app.get(url, headers = headers)
-            if (res.code !in 200..299) return null
+            if (res.code !in 200..299) return null to res.code
             val xu = res.headers["x-user"] ?: res.headers["X-User"]
             val fromHeader = xu?.let {
                 runCatching { JSONObject(it).optString("token") }.getOrNull()
             }?.ifBlank { null }
-            if (!fromHeader.isNullOrBlank()) return fromHeader
+            if (!fromHeader.isNullOrBlank()) return fromHeader to res.code
             val body = res.text
-            if (body.isBlank()) return null
+            if (body.isBlank()) return null to res.code
             val j = runCatching { JSONObject(body) }.getOrNull()
-                ?: return null
-            j.optString("token").ifBlank { null }
+                ?: return null to res.code
+            val tok = j.optString("token").ifBlank { null }
                 ?: j.optJSONObject("data")?.optString("token")?.ifBlank { null }
+            tok to res.code
         } catch (_: Exception) {
-            null
+            null to -1
         }
+    }
+
+    /** One mint attempt with a single retry on NETWORK failure
+     * only (code -1: no response at all — a 4G blip). An HTTP
+     * error code (403 region, 400) is systematic: retrying
+     * it cannot mint a token, so it is not retried. */
+    private suspend fun mbTokenFromRetry(
+        url: String,
+        signed: Boolean,
+        clientInfo: String?,
+        ua: String
+    ): Pair<String?, Int> {
+        val first = mbTokenFrom(url, signed, clientInfo, ua)
+        if (first.first != null || first.second != -1) return first
+        return mbTokenFrom(url, signed, clientInfo, ua)
     }
 
     @Volatile
     private var mbCachedToken: String? = null
     @Volatile
     private var mbCachedAt: Long = 0
+    // v10 — which host minted the cached guest token, so the
+    // DEBUG tok= label stays truthful for a cached token.
+    @Volatile
+    private var mbCachedVia: String = "-"
 
     /** Guest JWT (valid ~90 days; cached 1 h per session). Mobile
      * gateway first (IN order), web host fallback — the web host
-     * grants the same JWT in its x-user header (verified live). */
+     * grants the same JWT in its x-user header (verified live).
+     * v10: each mint attempt retries once, and only on a
+     * network failure (no response at all). */
     private suspend fun mbGuestToken(): Pair<String?, String> {
         val now = System.currentTimeMillis()
         val cached = mbCachedToken
         if (cached != null && now - mbCachedAt < 3600_000) {
-            return cached to "cached"
+            return cached to mbCachedVia
         }
         val mobUrl = "$mbMobileBase/wefeed-mobile-bff/tab/ranking-list" +
             "?tabId=0&categoryType=$mbRankCategoryType&page=1&perPage=1"
-        var tok = mbTokenFrom(
+        var tok = mbTokenFromRetry(
             mobUrl, signed = true,
             clientInfo = mbClientInfoToken(), ua = mbUaToken
-        )
+        ).first
         var via = "mob"
         if (tok == null) {
             val webUrl = "$mbWebBase/wefeed-h5api-bff/ranking-list/content" +
                 "?id=8614980535946986176&page=1&perPage=1"
-            tok = mbTokenFrom(
+            tok = mbTokenFromRetry(
                 webUrl, signed = false, clientInfo = null, ua = browserUA
-            )
+            ).first
             via = "web"
         }
         if (tok != null) {
             mbCachedToken = tok
             mbCachedAt = now
+            mbCachedVia = via
         }
         return tok to via
     }
@@ -2244,6 +2358,7 @@ class MovieBoxINProvider : MainAPI() {
         }?.ifBlank { null } ?: return
         mbCachedToken = tok
         mbCachedAt = System.currentTimeMillis()
+        mbCachedVia = "mob"
     }
 
     private fun mbStreamUrl(s: JSONObject): String? {
@@ -2574,21 +2689,25 @@ class MovieBoxINProvider : MainAPI() {
      * The phone's normal token is the mobile one (tok=mob);
      * only the web token yields caption-carrying stream ids
      * (v4 T25/T26b). Cached 1 h per session, separately from
-     * the mobile token. */
-    private suspend fun mbWebToken(): String? {
+     * the mobile token. v10: returns (token, via) — "web" /
+     * "webcached" — and is the H5 search branch's FIRST token
+     * (T90–T97): the sandbox always tested H5 search with a
+     * web token while the phone always used a mobile one, and
+     * search NEVER worked on the phone. */
+    private suspend fun mbWebToken(): Pair<String?, String> {
         val now = System.currentTimeMillis()
         val cached = mbCachedWebToken
-        if (cached != null && now - mbCachedWebAt < 3600_000) return cached
+        if (cached != null && now - mbCachedWebAt < 3600_000) return cached to "webcached"
         val webUrl = "$mbWebBase/wefeed-h5api-bff/ranking-list/content" +
             "?id=8614980535946986176&page=1&perPage=1"
-        val tok = mbTokenFrom(
+        val tok = mbTokenFromRetry(
             webUrl, signed = false, clientInfo = null, ua = browserUA
-        )
+        ).first
         if (tok != null) {
             mbCachedWebToken = tok
             mbCachedWebAt = now
         }
-        return tok
+        return tok to "web"
     }
 
     /** Play via the WEB base with a WEB token and return the
@@ -2886,7 +3005,7 @@ class MovieBoxINProvider : MainAPI() {
             if (System.currentTimeMillis() - t0 > 20000) {
                 trail += "wskip=slow"
             } else {
-                val webToken = mbWebToken()
+                val webToken = mbWebToken().first
                 trail += "wtok=" + if (webToken != null) "web" else "none"
                 if (webToken != null) {
                     val (webCaps, webIds, webCode) = mbWebPlayCaps(
@@ -3063,7 +3182,7 @@ class MovieBoxINProvider : MainAPI() {
         if (subjectId.isBlank() || detailPath.isBlank()) {
             emitDebug(
                 listOf(
-                    "MovieBoxIN v9", "srv=0", "ext=0",
+                    "MovieBoxIN v10", "srv=0", "ext=0",
                     "t=${elapsed() / 1000}s", "tok=$tokVia",
                     "play=$playCode", "id-missing"
                 ),
@@ -3180,7 +3299,7 @@ class MovieBoxINProvider : MainAPI() {
             // along (the home/search paths have no phone-visible
             // surface of their own).
             val diag = ArrayList<String>()
-            diag += "MovieBoxIN v9"
+            diag += "MovieBoxIN v10"
             diag += "srv=$streamsFound"
             diag += "ext=$emitted"
             diag += "dubs=$dubCount"

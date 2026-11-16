@@ -116,6 +116,45 @@ import okhttp3.RequestBody.Companion.toRequestBody
  *   in the sandbox). No OpenSubtitles, no rebuild — his order.
  *   Still NO trailer in v2.
  *
+ * v3 (his on-device v2 verdict, 2026-11-16 02:59 — DEBUG:
+ *   "MovieBoxIN v2 | srv=5 | ext=5 | t=3s | tok=mob | play=200 |
+ *   se=1 | ep=1 | sub=none:h5=200-empty/x6/mob=400/mobstr=200"):
+ * - CAPTIONS still missing on Prison Break S1E1. Proven live
+ *   AFTER v2: the H5 caption route returns real ar+en tracks for
+ *   EVERY stream id of S1E1 (all 4 MP4 ids -> 14 captions,
+ *   DASH id + format=DASH -> 16; the .srt files fetch 200,
+ *   36,910 B ar / 39,017 B en) — with the exact v2 URL shape
+ *   and ANY header set. So the phone's 6x empty is an
+ *   id-mismatch (its play response carries different stream
+ *   ids), not a URL/header/format bug. Fix: try ALL stream ids
+ *   (was: first 3) and LOG the tried ids in the DEBUG trail,
+ *   so the next phone DEBUG shows the exact ids to test.
+ * - Mobile ext-captions 400: v2 sent subjectId + episode=0
+ *   (resourceId is null — the field exists in NO response:
+ *   not in play data, not in streams, not in detail, not in
+ *   search/tabs, and IN's dex never reads a "resourceId" JSON
+ *   key). The gateway 400s on the missing param. Fix: try
+ *   subjectId ONLY (mob1, the HorrorMovies v18 shape), then
+ *   resourceId := first stream id + episode=0 (mob2); the
+ *   IN-shape runs only if a real resourceId ever appears.
+ *   Stream-captions (IN-exact, subjectId+streamId) now tries
+ *   ALL stream ids, not just the first.
+ * - "TOP 10" LIST INCOMPLETE: no section named "Top 10" exists
+ *   in the live H5 tab-operating; the three 10-card sections
+ *   (Hot Short TV / Trending Short Drama / Christmas Movies
+ *   2026) all carry genreTopId and their ranking-lists paginate
+ *   fully live (60/55/53 totals). The gap: rank pagination
+ *   needs genreTopId, which is verified ONLY in the H5
+ *   response — the phone's home loads from the MOBILE
+ *   tab-operating, and IN's dex never reads "genreTopId" at
+ *   all, so the mobile sections may not carry it (then
+ *   hasNext=false for every row and no row ever expands).
+ *   Fix: fetchTabSections merges genreTopId from the H5 twin
+ *   into any mobile section missing it (match by opId, then
+ *   title). Mobile-only sections with no H5 match stay
+ *   first-page-only — the one case this cannot fix blind.
+ *   Still NO trailer in v3.
+ *
  * HONEST LIMIT (proven live, see NOTES.md): the mobile gateway
  * (tab-operating, search/v2, season-info, captions) answers 403
  * "Service not available in current region" from a US datacenter
@@ -126,7 +165,7 @@ import okhttp3.RequestBody.Companion.toRequestBody
  * fallbacks; the mobile routes are the ones that work on his
  * phone (the original v56 WORKS there, his word). Nothing here
  * is "working" until he confirms on his phone after a full close
- * and reopen. DEBUG ("MovieBoxIN v2 | ... | sub=...") is emitted
+ * and reopen. DEBUG ("MovieBoxIN v3 | ... | sub=...") is emitted
  * whenever links are zero OR the dual is missing, so a failure
  * is never silent.
  */
@@ -325,7 +364,17 @@ class MovieBoxINProvider : MainAPI() {
      * twin fallback). Titles deduped (first non-empty wins —
      * the app keys rows by title); empty sections skipped.
      * Populates mbHomeSections (the mainPage entries for the
-     * next home load) and seeds the rank seen-sets. */
+     * next home load) and seeds the rank seen-sets.
+     * v3 — genreTopId merge: rank pagination needs genreTopId,
+     * which is verified ONLY in the H5 response (IN's dex never
+     * reads the field at all), while the phone's home loads from
+     * the MOBILE tab-operating — if its sections don't carry it,
+     * hasNext is false for every row and no row ever expands
+     * (the "top 10 incomplete" shape). So any section missing
+     * genreTopId takes it from the H5 twin (match by opId, then
+     * title). Mobile-only sections with no H5 match keep a
+     * blank id and stay first-page-only. Seeding runs AFTER the
+     * merge so merged sections seed too. */
     private suspend fun fetchTabSections(): List<MbHomeSection> {
         val sections = fetchMobileTabs() ?: fetchH5Tabs() ?: return emptyList()
         val out = ArrayList<MbHomeSection>()
@@ -336,22 +385,45 @@ class MovieBoxINProvider : MainAPI() {
             if (cards.isEmpty()) continue
             val title = section.optString("title").ifBlank { "✨Top Picks" }
             if (!seenTitles.add(title)) continue
-            val genreTopId = section.optString("genreTopId")
             out += MbHomeSection(
-                title, genreTopId, section.optString("opId"), cards
+                title, section.optString("genreTopId"),
+                section.optString("opId"), cards
             )
-            if (genreTopId.isNotBlank()) {
-                synchronized(mbRankSeenLock) {
-                    val seen = mbRankSeen.getOrPut(genreTopId) { HashSet() }
-                    // Seed with detailPaths (the same key
-                    // fetchRankPage dedups on) so a session-1
-                    // page-2 call never re-emits a card the row
-                    // already shows.
-                    for (c in cards) {
-                        val dp = c.url.substringAfter("/moviedetail/")
-                            .substringBefore("?").substringBefore("#").trim()
-                        if (dp.isNotBlank()) seen.add(dp)
-                    }
+        }
+        if (out.any { it.genreTopId.isBlank() }) {
+            val h5 = runCatching { fetchH5Tabs() }.getOrNull()
+            if (h5 != null) {
+                val byOp = HashMap<String, String>()
+                val byTitle = HashMap<String, String>()
+                for (i in 0 until h5.length()) {
+                    val s = h5.optJSONObject(i) ?: continue
+                    val gid = s.optString("genreTopId")
+                    if (gid.isBlank()) continue
+                    val op = s.optString("opId")
+                    if (op.isNotBlank()) byOp[op] = gid
+                    val t = s.optString("title")
+                    if (t.isNotBlank()) byTitle[t] = gid
+                }
+                for (i in out.indices) {
+                    val s = out[i]
+                    if (s.genreTopId.isNotBlank()) continue
+                    val gid = byOp[s.opId] ?: byTitle[s.title]
+                    if (gid != null) out[i] = s.copy(genreTopId = gid)
+                }
+            }
+        }
+        for (s in out) {
+            if (s.genreTopId.isBlank()) continue
+            synchronized(mbRankSeenLock) {
+                val seen = mbRankSeen.getOrPut(s.genreTopId) { HashSet() }
+                // Seed with detailPaths (the same key
+                // fetchRankPage dedups on) so a session-1
+                // page-2 call never re-emits a card the row
+                // already shows.
+                for (c in s.subjects) {
+                    val dp = c.url.substringAfter("/moviedetail/")
+                        .substringBefore("?").substringBefore("#").trim()
+                    if (dp.isNotBlank()) seen.add(dp)
                 }
             }
         }
@@ -1256,37 +1328,45 @@ class MovieBoxINProvider : MainAPI() {
     }
 
     /** Captions for a title — UNION across every route, never
-     * an early return on a partial hit. v1 stopped at the first
-     * array that held Arabic, so English from another stream or
-     * route was never consulted (the Prison Break S1E1 failure
-     * shape: Arabic present, English missing). Routes, in
-     * order: H5 caption per stream id (moviebox.sg first — the
-     * verified base — then the play base), mobile ext-captions
-     * (IN-exact: subjectId + resourceId + episode=0 HARDCODED,
-     * even for episodes — v1 sent subjectId only), mobile
-     * stream-captions (IN-exact: subjectId + streamId ONLY —
-     * v1 wrongly added episode + resourceId). Stops early only
-     * once BOTH sides are found. Returns the sub diagnostic:
-     * "ar+en" / "ar" / "en" / "ar+mf", else a compact
-     * "none:<route>=<code>/..." trail. Route H5 first: NOT
-     * region-gated (200 from a US IP), with the REAL stream id
-     * + format from the play response (id=subjectId alone
-     * returns an empty captions array — proven live on Prison
-     * Break, with and without se/ep params; a missing id is a
-     * 400 "empty id"). The CNC dex emits SubtitleFile with
-     * (lang, url) and NO headers, so no headers are passed
-     * with the caption URL. */
+     * an early return on a partial hit. Routes, in order: H5
+     * caption per stream id (moviebox.sg first — the verified
+     * base — then the play base), mobile ext-captions, mobile
+     * stream-captions. Stops early only once BOTH sides are
+     * found. Returns the sub diagnostic: "ar+en" / "ar" / "en"
+     * / "ar+mf", else a compact "none:<route>=<code>/..."
+     * trail (with "/ids=<tried stream ids>" so the next phone
+     * DEBUG shows the exact ids to test).
+     * v3 — why: the phone's v2 DEBUG showed 6x h5=200-empty
+     * for Prison Break S1E1, yet the H5 route was proven live
+     * AFTER v2 to return real ar+en tracks for EVERY stream id
+     * of S1E1 (all 4 MP4 ids -> 14 captions, DASH id +
+     * format=DASH -> 16; the .srt files fetch 200) with the
+     * exact v2 URL shape and ANY header set — so the phone's
+     * play response must carry different stream ids. The fix
+     * tries ALL ids (was: first 3) and logs them. Mobile
+     * ext-captions 400 in v2 because resourceId is null — the
+     * field exists in NO response (play data, streams, detail,
+     * search, tabs) and IN's dex never reads a "resourceId"
+     * JSON key — so v2 sent subjectId + episode=0 and the
+     * gateway 400d on the missing param. v3 tries subjectId
+     * ONLY (mob1), then resourceId := first stream id +
+     * episode=0 (mob2); the IN-shape runs only if a real
+     * resourceId ever appears. Stream-captions (IN-exact:
+     * subjectId + streamId only) now tries ALL stream ids.
+     * The CNC dex emits SubtitleFile with (lang, url) and NO
+     * headers, so no headers are passed with the caption URL. */
     private suspend fun mbEmitCaptions(
         subjectId: String,
         detailPath: String,
         playBase: String,
         token: String,
         h5Caps: List<Pair<String, String>>,
-        streamId: String?,
+        streamIds: List<String>,
         resourceId: String?,
         subtitleCallback: (SubtitleFile) -> Unit
     ): String {
         val trail = ArrayList<String>()
+        val triedIds = ArrayList<String>()
         var ara: String? = null
         var eng: String? = null
         fun absorb(arr: JSONArray?) {
@@ -1295,11 +1375,31 @@ class MovieBoxINProvider : MainAPI() {
             if (eng == null) eng = e
         }
         fun bothFound(): Boolean = ara != null && eng != null
+        // One mobile caption GET: signed headers like every
+        // other mobile call; records "tag=code" in the trail
+        // and absorbs any captions array on 2xx.
+        suspend fun tryMobile(url: String, tag: String) {
+            runCatching {
+                val headers = mbSignedHeaders(
+                    "GET", url, mbUaToken, mbClientInfoToken()
+                ) + mapOf(
+                    "Authorization" to "Bearer $token",
+                    "X-MB-Token" to token
+                )
+                val res = app.get(url, headers = headers)
+                trail += "$tag=${res.code}"
+                if (res.code in 200..299) {
+                    val json = runCatching { JSONObject(res.text) }.getOrNull()
+                    absorb(mbCaptionsArray(json, "extCaptions", "captions"))
+                }
+            }
+        }
         // Route H5 first: every (stream id, format) pair,
         // moviebox.sg first, then the play base if different.
         val h5Bases = listOf(mbWebBase, playBase).distinct()
         for ((sid, fmt) in h5Caps) {
             if (bothFound()) break
+            if (!triedIds.contains(sid)) triedIds += sid
             for (base in h5Bases) {
                 if (bothFound()) break
                 val capUrl = "$base/wefeed-h5api-bff/subject/caption" +
@@ -1327,51 +1427,53 @@ class MovieBoxINProvider : MainAPI() {
                 trail += "h5=$code-ok"
             }
         }
-        // Route mobile ext-captions (IN-exact: subjectId +
-        // resourceId + episode=0 hardcoded).
+        // Route mobile ext-captions. IN-shape (subjectId +
+        // resourceId + episode=0) only when a real resourceId
+        // exists; otherwise subjectId only (mob1), then
+        // resourceId := first stream id + episode=0 (mob2).
         if (!bothFound()) {
-            runCatching {
-                var extUrl = "$mbMobileBase/wefeed-mobile-bff/subject-api/" +
-                    "get-ext-captions?subjectId=$subjectId"
-                if (!resourceId.isNullOrBlank()) extUrl += "&resourceId=$resourceId"
-                extUrl += "&episode=0"
-                val extHeaders = mbSignedHeaders(
-                    "GET", extUrl, mbUaToken, mbClientInfoToken()
-                ) + mapOf(
-                    "Authorization" to "Bearer $token",
-                    "X-MB-Token" to token
+            if (!resourceId.isNullOrBlank()) {
+                tryMobile(
+                    "$mbMobileBase/wefeed-mobile-bff/subject-api/" +
+                        "get-ext-captions?subjectId=$subjectId" +
+                        "&resourceId=$resourceId&episode=0",
+                    "mob"
                 )
-                val extRes = app.get(extUrl, headers = extHeaders)
-                trail += "mob=${extRes.code}"
-                if (extRes.code in 200..299) {
-                    val extJson = runCatching { JSONObject(extRes.text) }.getOrNull()
-                    val arr = mbCaptionsArray(extJson, "extCaptions", "captions")
-                    absorb(arr)
+            } else {
+                tryMobile(
+                    "$mbMobileBase/wefeed-mobile-bff/subject-api/" +
+                        "get-ext-captions?subjectId=$subjectId",
+                    "mob1"
+                )
+                val firstSid = streamIds.firstOrNull()
+                if (!bothFound() && !firstSid.isNullOrBlank()) {
+                    tryMobile(
+                        "$mbMobileBase/wefeed-mobile-bff/subject-api/" +
+                            "get-ext-captions?subjectId=$subjectId" +
+                            "&resourceId=$firstSid&episode=0",
+                        "mob2"
+                    )
                 }
             }
         }
         // Route mobile stream-captions (IN-exact: subjectId +
-        // streamId only — no episode, no resourceId).
-        if (!bothFound() && !streamId.isNullOrBlank()) {
-            runCatching {
-                val streamUrl = "$mbMobileBase/wefeed-mobile-bff/subject-api/" +
-                    "get-stream-captions?subjectId=$subjectId&streamId=$streamId"
-                val streamHeaders = mbSignedHeaders(
-                    "GET", streamUrl, mbUaToken, mbClientInfoToken()
-                ) + mapOf(
-                    "Authorization" to "Bearer $token",
-                    "X-MB-Token" to token
+        // streamId only — no episode, no resourceId), every
+        // stream id in turn.
+        if (!bothFound()) {
+            for (sid in streamIds) {
+                if (bothFound()) break
+                tryMobile(
+                    "$mbMobileBase/wefeed-mobile-bff/subject-api/" +
+                        "get-stream-captions?subjectId=$subjectId&streamId=$sid",
+                    "mobstr"
                 )
-                val streamRes = app.get(streamUrl, headers = streamHeaders)
-                trail += "mobstr=${streamRes.code}"
-                if (streamRes.code in 200..299) {
-                    val streamJson = runCatching { JSONObject(streamRes.text) }.getOrNull()
-                    val arr = mbCaptionsArray(streamJson, "captions", "extCaptions")
-                    absorb(arr)
-                }
             }
         }
-        if (ara == null && eng == null) return "none:" + trail.joinToString("/")
+        if (ara == null && eng == null) {
+            var out = "none:" + trail.joinToString("/")
+            if (triedIds.isNotEmpty()) out += "/ids=" + triedIds.joinToString(",")
+            return out
+        }
         return mbEmitUnion(ara, eng, subtitleCallback)
     }
 
@@ -1394,7 +1496,6 @@ class MovieBoxINProvider : MainAPI() {
         var emitted = 0
         var playCode = "?"
         var tokVia = "none"
-        var streamId: String? = null
         var resourceId: String? = null
         var subDiag = "?"
         val counting: (ExtractorLink) -> Unit = { link ->
@@ -1404,7 +1505,7 @@ class MovieBoxINProvider : MainAPI() {
         if (subjectId.isBlank() || detailPath.isBlank()) {
             emitDebug(
                 listOf(
-                    "MovieBoxIN v2", "srv=0", "ext=0",
+                    "MovieBoxIN v3", "srv=0", "ext=0",
                     "t=${elapsed() / 1000}s", "tok=$tokVia",
                     "play=$playCode", "id-missing"
                 ),
@@ -1471,8 +1572,6 @@ class MovieBoxINProvider : MainAPI() {
                 }
                 streamsFound += streamObjs.size
                 if (streamObjs.isNotEmpty()) {
-                    streamId = streamObjs[0].optString("id")
-                        .ifBlank { null } ?: streamId
                     if (resourceId == null) {
                         resourceId = streamObjs[0].optString("resourceId")
                             .ifBlank { null }
@@ -1480,6 +1579,13 @@ class MovieBoxINProvider : MainAPI() {
                 }
                 // H5 caption candidates — (stream id, format)
                 // from the play response, first id per format.
+                // v3: ALL stream ids (was: first 3) — the
+                // phone's v2 DEBUG showed 6x h5=200-empty while
+                // every id of S1E1 returns real captions live,
+                // so the phone's play response must carry
+                // different ids; widening the net costs one
+                // fast call per id and the tried ids are logged
+                // in the DEBUG trail.
                 val h5Caps = ArrayList<Pair<String, String>>()
                 for (s in streamObjs) {
                     val sid = s.optString("id")
@@ -1491,7 +1597,6 @@ class MovieBoxINProvider : MainAPI() {
                         else -> "MP4"
                     }
                     if (h5Caps.none { it.first == sid }) h5Caps += sid to fmt
-                    if (h5Caps.size >= 3) break
                 }
                 for (s in streamObjs) {
                     if (emitted >= 6 || elapsed() > 25000) break
@@ -1514,9 +1619,12 @@ class MovieBoxINProvider : MainAPI() {
                     )
                 }
                 if (emitted > 0) {
+                    val streamIds = streamObjs.mapNotNull { o ->
+                        o.optString("id").ifBlank { null }
+                    }.distinct()
                     subDiag = mbEmitCaptions(
                         subjectId, detailPath, base, token, h5Caps,
-                        streamId, resourceId, subtitleCallback
+                        streamIds, resourceId, subtitleCallback
                     )
                     break
                 }
@@ -1527,7 +1635,7 @@ class MovieBoxINProvider : MainAPI() {
             // emit the DEBUG line even when playback links exist.
             emitDebug(
                 listOf(
-                    "MovieBoxIN v2", "srv=$streamsFound",
+                    "MovieBoxIN v3", "srv=$streamsFound",
                     "ext=$emitted", "t=${elapsed() / 1000}s",
                     "tok=$tokVia", "play=$playCode",
                     "se=$se", "ep=$ep", "sub=$subDiag"

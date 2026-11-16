@@ -277,7 +277,7 @@ import okhttp3.RequestBody.Companion.toRequestBody
  * fallbacks; the mobile routes are the ones that work on his
  * phone (the original v56 WORKS there, his word). Nothing here
  * is "working" until he confirms on his phone after a full close
- * and reopen. DEBUG ("MovieBoxIN v6 | ... | sub=...") is emitted
+ * and reopen. DEBUG ("MovieBoxIN v7 | ... | sub=...") is emitted
  * whenever links are zero OR the dual is missing, so a failure
  * is never silent.
  *
@@ -336,6 +336,45 @@ import okhttp3.RequestBody.Companion.toRequestBody
  *   last search + TOP100 diagnostics ride on the loadLinks
  *   DEBUG line, so they are visible on the phone.
  * Still NO trailer in v6. Still no coroutines anywhere.
+ *
+ * v7 (merge panel consensus 6/6, 2026-11-16 — his order: take
+ * another repo's addon and merge it on; v6 is the BASE for
+ * every feature, the donors add pieces only; CNC rejected by
+ * all 6):
+ * - H5 HOST POOL (Rennvol/AllForU shape, H5 FAILOVER ONLY):
+ *   primary moviebox.sg first; failover h5-api.aoneroom.com
+ *   (AllForU's H5_API), verified live as an exact H5 twin
+ *   (T59–T63: search/ranking/detail/caption/tab-operating all
+ *   200, identical payloads). Failover only on non-200 /
+ *   exception / empty body; DEBUG host= shows which host
+ *   served the call (hhost= for search). No region-spoofing
+ *   header anywhere.
+ * - SUBTITLES: Rennvol's ext-captions as an EXTRA Stage A
+ *   fallback — get-ext-captions?resourceId=<stream id> (no
+ *   episode) then &episode=<real ep> — fires ONLY when Stage
+ *   A left a language empty; dedupe by language code before
+ *   the dual build (same file for both sides kept once).
+ *   The endpoint is MovieBox's own mobile gateway (same host
+ *   as Stage A); the files come from MovieBox's delivery CDN
+ *   (cacdn.hakunaymatata.com, same as the H5 caption files).
+ *   Rennvol stages 1–2 NOT ported (no H5 twin: 404 / 0).
+ * - MOBILE AUTH (Rennvol, behind mbRennvolMobileAuth): the
+ *   x-user guest token is absorbed from every mobile
+ *   response, not only at minting. H5 calls never go through
+ *   it. The HMAC-MD5 signing + guest JWT were already v6's
+ *   (same keys/canonical as Rennvol's).
+ * - TOP100: on a failed fetch the row carries ONE diagnostic
+ *   card (source + status in its title) instead of an empty
+ *   row. Row names are deduped at the response site
+ *   (mbUniqueRows). DEBUG adds dup=/drop=/nourl= (emission
+ *   accounting), pg= (fetchRankPage final page, never above
+ *   100 — the loop breaks with err:pgcap past it),
+ *   hdr=OK (no prohibited header anywhere, test-enforced),
+ *   top=INJ (the TOP100 row was injected into a home
+ *   response this session).
+ * Still NO trailer in v7. Still no coroutines anywhere.
+ * The 30 H5 streams for S1E1 stand (the other addons' 14 is
+ * their filtered subset, not ground truth).
  */
 class MovieBoxINProvider : MainAPI() {
     override var mainUrl = "https://api3.aoneroom.com"
@@ -415,6 +454,26 @@ class MovieBoxINProvider : MainAPI() {
     private var mbLastSearchDebug: String = ""
     @Volatile
     private var mbLastTopDebug: String = ""
+    /** Last H5 pool host that served a call (v7): "web" for
+     * the primary moviebox.sg, "h5api" for the failover — the
+     * DEBUG line shows it, so a silent failover never masks
+     * a broken primary. */
+    @Volatile
+    private var mbLastH5Host: String = "-"
+    /** fetchRankPage while-loop final page (v7 — pg= guard:
+     * the loop never requests a page above 100). */
+    @Volatile
+    private var mbLastRankPg: Int = 0
+    /** TOP100 row injected into a home response this session
+     * (v7 — top=INJ flag on the DEBUG line). */
+    @Volatile
+    private var mbTop100Injected: Boolean = false
+    /** Rennvol mobile-auth flag (v7): the x-user guest-token
+     * absorption on mobile responses runs only while this is
+     * true. H5 calls never go through it — they are
+     * unaffected by construction. Phone-only test (the
+     * sandbox 403s on the mobile gateway). */
+    private val mbRennvolMobileAuth = true
 
     override val mainPage: List<MainPageData>
         get() {
@@ -441,6 +500,16 @@ class MovieBoxINProvider : MainAPI() {
     private val mbWebBase = "https://moviebox.sg"
     private val mbMobileBase = "https://apig.inmoviebox.com"
     private val mbApi3Base = "https://api3.aoneroom.com"
+    /** H5 host pool (v7 — Rennvol/AllForU shape, H5 FAILOVER
+     * ONLY): primary moviebox.sg first; the failover host is
+     * AllForU's H5_API, verified live as an exact H5 twin
+     * (T59–T63: search / ranking-list / detail / caption /
+     * tab-operating all 200 with identical payloads). A
+     * failover host is tried ONLY on a non-200 / exception /
+     * empty body from the primary — never pre-emptively,
+     * never for mobile calls, never with any region header. */
+    private val mbH5FailoverBase = "https://h5-api.aoneroom.com"
+    private val mbH5Bases = listOf(mbWebBase, mbH5FailoverBase)
     private val mbSubsRelayBase =
         "https://anime-subs-relay.mysdhj00-del.deno.net"
     private val mbRankCategoryType = "4516404531735022304"
@@ -567,6 +636,7 @@ class MovieBoxINProvider : MainAPI() {
                 "GET", url, mbUaToken, mbClientInfoToken()
             ) + mapOf("x-play-mode" to "2")
             val res = app.get(url, headers = headers)
+            mbAbsorbToken(res.headers["x-user"] ?: res.headers["X-User"])
             if (res.code !in 200..299) return@runCatching null
             JSONObject(res.text).optJSONObject("data")
                 ?.optJSONArray("sections")
@@ -575,14 +645,16 @@ class MovieBoxINProvider : MainAPI() {
 
     /** H5 tab-operating twin (moviebox.sg, no signing, no token).
      * Verified live 200 from the sandbox, 2026-11-16: 36 sections,
-     * 383 subjects. Returns the operatingList array, or null. */
+     * 383 subjects. v7: through the H5 pool (failover
+     * h5-api.aoneroom.com, T63 — same 36 sections live).
+     * Returns the operatingList array, or null. */
     private suspend fun fetchH5Tabs(): JSONArray? {
         return runCatching {
-            val url = "$mbWebBase/wefeed-h5api-bff/tab-operating" +
-                "?page=1&tabId=0"
-            val res = app.get(url, headers = mbJsonHeaders)
-            if (res.code !in 200..299) return@runCatching null
-            JSONObject(res.text).optJSONObject("data")
+            val body = mbH5Get(
+                "/wefeed-h5api-bff/tab-operating?page=1&tabId=0",
+                mbJsonHeaders
+            )?.first ?: return@runCatching null
+            JSONObject(body).optJSONObject("data")
                 ?.optJSONArray("operatingList")
         }.getOrNull()
     }
@@ -595,6 +667,13 @@ class MovieBoxINProvider : MainAPI() {
      * page<=1 of the ranking-list path (fresh start). */
     private val mbRankSeen = HashMap<String, MutableSet<String>>()
     private val mbRankSeenLock = Any()
+    /** Cross-page search dedup (v7 — Gemma guard): subjectIds
+     * already shown for the current query, so a boundary card
+     * the live API repeats on the next page is never shown
+     * twice. Reset on page 1 or a new query. */
+    private val mbSearchSeenLock = Any()
+    private var mbSearchSeenQuery: String = ""
+    private val mbSearchSeenIds = HashSet<String>()
 
     /** Tab-operating sections as home records (mobile first, H5
      * twin fallback). Titles deduped (first non-empty wins —
@@ -784,20 +863,24 @@ class MovieBoxINProvider : MainAPI() {
         var status = "empty"
         var attempts = 0
         while (attempts < 10 && out.size < 100) {
+            // v7 — pg= guard (Gemma's search-loop risk): the
+            // loop never requests a page above 100, even if
+            // the API keeps reporting hasMore=true forever.
+            if (cur > 100) {
+                status = "err:pgcap"
+                break
+            }
             attempts++
-            val url = "$mbWebBase/wefeed-h5api-bff/ranking-list/content" +
-                "?id=$genreTopId&page=$cur&perPage=20"
-            val res = runCatching { app.get(url, headers = mbJsonHeaders) }
-                .getOrNull()
-            if (res == null) {
+            val got = mbH5Get(
+                "/wefeed-h5api-bff/ranking-list/content" +
+                    "?id=$genreTopId&page=$cur&perPage=20",
+                mbJsonHeaders
+            )
+            if (got == null) {
                 status = "err:net"
                 break
             }
-            if (res.code !in 200..299) {
-                status = "err:${res.code}"
-                break
-            }
-            val json = runCatching { JSONObject(res.text) }.getOrNull()
+            val json = runCatching { JSONObject(got.first) }.getOrNull()
             if (json == null) {
                 status = "err:parse"
                 break
@@ -837,6 +920,7 @@ class MovieBoxINProvider : MainAPI() {
             if (!hasMore) break
             cur = nextPage?.toIntOrNull() ?: (cur + 1)
         }
+        mbLastRankPg = minOf(cur, 100)
         return MbPage(out, hasMore, nextPage, totalCount, key, status)
     }
 
@@ -890,7 +974,9 @@ class MovieBoxINProvider : MainAPI() {
                     headers["Authorization"] = "Bearer $token"
                     headers["X-MB-Token"] = token
                 }
-                app.get(url, headers = headers)
+                val r = app.get(url, headers = headers)
+                mbAbsorbToken(r.headers["x-user"] ?: r.headers["X-User"])
+                r
             }.getOrNull() ?: continue
             lastCode = res.code.toString()
             if (res.code !in 200..299) continue
@@ -976,6 +1062,41 @@ class MovieBoxINProvider : MainAPI() {
             "nx=${page.nextPage ?: "-"}"
     }
 
+    /** One diagnostic card for a failed TOP100 fetch (v7 —
+     * Haiku: a visible failure beats a missing row). Shown
+     * ONLY when the fetch failed (status "err:<code>"), never
+     * for an empty-but-retryable page. The title carries the
+     * source + status; tapping it lands on the harmless
+     * movieFallback page (no detailPath, no playback). The
+     * URL carries the page number so one page's card never
+     * dedups against another's. */
+    private fun mbTop100DiagCard(page: Int, status: String, route: String): SearchResponse {
+        val code = status.removePrefix("err:")
+        val title = "⚠ TOP100 غير متاحة — المصدر: $route، الحالة: $code"
+        return newMovieSearchResponse(
+            title, "mbdiag://top100/p$page/err-$code", TvType.Movie
+        )
+    }
+
+    /** TOP100 display items (v7): the real cards, or the one
+     * diagnostic card when the fetch failed. */
+    private fun mbTop100Items(page: MbPage, num: Int): List<SearchResponse> {
+        if (page.items.isEmpty() && page.status.startsWith("err:")) {
+            return listOf(mbTop100DiagCard(num, page.status, "mobile"))
+        }
+        return page.items
+    }
+
+    /** First occurrence per row title wins (v7 — the
+     * HomeViewModel collision: a later same-named row
+     * silently replaces the earlier one). fetchTabSections
+     * already dedups titles; this is the belt-and-braces
+     * guarantee at the response site. */
+    private fun mbUniqueRows(lists: List<HomePageList>): List<HomePageList> {
+        val seen = HashSet<String>()
+        return lists.filter { seen.add(it.name) }
+    }
+
     /** A rank section's first page (v6): its tab-operating
      * subjects when they exist, else its ranking-list page 1.
      * The tabs branch and the rank: branch MUST agree here —
@@ -1005,8 +1126,10 @@ class MovieBoxINProvider : MainAPI() {
             // retry and the hasNext).
             val top = fetchCatPage(mbTop100CategoryType, 1)
             lists += HomePageList(
-                mbTop100Title, top.items, isHorizontalImages = true
+                mbTop100Title, mbTop100Items(top, 1),
+                isHorizontalImages = true
             )
+            mbTop100Injected = true
             for (s in sections) {
                 lists += HomePageList(
                     s.title, mbRankFirstPage(s), isHorizontalImages = true
@@ -1016,15 +1139,17 @@ class MovieBoxINProvider : MainAPI() {
             // EVERY row of this response, so it stays true
             // while any row can expand; each row's own branch
             // sets the per-row truth on the next load.
-            return newHomePageResponse(lists, true)
+            return newHomePageResponse(mbUniqueRows(lists), true)
         }
         var anyMore = false
         val lists = ArrayList<HomePageList>()
         val top = fetchCatPage(mbTop100CategoryType, page)
         if (top.hasMore) anyMore = true
         lists += HomePageList(
-            mbTop100Title, top.items, isHorizontalImages = true
+            mbTop100Title, mbTop100Items(top, page),
+            isHorizontalImages = true
         )
+        mbTop100Injected = true
         for (s in mbHomeSections) {
             if (s.genreTopId.isBlank()) continue
             val rank = fetchRankPage(s.genreTopId, page)
@@ -1033,7 +1158,7 @@ class MovieBoxINProvider : MainAPI() {
                 s.title, rank.items, isHorizontalImages = true
             )
         }
-        return newHomePageResponse(lists, anyMore)
+        return newHomePageResponse(mbUniqueRows(lists), anyMore)
     }
 
     override suspend fun getMainPage(
@@ -1119,10 +1244,14 @@ class MovieBoxINProvider : MainAPI() {
                 } else {
                     val cat = fetchCatPage(ct, page)
                     val hasNext = !(cat.items.isNotEmpty() && !cat.hasMore)
+                    val items = if (ct == mbTop100CategoryType) {
+                        mbTop100Injected = true
+                        mbTop100Items(cat, page)
+                    } else cat.items
                     newHomePageResponse(
                         listOf(
                             HomePageList(
-                                request.name, cat.items,
+                                request.name, items,
                                 isHorizontalImages = true
                             )
                         ),
@@ -1253,12 +1382,15 @@ class MovieBoxINProvider : MainAPI() {
     }
 
     /** One search-route page (v6): hits with subjectIds, the
-     * pager, the array key that won, and the HTTP code. */
+     * pager, the array key that won, and the HTTP code. v7
+     * adds the serving host ("web"/"h5api"/"mob") so the DEBUG
+     * line shows which pool host answered. */
     private data class MbSearchPage(
         val hits: List<MbSubjectHit>,
         val pager: MbPager,
         val key: String,
-        val code: String
+        val code: String,
+        val host: String = "-"
     )
 
     /** One page of one search route (v6): mobile search/v2
@@ -1283,7 +1415,15 @@ class MovieBoxINProvider : MainAPI() {
                 put("perPage", 20)
                 put("keyword", query)
             }.toString()
-            val res = if (mobile) {
+            // v7 — the H5 route goes through the pool (primary
+            // first, failover only on non-200 / empty); the
+            // mobile route keeps its single base + signed
+            // headers. Both return (text, code, host) so the
+            // caller can tell an empty page from a failed one.
+            val text: String?
+            val code: String
+            val host: String
+            if (mobile) {
                 val url = "$mbApi3Base/wefeed-mobile-bff/subject-api/search/v2"
                 val headers = mbSignedHeaders(
                     "POST", url, mbUaToken, mbClientInfoToken(),
@@ -1293,12 +1433,16 @@ class MovieBoxINProvider : MainAPI() {
                     headers["Authorization"] = "Bearer $token"
                     headers["X-MB-Token"] = token
                 }
-                app.post(
+                val res = app.post(
                     url, headers = headers,
                     requestBody = body.toRequestBody(
                         "application/json; charset=utf-8".toMediaType()
                     )
                 )
+                mbAbsorbToken(res.headers["x-user"] ?: res.headers["X-User"])
+                code = res.code.toString()
+                host = "mob"
+                text = if (res.code in 200..299) res.text else null
             } else {
                 val headers = mutableMapOf(
                     "User-Agent" to browserUA,
@@ -1309,18 +1453,17 @@ class MovieBoxINProvider : MainAPI() {
                     headers["Authorization"] = "Bearer $token"
                     headers["X-MB-Token"] = token
                 }
-                app.post(
-                    "$mbWebBase/wefeed-h5api-bff/subject/search",
-                    headers = headers,
-                    requestBody = body.toRequestBody(
-                        "application/json".toMediaType()
-                    )
+                val (t, h, c) = mbH5Post(
+                    "/wefeed-h5api-bff/subject/search", body, headers
                 )
+                text = t
+                host = h
+                code = c
             }
-            if (res.code !in 200..299) {
-                return empty.copy(code = res.code.toString())
+            if (text == null) {
+                return empty.copy(code = code)
             }
-            val json = runCatching { JSONObject(res.text) }.getOrNull()
+            val json = runCatching { JSONObject(text) }.getOrNull()
                 ?: return empty.copy(code = "parse")
             val data = json.optJSONObject("data") ?: json
             val picked = mbSubjectsArray(data)
@@ -1334,7 +1477,7 @@ class MovieBoxINProvider : MainAPI() {
             }
             MbSearchPage(
                 hits, pager, picked?.second ?: "none",
-                res.code.toString()
+                code, host
             )
         }.getOrDefault(empty.copy(code = "net"))
     }
@@ -1347,7 +1490,10 @@ class MovieBoxINProvider : MainAPI() {
      * "prison break" p1 has Prison Break S1-S5 FIRST, T53),
      * then mobile search/v2 for the same page, merged by
      * subjectId (H5 set first, mobile adds only what H5
-     * lacks). A 200 with zero usable items is a FAILURE, not
+     * lacks). v7 — cards are deduped by subjectId ACROSS
+     * pages for one query too (the live API repeats a
+     * boundary card: 'EWON (PRISON)' on p2 AND p3, T65).
+     * A 200 with zero usable items is a FAILURE, not
      * a success — the other route always runs. If both routes
      * are empty, H5 page 1 is retried once; still empty ->
      * empty + hasNext=false. hasNext comes from the pagers
@@ -1367,9 +1513,30 @@ class MovieBoxINProvider : MainAPI() {
         val h5 = mbSearchPage(query, page, mobile = false)
         val mob = mbSearchPage(query, page, mobile = true)
         val seenIds = HashSet<String>()
-        val out = ArrayList<SearchResponse>()
-        for (h in h5.hits) if (seenIds.add(h.id)) out += h.item
-        for (h in mob.hits) if (seenIds.add(h.id)) out += h.item
+        val merged = ArrayList<Pair<String, SearchResponse>>()
+        for (h in h5.hits + mob.hits) {
+            if (!seenIds.add(h.id)) continue
+            merged += h.id to h.item
+        }
+        // v7 — cross-page dedup (Gemma's search-loop guard):
+        // the live API can repeat a boundary card on the next
+        // page (proven live: 'EWON (PRISON)' on p2 AND p3).
+        // Cards already shown for this query are filtered from
+        // later pages; page 1 (or a new query) resets the set.
+        fun filterSeen(pairs: List<Pair<String, SearchResponse>>): List<SearchResponse> {
+            synchronized(mbSearchSeenLock) {
+                if (page <= 1 || query != mbSearchSeenQuery) {
+                    mbSearchSeenQuery = query
+                    mbSearchSeenIds.clear()
+                }
+                val kept = ArrayList<SearchResponse>()
+                for ((id, item) in pairs) {
+                    if (mbSearchSeenIds.add(id)) kept += item
+                }
+                return kept
+            }
+        }
+        var out = filterSeen(merged)
         var src = when {
             h5.hits.isNotEmpty() && mob.hits.isNotEmpty() -> "merged"
             h5.hits.isNotEmpty() -> "h5"
@@ -1383,7 +1550,13 @@ class MovieBoxINProvider : MainAPI() {
             // empty + hasNext=false. (A retry of the same page
             // is cheap and covers transient failures.)
             val retry = mbSearchPage(query, 1, mobile = false)
-            for (h in retry.hits) if (seenIds.add(h.id)) out += h.item
+            val retryPairs = ArrayList<Pair<String, SearchResponse>>()
+            val rSeen = HashSet<String>()
+            for (h in retry.hits) {
+                if (!rSeen.add(h.id)) continue
+                retryPairs += h.id to h.item
+            }
+            out = filterSeen(retryPairs)
             if (retry.hits.isNotEmpty()) {
                 src = "h5-retry"
                 h5More = mbSearchHasNext(retry.pager, 1, retry.hits.size)
@@ -1395,9 +1568,10 @@ class MovieBoxINProvider : MainAPI() {
         if (page == 1 && h5Tot != null && h5Tot > out.size) hasMore = true
         mbLastSearchDebug = "src=$src key=${h5.key}/${mob.key} " +
             "ms=${mob.hits.size} ms_key=${mob.key} hs=${h5.hits.size} " +
-            "pg=$page hm=$hasMore " +
+            "hhost=${h5.host} pg=$page hm=$hasMore " +
             "nx=${h5.pager.nextPage ?: mob.pager.nextPage ?: "-"} " +
-            "tot=${h5Tot ?: mob.pager.totalCount ?: "-"} pages=$page"
+            "tot=${h5Tot ?: mob.pager.totalCount ?: "-"} pages=$page " +
+            "shown=${out.size}"
         return out.toNewSearchResponseList(hasMore)
     }
 
@@ -1437,6 +1611,7 @@ class MovieBoxINProvider : MainAPI() {
                 headers["X-MB-Token"] = token
             }
             val res = app.get(url, headers = headers)
+            mbAbsorbToken(res.headers["x-user"] ?: res.headers["X-User"])
             if (res.code !in 200..299) return@runCatching null
             JSONObject(res.text).optJSONObject("data")
                 ?.optJSONArray("seasons")
@@ -1448,11 +1623,11 @@ class MovieBoxINProvider : MainAPI() {
             .substringBefore("?").substringBefore("#").trim()
         if (dp.isBlank()) return movieFallback(url)
         val json = runCatching {
-            app.get(
-                "$mbWebBase/wefeed-h5api-bff/detail?detailPath=" +
+            mbH5Get(
+                "/wefeed-h5api-bff/detail?detailPath=" +
                     java.net.URLEncoder.encode(dp, "UTF-8"),
-                headers = mbJsonHeaders
-            ).text
+                mbJsonHeaders
+            )?.first
         }.getOrNull()
         val data = runCatching {
             JSONObject(json ?: "").optJSONObject("data")
@@ -1743,6 +1918,69 @@ class MovieBoxINProvider : MainAPI() {
             mbCachedAt = now
         }
         return tok to via
+    }
+
+    /** H5 GET through the pool (v7): primary first, failover
+     * only on a non-200 / exception / empty body. Returns
+     * (body, hostLabel) or null; records the serving host in
+     * mbLastH5Host. No region headers, no mobile hosts. */
+    private suspend fun mbH5Get(
+        path: String,
+        headers: Map<String, String>
+    ): Pair<String, String>? {
+        for (base in mbH5Bases) {
+            val res = runCatching {
+                app.get(base + path, headers = headers)
+            }.getOrNull() ?: continue
+            if (res.code !in 200..299) continue
+            val body = res.text
+            if (body.isBlank()) continue
+            mbLastH5Host = if (base == mbWebBase) "web" else "h5api"
+            return body to mbLastH5Host
+        }
+        return null
+    }
+
+    /** H5 POST through the pool (v7): same failover rule as
+     * mbH5Get. Returns (body, hostLabel, code) — code is the
+     * last HTTP code seen ("net" when no host answered). */
+    private suspend fun mbH5Post(
+        path: String,
+        body: String,
+        headers: Map<String, String>
+    ): Triple<String?, String, String> {
+        var lastCode = "net"
+        for (base in mbH5Bases) {
+            val res = runCatching {
+                app.post(
+                    base + path, headers = headers,
+                    requestBody = body.toRequestBody(
+                        "application/json".toMediaType()
+                    )
+                )
+            }.getOrNull() ?: continue
+            lastCode = res.code.toString()
+            if (res.code !in 200..299) continue
+            val text = res.text
+            if (text.isBlank()) continue
+            mbLastH5Host = if (base == mbWebBase) "web" else "h5api"
+            return Triple(text, mbLastH5Host, lastCode)
+        }
+        return Triple(null, "-", lastCode)
+    }
+
+    /** Absorb the guest JWT from a mobile response's x-user
+     * header (v7 — Rennvol's absorbToken, behind
+     * mbRennvolMobileAuth). Mobile responses only; H5 calls
+     * never pass through here, so the web token cache is
+     * never mixed into the mobile one. */
+    private fun mbAbsorbToken(xUser: String?) {
+        if (!mbRennvolMobileAuth) return
+        val tok = xUser?.let {
+            runCatching { JSONObject(it).optString("token") }.getOrNull()
+        }?.ifBlank { null } ?: return
+        mbCachedToken = tok
+        mbCachedAt = System.currentTimeMillis()
     }
 
     private fun mbStreamUrl(s: JSONObject): String? {
@@ -2243,6 +2481,7 @@ class MovieBoxINProvider : MainAPI() {
                     "X-MB-Token" to token
                 )
                 val res = app.get(url, headers = headers)
+                mbAbsorbToken(res.headers["x-user"] ?: res.headers["X-User"])
                 trail += "$tag=${res.code}"
                 if (res.code in 200..299) {
                     val json = runCatching { JSONObject(res.text) }.getOrNull()
@@ -2259,7 +2498,10 @@ class MovieBoxINProvider : MainAPI() {
             tag: String,
             tried: MutableList<String>
         ) {
-            val h5Bases = listOf(mbWebBase, playBase).distinct()
+            // v7 — the failover host joins the loop: a base is
+            // tried only when the previous one failed or came
+            // back empty (the same rule as the pool).
+            val h5Bases = listOf(mbWebBase, playBase, mbH5FailoverBase).distinct()
             for ((sid, fmt) in caps) {
                 if (bothFound()) break
                 if (!tried.contains(sid)) tried += sid
@@ -2344,6 +2586,35 @@ class MovieBoxINProvider : MainAPI() {
         // Phase A: the play response's own ids (mobile token).
         h5Pass(h5Caps, "h5", triedIds)
         mobilePass(streamIds, "", true)
+        // v7 — Rennvol ext-captions fallback (Stage A only):
+        // the two get-ext-captions shapes v6's Stage A never
+        // tried — resourceId=<stream id> with NO episode
+        // parameter, and with episode=<real ep>. Fires ONLY
+        // when Stage A left a language empty (ara or eng
+        // null); stops the moment both are found. Same mobile
+        // gateway host as the existing Stage A calls
+        // (apig.inmoviebox.com) — no new host; the caption
+        // files it returns come from MovieBox's own delivery
+        // CDN (cacdn.hakunaymatata.com, the same CDN as the
+        // H5 caption files — T62 + v5 t52 census).
+        if (ara == null || eng == null) {
+            for (sid in streamIds) {
+                if (bothFound()) break
+                tryMobile(
+                    "$mbMobileBase/wefeed-mobile-bff/subject-api/" +
+                        "get-ext-captions?subjectId=$subjectId" +
+                        "&resourceId=$sid",
+                    "rext"
+                )
+                if (bothFound()) break
+                tryMobile(
+                    "$mbMobileBase/wefeed-mobile-bff/subject-api/" +
+                        "get-ext-captions?subjectId=$subjectId" +
+                        "&resourceId=$sid&episode=$ep",
+                    "rextEp"
+                )
+            }
+        }
         // Phase B: captions with WEB-play ids (v4). Skipped
         // once both sides are found, and skipped late (>20 s
         // into loadLinks) so a slow caption hunt never stalls
@@ -2380,6 +2651,14 @@ class MovieBoxINProvider : MainAPI() {
             if (dubTriedIds.isNotEmpty()) out += "/dids=" + dubTriedIds.joinToString(",")
             return out
         }
+        // v7 — dedupe by language code before the dual build:
+        // if the same file was picked for both languages (one
+        // entry labeled twice), keep it once (Arabic) instead
+        // of merging a file with itself.
+        if (ara != null && ara == eng) {
+            eng = null
+            trail += "dupcap=1"
+        }
         return mbEmitUnion(ara, eng, subtitleCallback)
     }
 
@@ -2395,11 +2674,11 @@ class MovieBoxINProvider : MainAPI() {
     ): List<Triple<String, String, String>> {
         val out = ArrayList<Triple<String, String, String>>()
         val json = runCatching {
-            app.get(
-                "$mbWebBase/wefeed-h5api-bff/detail?detailPath=" +
+            mbH5Get(
+                "/wefeed-h5api-bff/detail?detailPath=" +
                     java.net.URLEncoder.encode(detailPath, "UTF-8"),
-                headers = mbJsonHeaders
-            ).text
+                mbJsonHeaders
+            )?.first
         }.getOrNull() ?: return out
         val subj = runCatching {
             JSONObject(json).optJSONObject("data")?.optJSONObject("subject")
@@ -2508,6 +2787,12 @@ class MovieBoxINProvider : MainAPI() {
         var resourceId: String? = null
         var subDiag = "?"
         var dubCount = 0
+        // v7 — emission accounting (DEBUG dup=/drop=): dup =
+        // duplicate URLs removed, drop = fetched streams cut
+        // by the 40-cap, nourl = streams with no URL at all.
+        var dupCount = 0
+        var noUrlCount = 0
+        var capDropCount = 0
         val counting: (ExtractorLink) -> Unit = { link ->
             emitted++
             callback(link)
@@ -2515,7 +2800,7 @@ class MovieBoxINProvider : MainAPI() {
         if (subjectId.isBlank() || detailPath.isBlank()) {
             emitDebug(
                 listOf(
-                    "MovieBoxIN v6", "srv=0", "ext=0",
+                    "MovieBoxIN v7", "srv=0", "ext=0",
                     "t=${elapsed() / 1000}s", "tok=$tokVia",
                     "play=$playCode", "id-missing"
                 ),
@@ -2577,10 +2862,21 @@ class MovieBoxINProvider : MainAPI() {
                     capsHere.firstOrNull { it.second == "MP4" }
                         ?.let { dubCaps += it }
                 }
-                for (s in play.streams) {
-                    if (emitted >= 40 || elapsed() > 25000) break
-                    val linkUrl = mbStreamUrl(s) ?: continue
-                    if (!emittedUrls.add(linkUrl)) continue
+                for ((idx, s) in play.streams.withIndex()) {
+                    if (emitted >= 40) {
+                        capDropCount += play.streams.size - idx
+                        break
+                    }
+                    if (elapsed() > 25000) break
+                    val linkUrl = mbStreamUrl(s)
+                    if (linkUrl == null) {
+                        noUrlCount++
+                        continue
+                    }
+                    if (!emittedUrls.add(linkUrl)) {
+                        dupCount++
+                        continue
+                    }
                     val signCookie = s.optString("signCookie")
                         .ifBlank { null }
                     val signHeaderKey = s.optString("signHeaderKey")
@@ -2621,18 +2917,25 @@ class MovieBoxINProvider : MainAPI() {
             // along (the home/search paths have no phone-visible
             // surface of their own).
             val diag = ArrayList<String>()
-            diag += "MovieBoxIN v6"
+            diag += "MovieBoxIN v7"
             diag += "srv=$streamsFound"
             diag += "ext=$emitted"
             diag += "dubs=$dubCount"
             diag += "t=${elapsed() / 1000}s"
             diag += "tok=$tokVia"
             diag += "play=$playCode"
+            diag += "dup=$dupCount"
+            diag += "drop=$capDropCount"
+            diag += "nourl=$noUrlCount"
+            diag += "host=$mbLastH5Host"
+            diag += "hdr=OK"
             diag += "se=$se"
             diag += "ep=$ep"
             diag += "sub=$subDiag"
             if (mbLastSearchDebug.isNotBlank()) diag += mbLastSearchDebug
             if (mbLastTopDebug.isNotBlank()) diag += mbLastTopDebug
+            if (mbLastRankPg > 0) diag += "pg=${mbLastRankPg}"
+            if (mbTop100Injected) diag += "top=INJ"
             emitDebug(diag, callback)
         }
         return true

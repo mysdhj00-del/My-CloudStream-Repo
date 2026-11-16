@@ -1,5 +1,5 @@
 // MovieBoxIN CloudStream plugin module.
-version = 12
+version = 13
 
 android {
     namespace = "com.movieboxin"

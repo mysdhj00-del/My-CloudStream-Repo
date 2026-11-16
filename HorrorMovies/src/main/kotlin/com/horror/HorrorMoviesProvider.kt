@@ -20,6 +20,7 @@ import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.loadExtractor
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import org.json.JSONObject
+import org.json.JSONArray
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import android.util.Base64
@@ -1530,7 +1531,7 @@ class HorrorMoviesProvider : MainAPI() {
         }
         if (emitted == 0 && allowDebug) {
             emitDebug(
-                listOf("Horror v19·$lane") + diagExtra +
+                listOf("Horror v21·$lane") + diagExtra +
                     listOf("srv=${embeds.size}", "ext=$extOk",
                         "dig=$digOk", "relay=$relayOk", "t=${elapsed() / 1000}s"),
                 callback
@@ -1601,7 +1602,7 @@ class HorrorMoviesProvider : MainAPI() {
     ): Boolean {
         val res = runCatching { app.get(data, headers = browserHeaders) }.getOrNull()
         if (res == null) {
-            emitDebug(listOf("Horror v19·EgyBest", "page-fail"), callback)
+            emitDebug(listOf("Horror v21·EgyBest", "page-fail"), callback)
             return true
         }
         val text = res.text
@@ -2143,32 +2144,201 @@ class HorrorMoviesProvider : MainAPI() {
         ).find(t)
         if (m1 != null) {
             val g = m1.groupValues[1].uppercase()
-            return mbRoman[g] ?: g.toIntOrNull() ?: 0
+            return mbPartNum(g)
         }
         val m2 = Regex("""\s+([IVXLCDM]+|\d+)\s*$""")
             .find(t.substringBefore(":").trim())
         if (m2 != null) {
             val g = m2.groupValues[1].uppercase()
-            return mbRoman[g] ?: g.toIntOrNull() ?: 0
+            return mbPartNum(g)
         }
         return 0
+    }
+
+    /** v21: a trailing 4-digit year (1900-2099) is a year, not a
+     * part number ("Godzilla 2000" -> part 0, not 2000). */
+    private fun mbPartNum(g: String): Int {
+        val n = g.toIntOrNull()
+        if (n != null && g.length == 4 && n in 1900..2099) return 0
+        return mbRoman[g] ?: n ?: 0
     }
 
     private fun mbFranchiseYear(releaseDate: String?): Int =
         releaseDate?.take(4)?.toIntOrNull() ?: 0
 
+    /** v21: normalized base key for comparison — lowercase,
+     * commas/brackets/quotes removed, all whitespace removed.
+     * Fixes spacing variants ("The Texas Chain Saw Massacre"
+     * == "The Texas Chainsaw Massacre") and bracket variants
+     * ("[Rec]" == "REC"). Deliberately does NOT strip a
+     * leading "the ": "Conjuring" (the look-alike
+     * "Conjuring: The Beyond") must NOT equal "The Conjuring",
+     * and "Purge" must NOT equal "The Purge". */
+    private fun mbBaseKey(title: String): String {
+        var t = mbFranchiseBase(title).lowercase()
+        t = t.replace(Regex("""[,\[\]()\"'’]"""), "")
+        return Regex("""\s+""").replace(t, "")
+    }
+
+    /** v21: normalized title key for dedup — lowercase, bracketed
+     * suffixes ("[English]", "[HD]") removed, leading "the "
+     * stripped, all whitespace/quotes removed. Unlike mbBaseKey
+     * it keeps the subtitle after the colon, so two different
+     * films of one franchise in one year ("Godzilla: King of
+     * the Monsters" vs "Godzilla: The Planet Eater", 2019) do
+     * NOT collide — while spacing variants ("The Texas Chain
+     * Saw Massacre") and dub variants ("... [English]") do. */
+    private fun mbTitleKey(title: String): String {
+        var t = title.lowercase()
+        t = Regex("""\[[^\]]*\]""").replace(t, "")
+        if (t.trim().startsWith("the ")) t = t.trim().substring(4)
+        t = t.replace(Regex("""[\"'’]"""), "")
+        return Regex("""\s+""").replace(t, "").trim()
+    }
+
+    /** v21: franchise alias groups — renamed sequels that share
+     * NO title words with the franchise name, so no structural
+     * rule can match them. A base belongs to a group if it
+     * equals any member (normalized keys); groups are checked
+     * both ways, so opening a renamed sequel still shows the
+     * rest. Deliberately NOT included: Ju-on (a separate
+     * Japanese series, not The Grudge parts) and the
+     * Conjuring-universe crossovers (Annabelle / The Nun are
+     * their own franchises, not Conjuring parts). */
+    private val mbFranchiseAliases: List<Set<String>> = listOf(
+        setOf("saw", "jigsaw", "spiral"),
+        setOf("child's play", "bride of chucky", "seed of chucky",
+            "curse of chucky", "cult of chucky"),
+        setOf("the texas chainsaw massacre", "texas chainsaw massacre",
+            "leatherface", "texas chainsaw"),
+        setOf("a nightmare on elm street", "nightmare on elm street",
+            "new nightmare", "freddy's dead", "freddy vs. jason"),
+        setOf("friday the 13th", "freddy vs. jason",
+            "jason goes to hell"),
+        setOf("the ring", "rings", "ring"),
+        setOf("28 days later", "28 weeks later", "28 years later"),
+        setOf("godzilla", "shin godzilla", "son of godzilla",
+            "the return of godzilla", "return of godzilla")
+    ).map { g -> g.map { mbBaseKey(it) }.toSet() }
+
+    /** v21: does a candidate title belong to the current film's
+     * franchise? Rules (in order):
+     *  A. exact base match (normalized keys).
+     *  B. prefix subtitle — the candidate's pre-colon title
+     *     starts with the base + a space ("Halloween Kills",
+     *     "Annabelle Comes Home", "Godzilla Minus One",
+     *     "The Ring Two", "Paranormal Activity - Next of Kin").
+     *  C. post-colon franchise — the base of the part after the
+     *     colon equals the current base ("Hellbound: Hellraiser
+     *     II", "Leatherface: Texas Chainsaw Massacre III").
+     *  D. "vs." split — either side's base equals the current
+     *     base ("King Kong vs. Godzilla", "Mothra vs. Godzilla").
+     *  E. alias group (see mbFranchiseAliases).
+     *  F. inverted subtitle — "The <sequence-word> <last word
+     *     of the base>" ("The First Purge", "The Forever
+     *     Purge"); the middle word must be an ordinal/finality
+     *     word so "The Wedding Ring" / "The Christmas Ring" do
+     *     NOT match "The Ring".
+     * Known trade-off (NOTES.md): Rule B can include a few
+     * unrelated same-prefix films ('Halloween Night',
+     * 'Insidious Tales') — a title-only match cannot tell a
+     * sequel from a same-name film, and missing real parts is
+     * the worse failure for his order. The v17 look-alike
+     * exclusions still hold: "Conjuring: The Beyond" and
+     * "The Nun II" do NOT match "The Conjuring". */
+    private fun mbIsFranchisePart(candidate: String, base: String): Boolean {
+        val baseKey = mbBaseKey(base)
+        if (baseKey.length < 2) return false
+        val candBase = mbFranchiseBase(candidate)
+        val candKey = mbBaseKey(candidate)
+        if (candKey == baseKey) return true // A
+        val baseNorm = mbFranchiseBase(base).lowercase()
+        // B: prefix subtitle on the pre-colon title
+        // ("Halloween Kills", "Annabelle Comes Home", "Godzilla
+        // Minus One", "The Ring Two", "Paranormal Activity -
+        // Next of Kin"). Punctuation is first normalized to a
+        // space, so "Godzilla, Mothra and King Ghidorah: ..."
+        // also matches. Gated on a base of 5+ characters so a
+        // 3-letter base like "REC" does not swallow "Rec Man".
+        val preNorm = candidate.substringBefore(":").trim().lowercase()
+            .replace(Regex("""[^a-z0-9]+"""), " ").trim()
+        if (baseKey.length >= 5 && preNorm.startsWith(baseNorm + " ")) return true
+        // C: post-colon franchise — the base of the part after
+        // the colon equals the current base AND the post-colon
+        // part carries a part number or is longer than the base
+        // ("Hellbound: Hellraiser II", "Leatherface: Texas
+        // Chainsaw Massacre III"). The number/length guard keeps
+        // "Final Girl: Halloween" OUT of "The Ring" (a bare
+        // franchise name after the colon is a different film's
+        // subtitle, not a part).
+        val postColon = candidate.substringAfter(":", "").trim()
+        if (postColon.isNotBlank() &&
+            mbBaseKey(postColon) == baseKey &&
+            (mbFranchisePart(postColon) > 0 ||
+                postColon.trim().split(Regex("""\s+""")).size >
+                    baseNorm.trim().split(Regex("""\s+""")).size)
+        ) return true
+        // D: "vs." split.
+        val vsParts = Regex("""\s+vs\.?\s+""", RegexOption.IGNORE_CASE)
+            .split(candidate)
+        if (vsParts.size == 2) {
+            for (side in vsParts) {
+                if (mbBaseKey(side) == baseKey) return true
+                val sideNorm = side.trim().lowercase()
+                    .replace(Regex("""[^a-z0-9]+"""), " ").trim()
+                if (sideNorm.startsWith(baseNorm + " ")) return true
+            }
+        }
+        // E: alias group.
+        for (group in mbFranchiseAliases) {
+            if (baseKey in group && candKey in group) return true
+        }
+        // F: inverted subtitle ("The First Purge").
+        val lastWord = baseNorm.substringAfterLast(" ")
+        if (lastWord.length >= 4) {
+            val candLow = candidate.trim().lowercase()
+            if (candLow.startsWith("the ") &&
+                candLow.endsWith(" $lastWord")
+            ) {
+                val middle = candLow.removePrefix("the ")
+                    .removeSuffix(" $lastWord").trim()
+                if (middle in setOf(
+                        "first", "last", "final", "forever",
+                        "next", "new", "ultimate"
+                    )
+                ) return true
+            }
+        }
+        return false
+    }
+
     /** v17: franchise parts for a MovieBox film page (his order
      * 2026-11-15 22:18 — a film with more than one part shows ALL
-     * its parts, ordered). Searches MovieBox for the film's base
-     * name, keeps only results whose base name matches exactly
-     * (no look-alikes: "Conjuring: The Beyond" and "The Nun II"
-     * do NOT match "The Conjuring"), Arabic-subtitled only,
-     * deduped by (title, year) and by (base, year, part) — the
-     * second catches duplicate listings of one part ("Saw 11"
-     * vs "Saw XI") — sorted by year then part number. The
-     * current film is included in its sorted position. Fully
-     * fail-soft: any failure returns the current film alone
-     * (the caller then shows no recommendations row). */
+     * its parts, ordered). v21: the parts search takes the WEB
+     * token FIRST (MovieBoxIN v10 lesson — H5 search with the
+     * phone's mobile token is suspected to return 400, so the
+     * v17 feature may never have worked on the phone; the
+     * sandbox always tested it with a web token), falls back to
+     * the guest token, and skips the search when no token exists
+     * at all (H5 search without a token is 400, proven live).
+     * When H5 returns 400/empty, a mobile search/v2 fallback
+     * runs (Rennvol pattern — untested live, 403 from the
+     * sandbox). Matching is mbIsFranchisePart (rules A–F), NOT
+     * exact-base-only. The Arabic-subtitles gate is RELAXED for
+     * the parts row ONLY — his order "any film with parts" is
+     * unconditional, and the gate demonstrably dropped real
+     * parts (Saw XI 2025, Godzilla: Final Wars); the MovieBox
+     * lane list stays Arabic-only. Dedup: (normalized title,
+     * year) + (base, year, part) only when part > 0 — the old
+     * (base,year,part) dedup wrongly dropped a second same-year
+     * film with part 0 (Godzilla: The Planet Eater vs King of
+     * the Monsters, 2019; Hellraiser: Deader vs Hellworld,
+     * 2005). Sorted by year then part number, capped at 50
+     * (v17's take(20) dropped the NEWEST parts of long series
+     * like Godzilla). The current film is included in its
+     * sorted position. Fully fail-soft: any failure returns the
+     * current film alone (the caller then shows no
+     * recommendations row). */
     private suspend fun mbFranchiseParts(
         title: String,
         detailPath: String,
@@ -2183,39 +2353,62 @@ class HorrorMoviesProvider : MainAPI() {
         )
         val base = mbFranchiseBase(displayTitle)
         if (base.length < 2) return listOfNotNull(current)
-        val token = runCatching { mbGuestToken().first }.getOrNull()
+        // v21: WEB token first (H5 search), guest token fallback,
+        // no token at all -> no doomed call.
+        val webToken = runCatching { mbWebToken().first }.getOrNull()
+        val guestToken = if (webToken.isNullOrBlank()) {
+            runCatching { mbGuestToken().first }.getOrNull()
+        } else null
+        val token = webToken ?: guestToken
             ?: return listOfNotNull(current)
         val found = ArrayList<Triple<Int, Int, SearchResponse>>()
         val seenTitleYear = HashSet<String>()
         val seenBaseYearPart = HashSet<String>()
+        var matched = 0
+        var h5Failed = false
         fun consider(o: JSONObject) {
-            val t = o.optString("title")
+            val t = o.optString("title").ifBlank { o.optString("name") }
             if (t.isBlank()) return
-            if (!mbFranchiseBase(t).equals(base, ignoreCase = true)) return
-            if (!hasArabicSub(o.optString("subtitles"))) return
+            if (o.optInt("subjectType", 1) != 1) return
+            if (!mbIsFranchisePart(t, base)) return
             val dp = o.optString("detailPath")
             if (dp.isBlank()) return
             val y = mbFranchiseYear(o.optString("releaseDate"))
             val p = mbFranchisePart(t)
-            if (!seenTitleYear.add(t.trim().lowercase() + "|" + y)) return
-            if (!seenBaseYearPart.add(base.lowercase() + "|" + y + "|" + p)) return
+            // v21: normalized-title dedup (spacing/bracket
+            // variants of one listing, e.g. "The Texas Chain Saw
+            // Massacre" vs "The Texas Chainsaw Massacre", and
+            // "[English]" dub variants) + (base, year, part)
+            // only when part > 0 (catches "Saw 11" vs "Saw XI"
+            // without dropping a second same-year film).
+            if (!seenTitleYear.add(mbTitleKey(t) + "|" + y)) return
+            if (p > 0 &&
+                !seenBaseYearPart.add(mbBaseKey(base) + "|" + y + "|" + p)
+            ) return
+            val coverUrl = o.optJSONObject("cover")?.optString("url")
+                ?.ifBlank { null }
+                ?: o.optString("poster").ifBlank { null }
+                ?: o.optString("coverUrl").ifBlank { null }
             val card = movieCard(
                 t,
                 "$mbWebBase/ar/moviedetail/$dp",
-                o.optJSONObject("cover")?.optString("url")?.ifBlank { null }
+                coverUrl
             ) ?: return
+            matched++
             found += Triple(if (y > 0) y else 9999, p, card)
         }
         // The search walk mirrors the verified live behaviour:
         // pages return 6-16 items each and hasMore turns false
         // around page 6 even while totalCount reads higher — the
         // API's reachable window, not our cap, ends the walk.
+        // v21: perPage 50 (proven live: 13 items/page vs ~6 at
+        // perPage 20 for "Final Destination").
         var page = 1
         while (page <= 6) {
             val body = JSONObject().apply {
                 put("keyword", base)
                 put("page", page)
-                put("perPage", 20)
+                put("perPage", 50)
                 put("subjectType", 1)
             }.toString()
             val res = runCatching {
@@ -2232,13 +2425,27 @@ class HorrorMoviesProvider : MainAPI() {
                         "application/json".toMediaType()
                     )
                 )
-            }.getOrNull() ?: break
-            if (res.code !in 200..299) break
+            }.getOrNull()
+            if (res == null) {
+                h5Failed = true
+                break
+            }
+            if (res.code !in 200..299) {
+                h5Failed = true
+                break
+            }
             val data = runCatching {
                 JSONObject(res.text).optJSONObject("data")
-            }.getOrNull() ?: break
-            val items = data.optJSONArray("items") ?: break
-            if (items.length() == 0) break
+            }.getOrNull()
+            if (data == null) {
+                h5Failed = true
+                break
+            }
+            val items = data.optJSONArray("items")
+            if (items == null || items.length() == 0) {
+                if (page == 1) h5Failed = true
+                break
+            }
             for (i in 0 until items.length()) {
                 items.optJSONObject(i)?.let { consider(it) }
             }
@@ -2248,12 +2455,19 @@ class HorrorMoviesProvider : MainAPI() {
             ) break
             page++
         }
+        // v21: mobile search/v2 fallback — only when H5 failed
+        // or matched nothing.
+        if (h5Failed || matched == 0) {
+            runCatching { mbFranchisePartsMobile(base, token, ::consider) }
+        }
         if (current != null) {
             val curYear = mbFranchiseYear(releaseDate)
             val curPart = mbFranchisePart(displayTitle)
-            val k1 = displayTitle.trim().lowercase() + "|" + curYear
-            val k2 = base.lowercase() + "|" + curYear + "|" + curPart
-            if (seenTitleYear.add(k1) && seenBaseYearPart.add(k2)) {
+            val k1 = mbTitleKey(displayTitle) + "|" + curYear
+            val k2 = mbBaseKey(base) + "|" + curYear + "|" + curPart
+            if (seenTitleYear.add(k1) &&
+                (curPart <= 0 || seenBaseYearPart.add(k2))
+            ) {
                 found += Triple(
                     if (curYear > 0) curYear else 9999, curPart, current
                 )
@@ -2264,7 +2478,79 @@ class HorrorMoviesProvider : MainAPI() {
                 .thenBy { it.second }
                 .thenBy { it.third.name }
         )
-        return found.map { it.third }.take(20)
+        return found.map { it.third }.take(50)
+    }
+
+    /** v21: mobile search/v2 fallback for the parts search
+     * (Rennvol pattern — POST subject-api/search/v2, signed
+     * headers with body, Bearer guest token). Response arrays
+     * are merged tolerantly (first non-empty of items /
+     * subjects / subjectList / list / results[].subjects);
+     * cards need a non-blank detailPath (this module's load()
+     * cannot open a subjectId-only card). Pages 1..2 only.
+     * UNTESTED LIVE: the mobile gateway is 403 from the
+     * sandbox, so this path is built from Rennvol's published
+     * code and MovieBoxIN's proven mobile branch — the phone
+     * is the judge. */
+    private suspend fun mbFranchisePartsMobile(
+        keyword: String,
+        token: String,
+        consider: (JSONObject) -> Unit
+    ) {
+        var page = 1
+        while (page <= 2) {
+            val body = JSONObject().apply {
+                put("page", page)
+                put("perPage", 20)
+                put("keyword", keyword)
+            }.toString()
+            val url = "$mbMobileBase/wefeed-mobile-bff/subject-api/search/v2"
+            val headers = mbSignedHeaders(
+                "POST", url, mbUaToken, mbClientInfoToken(),
+                body = body, contentType = "application/json; charset=utf-8"
+            ).toMutableMap()
+            headers["Authorization"] = "Bearer $token"
+            headers["X-MB-Token"] = token
+            val res = runCatching {
+                app.post(
+                    url, headers = headers,
+                    requestBody = body.toRequestBody(
+                        "application/json; charset=utf-8".toMediaType()
+                    )
+                )
+            }.getOrNull() ?: break
+            if (res.code !in 200..299) break
+            val data = runCatching {
+                JSONObject(res.text).optJSONObject("data")
+            }.getOrNull() ?: break
+            val arr = mbFranchiseMobileArray(data) ?: break
+            if (arr.length() == 0) break
+            for (i in 0 until arr.length()) {
+                arr.optJSONObject(i)?.let { consider(it) }
+            }
+            val pager = data.optJSONObject("pager")
+            if (pager != null && pager.has("hasMore") &&
+                !pager.optBoolean("hasMore")
+            ) break
+            page++
+        }
+    }
+
+    /** v21: first non-empty parseable subject array in a mobile
+     * search/v2 response (Rennvol's subjectsOf order). */
+    private fun mbFranchiseMobileArray(data: JSONObject): JSONArray? {
+        for (key in listOf("items", "subjects", "subjectList", "list")) {
+            val arr = data.optJSONArray(key)
+            if (arr != null && arr.length() > 0) return arr
+        }
+        val results = data.optJSONArray("results")
+        if (results != null) {
+            for (i in 0 until results.length()) {
+                val arr = results.optJSONObject(i)?.optJSONArray("subjects")
+                if (arr != null && arr.length() > 0) return arr
+            }
+        }
+        return null
     }
 
     /** loadLinks data for MovieBox: url ||| title ||| subjectId. */
@@ -2306,7 +2592,13 @@ class HorrorMoviesProvider : MainAPI() {
      * alphabetically, each rendered name=value (decoded) joined
      * with '&'. GET with no body => BODY_LEN and BODY_HASH are
      * empty strings. */
-    private fun mbCanonical(method: String, url: String, ts: Long): String {
+    private fun mbCanonical(
+        method: String,
+        url: String,
+        ts: Long,
+        body: String? = null,
+        contentType: String = "application/json"
+    ): String {
         val qStart = url.indexOf('?')
         val rawPath = if (qStart >= 0) url.substring(0, qStart) else url
         val path = Regex("""^[a-z]+://[^/]+""").replace(rawPath, "")
@@ -2335,23 +2627,38 @@ class HorrorMoviesProvider : MainAPI() {
             }
         }
         val curl = if (rendered.isEmpty()) path else "$path?$rendered"
+        // v21: body-aware canonical (Rennvol pattern — the
+        // canonical is [method, accept, contentType, bodyLength,
+        // ts, bodyHash, url]; a null body keeps the old empty
+        // slots, so every existing GET caller signs exactly as
+        // before. A POST must pass its body so the gateway's
+        // signature check matches.
+        val bodyBytes = body?.toByteArray(Charsets.UTF_8)
+        val bodyLength = bodyBytes?.size?.toString() ?: ""
+        val bodyHash = if (bodyBytes != null) {
+            md5Hex(bodyBytes.copyOfRange(0, minOf(bodyBytes.size, 102400)))
+        } else ""
         return listOf(
-            method.uppercase(), "application/json", "application/json",
-            "", ts.toString(), "", curl
+            method.uppercase(), "application/json", contentType,
+            bodyLength, ts.toString(), bodyHash, curl
         ).joinToString("\n")
     }
 
     /** X-Client-Token = "<ts>,<md5(reverse(ts))>"; x-tr-signature
-     * = "<ts>|2|<base64(HmacMD5(key, canonical))>". */
+     * = "<ts>|2|<base64(HmacMD5(key, canonical))>". v21: optional
+     * body + contentType for POST signing (mobile search/v2);
+     * GET callers pass neither and sign exactly as before. */
     private fun mbSignedHeaders(
         method: String,
         url: String,
         ua: String,
-        clientInfo: String
+        clientInfo: String,
+        body: String? = null,
+        contentType: String = "application/json"
     ): Map<String, String> {
         val ts = System.currentTimeMillis()
         val xct = "$ts,${md5Hex(ts.toString().reversed().toByteArray(Charsets.UTF_8))}"
-        val canonical = mbCanonical(method, url, ts)
+        val canonical = mbCanonical(method, url, ts, body, contentType)
         val mac = Mac.getInstance("HmacMD5")
         mac.init(SecretKeySpec(mbKey(mbKeyDefaultB64), "HmacMD5"))
         val sigBytes = mac.doFinal(canonical.toByteArray(Charsets.UTF_8))
@@ -2359,7 +2666,7 @@ class HorrorMoviesProvider : MainAPI() {
         return mapOf(
             "User-Agent" to ua,
             "Accept" to "application/json",
-            "Content-Type" to "application/json",
+            "Content-Type" to contentType,
             "X-Client-Token" to xct,
             "x-tr-signature" to sig,
             "X-Client-Info" to clientInfo,
@@ -2455,6 +2762,41 @@ class HorrorMoviesProvider : MainAPI() {
             mbCachedAt = now
         }
         return tok to via
+    }
+
+    @Volatile
+    private var mbCachedWebToken: String? = null
+    @Volatile
+    private var mbCachedWebAt: Long = 0
+
+    /** v21: WEB token, minted from the web host ONLY (mirror of
+     * MovieBoxIN v10's mbWebToken — same ranking-list/content
+     * call, separate 1 h cache). WHY: H5 subject/search is
+     * token-gated and the phone's guest token is a MOBILE token
+     * (mbGuestToken mints mobile-first); the sandbox always
+     * tested H5 search with a web token while the phone always
+     * used a mobile token, and phone search never worked in any
+     * version until v10 switched the H5 branch to web-first
+     * («البحث تحسن»). The parts search takes this token FIRST;
+     * a mobile token against H5 search is suspected to return
+     * 400 «invalid token» (unprovable from the sandbox — the
+     * mobile mint is 403 here; the phone is the judge). */
+    private suspend fun mbWebToken(): Pair<String?, String> {
+        val now = System.currentTimeMillis()
+        val cached = mbCachedWebToken
+        if (cached != null && now - mbCachedWebAt < 3600_000) {
+            return cached to "webcached"
+        }
+        val webUrl = "$mbWebBase/wefeed-h5api-bff/ranking-list/content" +
+            "?id=$mbRankId&page=1&perPage=1"
+        val tok = mbTokenFrom(
+            webUrl, signed = false, clientInfo = null, ua = browserUA
+        )
+        if (tok != null) {
+            mbCachedWebToken = tok
+            mbCachedWebAt = now
+        }
+        return tok to "web"
     }
 
     private fun mbStreamUrl(s: JSONObject): String? {
@@ -2886,7 +3228,7 @@ class HorrorMoviesProvider : MainAPI() {
         if (subjectId.isBlank() || detailPath.isBlank()) {
             emitDebug(
                 listOf(
-                    "Horror v19·MovieBox", "srv=0", "ext=0", "dig=0",
+                    "Horror v21·MovieBox", "srv=0", "ext=0", "dig=0",
                     "relay=0", "t=${elapsed() / 1000}s", "tok=$tokVia",
                     "play=$playCode", "id-missing"
                 ),
@@ -3001,7 +3343,7 @@ class HorrorMoviesProvider : MainAPI() {
             // emit the DEBUG line even when playback links exist.
             emitDebug(
                 listOf(
-                    "Horror v19·MovieBox", "srv=$streamsFound",
+                    "Horror v21·MovieBox", "srv=$streamsFound",
                     "ext=$emitted", "dig=0", "relay=0",
                     "t=${elapsed() / 1000}s", "tok=$tokVia",
                     "play=$playCode", "sub=$subDiag"

@@ -277,7 +277,7 @@ import okhttp3.RequestBody.Companion.toRequestBody
  * fallbacks; the mobile routes are the ones that work on his
  * phone (the original v56 WORKS there, his word). Nothing here
  * is "working" until he confirms on his phone after a full close
- * and reopen. DEBUG ("MovieBoxIN v13 | ... | sub=...") is emitted
+ * and reopen. DEBUG ("MovieBoxIN v14 | ... | sub=...") is emitted
  * whenever links are zero OR the dual is missing, so a failure
  * is never silent.
  *
@@ -1283,7 +1283,7 @@ class MovieBoxINProvider : MainAPI() {
         // the card reads as a contradiction (HTTP 200 = OK,
         // yet a failure card).
         val detail = if (code == "200") " بلا عناوين" else ""
-        val title = "⚠ v13 TOP100 غير متاحة — المصدر: $route، الحالة: $code$detail"
+        val title = "⚠ v14 TOP100 غير متاحة — المصدر: $route، الحالة: $code$detail"
         return newMovieSearchResponse(
             title, "mbdiag://top100/p$page/err-$code", TvType.Movie
         )
@@ -1308,7 +1308,7 @@ class MovieBoxINProvider : MainAPI() {
         mobStatus: String,
         tok: String
     ): SearchResponse {
-        val title = "⚠ v13 بحث فارغ — h5=$h5Status mob=$mobStatus tok=$tok"
+        val title = "⚠ v14 بحث فارغ — h5=$h5Status mob=$mobStatus tok=$tok"
         val slug = "h5-" + h5Status.replace(":", "-").replace("/", "-") +
             "-mob-" + mobStatus.replace(":", "-").replace("/", "-")
         return newMovieSearchResponse(
@@ -2416,7 +2416,15 @@ class MovieBoxINProvider : MainAPI() {
                 newExtractorLink(
                     name,
                     "DEBUG " + diag.joinToString(" | "),
-                    "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8",
+                    // v14 — the DEBUG link must NOT be a playable
+                    // test clip: PlayerView.playerError() auto-
+                    // advances to the next mirror on a source
+                    // error, so a real test stream (Mux x36xhzz
+                    // = Big Buck Bunny, 10:34) gets played as if
+                    // it were the episode (the v13 Naruto S1E1
+                    // screenshot). An unroutable URL fails fast
+                    // and yields an honest error instead.
+                    "https://127.0.0.1/movieboxin-debug.m3u8",
                     ExtractorLinkType.M3U8
                 ) {
                     this.quality = Qualities.Unknown.value
@@ -2733,6 +2741,20 @@ class MovieBoxINProvider : MainAPI() {
         return null
     }
 
+    /** v14 — Rennvol's playable-URL rule: the mobile gateway
+     * DOES return placeholder/ad clips among play-info
+     * streams, and a placeholder URL fails in the player and
+     * (via the error fallback) lands on the next link. Drop
+     * such URLs before emitting; the caller counts them
+     * (plc= in the DEBUG line). */
+    private fun mbIsPlayableUrl(url: String): Boolean {
+        if (!url.startsWith("http")) return false
+        val u = url.lowercase()
+        return !u.contains("deprecation") && !u.contains("placeholder") &&
+            !u.contains("anti_piracy") && !u.contains("antipiracy") &&
+            !u.contains("/ad/")
+    }
+
     /** CNC-faithful emit (MovieBoxProviderIN loadLinks$emitStream,
      * byte-identical logic in v54's emitNetStream). VIDEO links get
      * Origin + the full player-page Referer + the mobile Chrome UA
@@ -2752,7 +2774,15 @@ class MovieBoxINProvider : MainAPI() {
         subjectId: String,
         se: Int,
         ep: Int,
-        callback: (ExtractorLink) -> Unit
+        callback: (ExtractorLink) -> Unit,
+        // v14 — mobile play-info streams: Rennvol's shape
+        // (site-root Referer + the sign cookie as a Cookie
+        // header on EVERY type). The H5 path keeps its proven
+        // full player-page Referer; the mobile path has no
+        // real detailPath, so the player-page Referer built
+        // from the fake card URL is garbage that can 403 an
+        // MP4, and M3U8/DASH links got no cookie at all.
+        isMobile: Boolean = false
     ) {
         val type = when {
             url.contains(".m3u8") -> ExtractorLinkType.M3U8
@@ -2770,7 +2800,27 @@ class MovieBoxINProvider : MainAPI() {
         val playerReferer = "$playBase/movies/$detailPath?id=$subjectId" +
             "&type=/movie/detail&$seEp&lang=en"
         val headers: Map<String, String> =
-            if (type != ExtractorLinkType.VIDEO) {
+            if (isMobile) {
+                // v14 — Rennvol's signed-stream shape: site-root
+                // Referer + Cookie on every type (the sign
+                // cookie is the auth the mobile CDN checks;
+                // the H5 M3U8/DASH shape got no cookie at all).
+                val m = LinkedHashMap<String, String>()
+                if (type == ExtractorLinkType.VIDEO) {
+                    m["Origin"] = playBase
+                    m["Referer"] = mbWebBase
+                    m["User-Agent"] = mbUaPlayChrome
+                } else {
+                    m["Referer"] = "https://movie-box.co/"
+                    m["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36"
+                }
+                if (!signCookie.isNullOrBlank()) {
+                    m["Cookie"] = signCookie
+                    val key = signHeaderKey?.ifBlank { null }
+                    if (key != null && key != "Cookie") m[key] = signCookie
+                }
+                m
+            } else if (type != ExtractorLinkType.VIDEO) {
                 mapOf(
                     "Referer" to "https://movie-box.co/",
                     "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36"
@@ -2800,7 +2850,9 @@ class MovieBoxINProvider : MainAPI() {
                 newExtractorLink(
                     name, label, url, type
                 ) {
-                    this.referer = if (type != ExtractorLinkType.VIDEO) {
+                    this.referer = if (isMobile) {
+                        mbWebBase
+                    } else if (type != ExtractorLinkType.VIDEO) {
                         "https://movie-box.co/"
                     } else {
                         playerReferer
@@ -3198,14 +3250,24 @@ class MovieBoxINProvider : MainAPI() {
         ep: Int,
         t0: Long,
         dubCaps: List<Pair<String, String>> = emptyList(),
-        subtitleCallback: (SubtitleFile) -> Unit
+        subtitleCallback: (SubtitleFile) -> Unit,
+        // v14 — per-dub mobile captions: (dub sid, its stream
+        // ids). Each dub's ids are tried with THAT dub's sid
+        // (Rennvol's per-stream chain) — the main subject's ids
+        // carry no sidecar subs for an Arabic-burned version.
+        dubSidIds: List<Pair<String, List<String>>> = emptyList(),
+        // v14 — inline captions already picked off play-info
+        // stream objects (extCaptions/captions arrays).
+        seedAra: String? = null,
+        seedEng: String? = null
     ): String {
         val trail = ArrayList<String>()
         val triedIds = ArrayList<String>()
         val webTriedIds = ArrayList<String>()
         val dubTriedIds = ArrayList<String>()
-        var ara: String? = null
-        var eng: String? = null
+        var ara: String? = seedAra
+        var eng: String? = seedEng
+        if (ara != null || eng != null) trail += "seed=ok"
         fun absorb(arr: JSONArray?) {
             val (a, e) = mbPickCaptions(arr)
             if (ara == null) ara = a
@@ -3387,6 +3449,39 @@ class MovieBoxINProvider : MainAPI() {
         if (!bothFound() && dubCaps.isNotEmpty()) {
             h5Pass(dubCaps, "dh5", dubTriedIds)
         }
+        // Phase D (v14): per-dub MOBILE captions (Rennvol's
+        // per-stream chain, one call per stream id): each dub's
+        // ids are tried with THAT dub's sid — get-stream-
+        // captions, then get-ext-captions, then +episode. The
+        // main subject's ids carry no sidecar subs for an
+        // Arabic-burned version (v4), but another dub
+        // (Original Audio) may. Runs only while a side is
+        // still missing.
+        if (!bothFound() && dubSidIds.isNotEmpty()) {
+            for ((dubSid, ids) in dubSidIds) {
+                if (bothFound()) break
+                for (sid in ids) {
+                    if (bothFound()) break
+                    tryMobile(
+                        "$mbMobileBase/wefeed-mobile-bff/subject-api/" +
+                            "get-stream-captions?subjectId=$dubSid&streamId=$sid",
+                        "dstr"
+                    )
+                    if (bothFound()) break
+                    tryMobile(
+                        "$mbMobileBase/wefeed-mobile-bff/subject-api/" +
+                            "get-ext-captions?subjectId=$dubSid&resourceId=$sid",
+                        "dext"
+                    )
+                    if (bothFound()) break
+                    tryMobile(
+                        "$mbMobileBase/wefeed-mobile-bff/subject-api/" +
+                            "get-ext-captions?subjectId=$dubSid&resourceId=$sid&episode=$ep",
+                        "dextEp"
+                    )
+                }
+            }
+        }
         if (ara == null && eng == null) {
             var out = "none:" + trail.joinToString("/")
             if (triedIds.isNotEmpty()) out += "/ids=" + triedIds.joinToString(",")
@@ -3508,6 +3603,61 @@ class MovieBoxINProvider : MainAPI() {
         return MbPlayResult(emptyList(), null, playCode, null)
     }
 
+    /** Dubs from the mobile get (v14): the ONLY dubs source
+     * for a mobile-only subject — the H5 detail has none
+     * (T106 404) and loadLinks' mbFetchDubs fails on the fake
+     * detailPath, leaving the v13 single fallback dub
+     * (dubs=1, srv=1). Shape follows Rennvol's loadLinks:
+     * data.dubs[] entries carry subjectId (+ detailPath /
+     * lanName when present; neither is required — a dub is
+     * its subjectId). Host pool + signed + Bearer, same as
+     * loadBySubjectId's mobile step. */
+    private suspend fun mbFetchMobileDubs(
+        subjectId: String,
+        token: String
+    ): List<Triple<String, String, String>> {
+        val out = ArrayList<Triple<String, String, String>>()
+        for (base in listOf(mbMobileBase, mbApi3Base)) {
+            val url = "$base/wefeed-mobile-bff/subject-api/get?subjectId=$subjectId"
+            val res = runCatching {
+                val headers = mbSignedHeaders(
+                    "GET", url, mbUaToken, mbClientInfoToken()
+                ).toMutableMap()
+                if (token.isNotBlank()) {
+                    headers["Authorization"] = "Bearer $token"
+                    headers["X-MB-Token"] = token
+                }
+                val r = app.get(url, headers = headers)
+                mbAbsorbToken(r.headers["x-user"] ?: r.headers["X-User"], r.code)
+                r
+            }.getOrNull() ?: continue
+            if (res.code !in 200..299 || res.text.isBlank()) {
+                if (res.code in listOf(403, 407, 429, 500, 502, 503, 504)) continue
+                break
+            }
+            val subj = runCatching {
+                val root = JSONObject(res.text)
+                root.optJSONObject("data")?.optJSONObject("subject")
+                    ?: root.optJSONObject("data")
+                    ?: root.optJSONObject("subject")
+            }.getOrNull() ?: break
+            val dubs = subj.optJSONArray("dubs") ?: break
+            val seen = HashSet<String>()
+            for (i in 0 until dubs.length()) {
+                val o = dubs.optJSONObject(i) ?: continue
+                val sid = o.optString("subjectId").ifBlank { o.optString("id") }
+                if (sid.isBlank() || !seen.add(sid)) continue
+                val dp = o.optString("detailPath")
+                val lan = o.optString("lanName")
+                    .ifBlank { o.optString("name") }
+                    .ifBlank { "Dub" }
+                out += Triple(sid, dp, lan)
+            }
+            break
+        }
+        return out
+    }
+
     /** Mobile play-info (v13 — Rennvol's play route by
      * subjectId, the ONLY play route for a mobile-only
      * subject: the H5 dubs/play path needs a real
@@ -3586,6 +3736,10 @@ class MovieBoxINProvider : MainAPI() {
         var resourceId: String? = null
         var subDiag = "?"
         var dubCount = 0
+        // v14 — mobile per-dub accounting (DEBUG mdubs=/plc=/u1=)
+        var plcCount = 0
+        var mobDubsCount = 0
+        var u1Info: String? = null
         // v7 — emission accounting (DEBUG dup=/drop=): dup =
         // duplicate URLs removed, drop = fetched streams cut
         // by the 40-cap, nourl = streams with no URL at all.
@@ -3603,7 +3757,7 @@ class MovieBoxINProvider : MainAPI() {
             // "id-missing" the v12 screenshot showed.
             emitDebug(
                 listOf(
-                    "MovieBoxIN v13", "srv=0", "ext=0",
+                    "MovieBoxIN v14", "srv=0", "ext=0",
                     "t=${elapsed() / 1000}s", "tok=$tokVia",
                     "play=$playCode", "id-missing",
                     mbLastLoadDiag.ifBlank { "load=?" }
@@ -3633,6 +3787,11 @@ class MovieBoxINProvider : MainAPI() {
             var mainStreamIds = emptyList<String>()
             var mainPlayBase: String? = null
             val dubCaps = ArrayList<Pair<String, String>>()
+            // v14 — per-dub mobile captions (Phase D) + inline
+            // captions picked off play-info stream objects.
+            val dubSidIds = ArrayList<Pair<String, List<String>>>()
+            var seedAra: String? = null
+            var seedEng: String? = null
             for ((sid, dp, lan) in dubs) {
                 if (elapsed() > 20000) break
                 val play = mbFetchPlayStreams(sid, dp, se, ep, token)
@@ -3677,6 +3836,12 @@ class MovieBoxINProvider : MainAPI() {
                         noUrlCount++
                         continue
                     }
+                    // v14 — drop placeholder/ad clip URLs
+                    // (Rennvol's rule) before emitting.
+                    if (!mbIsPlayableUrl(linkUrl)) {
+                        plcCount++
+                        continue
+                    }
                     if (!emittedUrls.add(linkUrl)) {
                         dupCount++
                         continue
@@ -3707,15 +3872,32 @@ class MovieBoxINProvider : MainAPI() {
                 if (emitted >= 40 || elapsed() > 25000) break
             }
             if (emitted == 0) {
-                // v13 — mobile-only subject (no H5 detailPath):
-                // the H5 dubs/play loop above can never return
-                // streams (it needs a real detailPath), so try
-                // Rennvol's mobile play-info route by subjectId.
-                // Runs only when H5 yielded nothing, so the
-                // proven H5 path keeps priority everywhere.
-                val mobPlay = mbFetchMobilePlay(subjectId, se, ep, token)
-                playCode = mobPlay.code
-                if (mobPlay.base != null && mobPlay.streams.isNotEmpty()) {
+                // v14 — mobile-only subject (no H5 detailPath):
+                // the dubs list lives ONLY in the mobile get
+                // (the H5 detail has none — T106), and play-info
+                // runs once per dub sid (Rennvol stages 2-3),
+                // not once for the main subject only (the v13
+                // srv=1: one play-info call returned exactly
+                // one stream). Runs only when H5 yielded
+                // nothing, so the proven H5 path keeps priority
+                // everywhere. Each dub's stream ids are also
+                // collected for the per-dub caption pass (Phase
+                // D in mbEmitCaptions).
+                val mobDubs = mbFetchMobileDubs(subjectId, token)
+                mobDubsCount = mobDubs.size
+                val playSids = ArrayList<Triple<String, String, String>>()
+                playSids += Triple(subjectId, detailPath, "Original Audio")
+                for (d in mobDubs) {
+                    if (d.first != subjectId &&
+                        playSids.none { it.first == d.first }
+                    ) playSids += d
+                }
+                dubCount = playSids.size
+                for ((sid, _, lan) in playSids) {
+                    if (elapsed() > 20000) break
+                    val mobPlay = mbFetchMobilePlay(sid, se, ep, token)
+                    playCode = mobPlay.code
+                    if (mobPlay.base == null || mobPlay.streams.isEmpty()) continue
                     if (resourceId == null) resourceId = mobPlay.resourceId
                     streamsFound += mobPlay.streams.size
                     val capsHere = ArrayList<Pair<String, String>>()
@@ -3729,12 +3911,30 @@ class MovieBoxINProvider : MainAPI() {
                             else -> "MP4"
                         }
                         if (capsHere.none { it.first == id }) capsHere += id to fmt
+                        // v14 — inline captions on the stream
+                        // object itself (Rennvol reads extCaptions
+                        // off its resource items; play-info
+                        // streams may carry the same array).
+                        val inline = s.optJSONArray("extCaptions")
+                            ?: s.optJSONArray("captions")
+                        if (inline != null) {
+                            val (a, e) = mbPickCaptions(inline)
+                            if (seedAra == null) seedAra = a
+                            if (seedEng == null) seedEng = e
+                        }
                     }
-                    mainCaps += capsHere
-                    mainStreamIds = mobPlay.streams.mapNotNull { o ->
+                    val sidIds = mobPlay.streams.mapNotNull { o ->
                         o.optString("id").ifBlank { null }
                     }.distinct()
-                    mainPlayBase = mobPlay.base
+                    if (sid == subjectId) {
+                        mainCaps += capsHere
+                        mainStreamIds = sidIds
+                        mainPlayBase = mobPlay.base
+                    } else {
+                        capsHere.firstOrNull { it.second == "MP4" }
+                            ?.let { dubCaps += it }
+                        if (sidIds.isNotEmpty()) dubSidIds += sid to sidIds
+                    }
                     for ((idx, s) in mobPlay.streams.withIndex()) {
                         if (emitted >= 40) {
                             capDropCount += mobPlay.streams.size - idx
@@ -3744,6 +3944,10 @@ class MovieBoxINProvider : MainAPI() {
                         val linkUrl = mbStreamUrl(s)
                         if (linkUrl == null) {
                             noUrlCount++
+                            continue
+                        }
+                        if (!mbIsPlayableUrl(linkUrl)) {
+                            plcCount++
                             continue
                         }
                         if (!emittedUrls.add(linkUrl)) {
@@ -3761,19 +3965,42 @@ class MovieBoxINProvider : MainAPI() {
                         }
                         val q = Regex("""(2160|1440|1080|720|480|360)""")
                             .find(resLabel)?.groupValues?.get(1)
-                        val label = "MovieBox" + if (q != null) " ${q}p" else ""
+                        val label = if (sid == subjectId) {
+                            "MovieBox" + if (q != null) " ${q}p" else ""
+                        } else {
+                            "MovieBox $lan" + if (q != null) " ${q}p" else ""
+                        }
+                        // v14 — record the first emitted mobile
+                        // URL's shape (host/type/cookie) so the
+                        // next phone screenshot proves which
+                        // shape failed to load, if any.
+                        if (u1Info == null) {
+                            val host = runCatching {
+                                java.net.URL(linkUrl).host
+                            }.getOrNull() ?: "?"
+                            val typ = when {
+                                linkUrl.contains(".mpd") -> "DASH"
+                                linkUrl.contains(".m3u8") -> "HLS"
+                                else -> "MP4"
+                            }
+                            u1Info = "$host/$typ/ck=" +
+                                if (signCookie.isNullOrBlank()) "0" else "1"
+                        }
                         emitMovieBoxLink(
                             linkUrl, label, signCookie, signHeaderKey,
-                            mobPlay.base, detailPath, subjectId, se, ep, counting
+                            mobPlay.base, detailPath, subjectId, se, ep, counting,
+                            isMobile = true
                         )
                     }
+                    if (emitted >= 40 || elapsed() > 25000) break
                 }
             }
             if (emitted > 0) {
                 subDiag = mbEmitCaptions(
                     subjectId, detailPath, mainPlayBase ?: mbWebBase,
                     token, mainCaps, mainStreamIds, resourceId,
-                    se, ep, t0, dubCaps, subtitleCallback
+                    se, ep, t0, dubCaps, subtitleCallback,
+                    dubSidIds, seedAra, seedEng
                 )
             }
         }
@@ -3784,10 +4011,13 @@ class MovieBoxINProvider : MainAPI() {
             // along (the home/search paths have no phone-visible
             // surface of their own).
             val diag = ArrayList<String>()
-            diag += "MovieBoxIN v13"
+            diag += "MovieBoxIN v14"
             diag += "srv=$streamsFound"
             diag += "ext=$emitted"
             diag += "dubs=$dubCount"
+            diag += "mdubs=$mobDubsCount"
+            diag += "plc=$plcCount"
+            if (u1Info != null) diag += "u1=$u1Info"
             diag += "t=${elapsed() / 1000}s"
             diag += "tok=$tokVia"
             diag += "play=$playCode"

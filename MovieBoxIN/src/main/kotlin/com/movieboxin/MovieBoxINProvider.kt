@@ -277,9 +277,10 @@ import okhttp3.RequestBody.Companion.toRequestBody
  * fallbacks; the mobile routes are the ones that work on his
  * phone (the original v56 WORKS there, his word). Nothing here
  * is "working" until he confirms on his phone after a full close
- * and reopen. DEBUG ("MovieBoxIN v15 | ... | sub=...") is emitted
- * whenever links are zero OR the dual is missing, so a failure
- * is never silent.
+ * and reopen. DEBUG ("MovieBoxIN v16 | ... | sub=...") is emitted
+ * on EVERY loadLinks now, so the phone screenshot always proves
+ * the version AND the dual path (dual=merge / ai-tr / fail:<stage>)
+ * — a missing dual is never silent.
  *
  * v6 (panel consensus 6/6, 2026-11-16 — v5 regressions on his
  * phone: weak search, incomplete sideways pages, Prison Break
@@ -1283,7 +1284,7 @@ class MovieBoxINProvider : MainAPI() {
         // the card reads as a contradiction (HTTP 200 = OK,
         // yet a failure card).
         val detail = if (code == "200") " بلا عناوين" else ""
-        val title = "⚠ v15 TOP100 غير متاحة — المصدر: $route، الحالة: $code$detail"
+        val title = "⚠ v16 TOP100 غير متاحة — المصدر: $route، الحالة: $code$detail"
         return newMovieSearchResponse(
             title, "mbdiag://top100/p$page/err-$code", TvType.Movie
         )
@@ -1308,7 +1309,7 @@ class MovieBoxINProvider : MainAPI() {
         mobStatus: String,
         tok: String
     ): SearchResponse {
-        val title = "⚠ v15 بحث فارغ — h5=$h5Status mob=$mobStatus tok=$tok"
+        val title = "⚠ v16 بحث فارغ — h5=$h5Status mob=$mobStatus tok=$tok"
         val slug = "h5-" + h5Status.replace(":", "-").replace("/", "-") +
             "-mob-" + mobStatus.replace(":", "-").replace("/", "-")
         return newMovieSearchResponse(
@@ -3012,6 +3013,124 @@ class MovieBoxINProvider : MainAPI() {
         return out.toString()
     }
 
+    /** Build a WEBVTT from parsed English cues + translated Arabic
+     * texts (v16 AI fallback): timestamps come from the ORIGINAL
+     * English cues, only the text lines are translated — cue order
+     * and timing are preserved exactly (same shape as
+     * AnimeSubs.buildSubVTT). */
+    private fun mbBuildArVTT(
+        cues: List<MbSubCue>,
+        texts: List<String>
+    ): String {
+        val out = StringBuilder("WEBVTT\n\n")
+        for ((i, c) in cues.withIndex()) {
+            out.append(mbFmtMs(c.startMs)).append(" --> ")
+                .append(mbFmtMs(c.endMs)).append("\n")
+                .append(texts.getOrNull(i) ?: c.text).append("\n\n")
+        }
+        return out.toString()
+    }
+
+    /** Result of the v16 AI dual attempt: dualUrl when a dual file
+     * was built (relay mergesubs of the translated pair, else a
+     * locally merged + stored one), arUrl when a translated Arabic
+     * file was stored (even if the dual merge itself failed — the
+     * Arabic single can still be emitted), stage "ok:<engine>"
+     * on success ("ok:gtx" / "ok:mm" / "ok:cached"), else the
+     * failing stage (ai-en-fetch / ai-en-parse / ai-gtx / ai-mm /
+     * ai-mm-limit / ai-timeout / ai-store / ai-merge-fail). */
+    private data class MbAiDualResult(
+        val dualUrl: String?,
+        val arUrl: String?,
+        val stage: String
+    )
+
+    /** v16 — AI dual (Mohamed's order 2026-11-16 22:36): build the
+     * dual from the English track alone by translating its cues
+     * to Arabic (MbTranslate: gtx first, MyMemory fallback, 45 s
+     * deadline so playback start never stalls) and merging
+     * translated-AR + original-EN. engPool is tried in order —
+     * the first URL that fetches and parses into cues wins.
+     * The relay mergesubs rung runs first, then a local merge +
+     * store (same two rungs as mbEmitUnion). A cached result
+     * from a repeat play is validated (the relay's /s/ links
+     * live only 24 h) before it is reused. */
+    private suspend fun mbAiDual(
+        engPool: List<String>,
+        fetchText: suspend (String) -> String?
+    ): MbAiDualResult {
+        val deadlineMs = System.currentTimeMillis() + 45_000
+        // (1) Cache first (repeat plays skip translation entirely —
+        // same pattern as AnimeTranslate/GoojaraTranslate).
+        for (engUrl in engPool) {
+            val cachedDual = MbTranslate.cachedDual(engUrl)
+            if (cachedDual != null && fetchText(cachedDual) != null) {
+                return MbAiDualResult(cachedDual, MbTranslate.cachedAr(engUrl), "ok:cached")
+            }
+        }
+        // (2) Fetch + parse the first English file that yields cues.
+        var anyFetched = false
+        var engUrl: String? = null
+        var engCues: List<MbSubCue> = emptyList()
+        for (u in engPool) {
+            val t = fetchText(u) ?: continue
+            anyFetched = true
+            val cues = mbParseSubCues(t)
+            if (cues.isNotEmpty()) {
+                engUrl = u
+                engCues = cues
+                break
+            }
+        }
+        if (engUrl == null) {
+            return MbAiDualResult(
+                null, null, if (anyFetched) "ai-en-parse" else "ai-en-fetch"
+            )
+        }
+        // (3) Translate cue-by-cue (gtx first, MyMemory fallback).
+        val tr = MbTranslate.mbTranslateCueTexts(
+            engCues.map { it.text }, deadlineMs
+        )
+        val translated = tr.texts
+        if (translated == null) {
+            return MbAiDualResult(null, null, tr.failStage ?: "ai-gtx")
+        }
+        val engine = tr.engine ?: "gtx"
+        // (4) Store the translated Arabic VTT.
+        val arVtt = mbBuildArVTT(engCues, translated)
+        val arUrl = runCatching {
+            val res = app.post("$mbSubsRelayBase/relay/store", data = mapOf("vtt" to arVtt))
+            JSONObject(res.text).optString("url").ifEmpty { null }
+        }.getOrNull()
+        if (arUrl == null) return MbAiDualResult(null, null, "ai-store")
+        // (5) Merge translated-AR + original-EN: relay mergesubs
+        // first, then a local merge + store.
+        val mergeUrl = "$mbSubsRelayBase/relay/mergesubs?eng=" +
+            java.net.URLEncoder.encode(engUrl, "UTF-8") +
+            "&ara=" + java.net.URLEncoder.encode(arUrl, "UTF-8")
+        val relayOk = runCatching {
+            val r = app.get(mergeUrl)
+            r.code in 200..299 && r.text.contains("WEBVTT")
+        }.getOrDefault(false)
+        if (relayOk) {
+            MbTranslate.putCache(engUrl, arUrl, mergeUrl)
+            return MbAiDualResult(mergeUrl, arUrl, "ok:$engine")
+        }
+        val arCues = engCues.mapIndexed { i, c ->
+            MbSubCue(c.startMs, c.endMs, translated.getOrNull(i) ?: c.text)
+        }
+        val dualVtt = mbBuildDualVTT(arCues, engCues)
+        val stored = runCatching {
+            val res = app.post("$mbSubsRelayBase/relay/store", data = mapOf("vtt" to dualVtt))
+            JSONObject(res.text).optString("url").ifEmpty { null }
+        }.getOrNull()
+        if (stored != null) {
+            MbTranslate.putCache(engUrl, arUrl, stored)
+            return MbAiDualResult(stored, arUrl, "ok:$engine")
+        }
+        return MbAiDualResult(null, arUrl, "ai-merge-fail")
+    }
+
     /** Fetch both caption files on the phone's network (which
      * reaches MovieBox), merge locally and host the result on
      * the subtitle relay. Returns (stored dual URL, stage):
@@ -3051,15 +3170,28 @@ class MovieBoxINProvider : MainAPI() {
      * must not kill the dual when a later stage holds a good
      * one for the same language). Relay merge first, local
      * merge + /relay/store fallback per pair (as in HorrorMovies
-     * v19). Returns the sub diagnostic: "ar+en" when the dual
-     * was emitted, "ar" / "en" for a single side,
-     * "ar+mf:dual=<stage>" when both sides exist but no dual
-     * file could be built — stage is the last failure:
-     * relay-fail (the relay mergesubs GET failed), fetch-fail
-     * (a caption file could not be fetched), parse-fail (a
-     * fetched file parsed to zero cues), store-fail (the
-     * /relay/store POST failed). The singles are still emitted
-     * in that case. */
+     * v19). v16 — AI fallback (Mohamed's order 2026-11-16 22:36):
+     * when no pair builds a dual but an English track exists,
+     * its cues are translated to Arabic (gtx first, MyMemory
+     * fallback — MbTranslate) and the translated-AR + original-EN
+     * are merged instead. Returns the sub diagnostic:
+     * "ar+en|dual=merge" when the dual was built from the two
+     * existing tracks, "ar+en|dual=ai-tr:<engine>" when it was
+     * built from the AI translation, "ar" / "en" for a single
+     * side, "ar+mf:dual=<stage>" when both sides exist but no
+     * dual file could be built, "en|dual=fail:<stage>" when only
+     * English exists and the AI attempt failed — stage is the
+     * last failure: relay-fail (the relay mergesubs GET failed),
+     * fetch-fail (a caption file could not be fetched),
+     * parse-fail (a fetched file parsed to zero cues),
+     * store-fail (the /relay/store POST failed), ai-en-fetch /
+     * ai-en-parse (no English file could be fetched/parsed),
+     * ai-gtx / ai-mm / ai-mm-limit / ai-timeout (both engines
+     * failed, the MyMemory budget ran out, or the 45 s deadline
+     * hit), ai-store (the translated Arabic file could not be
+     * stored), ai-merge-fail (the translated pair could not be
+     * merged — the translated Arabic single is still emitted
+     * then). The singles are still emitted in that case. */
     private suspend fun mbEmitUnion(
         ara: String?,
         eng: String?,
@@ -3112,21 +3244,44 @@ class MovieBoxINProvider : MainAPI() {
             }.getOrDefault(false)
             if (mergeOk) {
                 emitDualThenSingles(mergeUrl)
-                return "ar+en"
+                return "ar+en|dual=merge"
             }
             // (2) Local merge fallback for the same pair.
             val (stored, stage) = mbMergeCaptionsLocal(a, e) { url -> fetchText(url) }
             if (stored != null) {
                 emitDualThenSingles(stored)
-                return "ar+en"
+                return "ar+en|dual=merge"
             }
             lastStage = stage
         }
+        // v16 — AI fallback (Mohamed's order 2026-11-16 22:36):
+        // no pair built a dual, but an English track exists — its
+        // cues are translated to Arabic and the translated-AR +
+        // original-EN are merged instead. The translated Arabic
+        // single is emitted too when the original Arabic URL is
+        // missing or dead.
+        var aiStage: String? = null
+        var aiArUrl: String? = null
+        if (eng != null) {
+            val ai = mbAiDual(engPool) { url -> fetchText(url) }
+            if (ai.dualUrl != null) {
+                subtitleCallback(SubtitleFile("الإنجليزية + العربية", ai.dualUrl))
+                subtitleCallback(SubtitleFile("الإنجليزية", eng))
+                if (ai.arUrl != null) subtitleCallback(SubtitleFile("العربية", ai.arUrl))
+                else if (ara != null) subtitleCallback(SubtitleFile("العربية", ara))
+                return "ar+en|dual=ai-tr:${ai.stage.removePrefix("ok:")}"
+            }
+            aiStage = ai.stage
+            aiArUrl = ai.arUrl
+            lastStage = ai.stage
+        }
         // No pair built a dual — singles only (unchanged).
         if (eng != null) subtitleCallback(SubtitleFile("الإنجليزية", eng))
-        if (ara != null) subtitleCallback(SubtitleFile("العربية", ara))
+        if (aiArUrl != null) subtitleCallback(SubtitleFile("العربية", aiArUrl))
+        else if (ara != null) subtitleCallback(SubtitleFile("العربية", ara))
         if (ara != null && eng != null) return "ar+mf:dual=$lastStage"
         if (ara != null) return "ar"
+        if (aiStage != null) return "en|dual=fail:$aiStage"
         return "en"
     }
 
@@ -3263,10 +3418,12 @@ class MovieBoxINProvider : MainAPI() {
      * caption per stream id (moviebox.sg first — the verified
      * base — then the play base), mobile ext-captions, mobile
      * stream-captions. Stops early only once BOTH sides are
-     * found. Returns the sub diagnostic: "ar+en" / "ar" / "en"
-     * / "ar+mf", else a compact "none:<route>=<code>/..."
-     * trail (with "/ids=<tried stream ids>" so the next phone
-     * DEBUG shows the exact ids to test).
+     * found. Returns the sub diagnostic: "ar+en|dual=merge" /
+     * "ar+en|dual=ai-tr:<engine>" / "ar" / "en" /
+     * "ar+mf:dual=<stage>" / "en|dual=fail:<stage>", else a
+     * compact "none:<route>=<code>/..." trail (with
+     * "/ids=<tried stream ids>" so the next phone DEBUG shows
+     * the exact ids to test).
      * v4 — why the phone's ids fail: the phone's v3 DEBUG
      * showed 10x h5=200-empty with ITS OWN ids logged
      * (/ids=7599736117126382536,...), and that first phone id
@@ -3567,7 +3724,7 @@ class MovieBoxINProvider : MainAPI() {
             if (eng != null) engAlts.removeAt(0)
         }
         val union = mbEmitUnion(ara, eng, subtitleCallback, araAlts, engAlts)
-        if (union.startsWith("ar+mf")) {
+        if (union.startsWith("ar+mf") || union.contains("dual=fail")) {
             return union + "|st=" + trail.takeLast(3).joinToString("/")
         }
         return union
@@ -3830,7 +3987,7 @@ class MovieBoxINProvider : MainAPI() {
             // "id-missing" the v12 screenshot showed.
             emitDebug(
                 listOf(
-                    "MovieBoxIN v15", "srv=0", "ext=0",
+                    "MovieBoxIN v16", "srv=0", "ext=0",
                     "t=${elapsed() / 1000}s", "tok=$tokVia",
                     "play=$playCode", "id-missing",
                     mbLastLoadDiag.ifBlank { "load=?" }
@@ -4077,14 +4234,16 @@ class MovieBoxINProvider : MainAPI() {
                 )
             }
         }
-        if (emitted == 0 || subDiag != "ar+en") {
-            // A missing subtitle must never be silent again —
-            // emit the DEBUG line even when playback links exist.
-            // v6: the last search + TOP100 diagnostics ride
-            // along (the home/search paths have no phone-visible
-            // surface of their own).
+        // v16 — the DEBUG line is emitted on EVERY loadLinks now
+        // (not only when the dual is missing): the phone screenshot
+        // always proves the version AND the dual path
+        // (dual=merge / ai-tr / fail:<stage>), so a missing dual
+        // is never silent. v6: the last search + TOP100
+        // diagnostics ride along (the home/search paths have no
+        // phone-visible surface of their own).
+        run {
             val diag = ArrayList<String>()
-            diag += "MovieBoxIN v15"
+            diag += "MovieBoxIN v16"
             diag += "srv=$streamsFound"
             diag += "ext=$emitted"
             diag += "dubs=$dubCount"

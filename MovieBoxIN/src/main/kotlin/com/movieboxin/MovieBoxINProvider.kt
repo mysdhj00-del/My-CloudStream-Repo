@@ -277,9 +277,65 @@ import okhttp3.RequestBody.Companion.toRequestBody
  * fallbacks; the mobile routes are the ones that work on his
  * phone (the original v56 WORKS there, his word). Nothing here
  * is "working" until he confirms on his phone after a full close
- * and reopen. DEBUG ("MovieBoxIN v5 | ... | sub=...") is emitted
+ * and reopen. DEBUG ("MovieBoxIN v6 | ... | sub=...") is emitted
  * whenever links are zero OR the dual is missing, so a failure
  * is never silent.
+ *
+ * v6 (panel consensus 6/6, 2026-11-16 — v5 regressions on his
+ * phone: weak search, incomplete sideways pages, Prison Break
+ * vanished from search, TOP100 row gone entirely):
+ * - SEARCH is H5 FIRST + mobile merge (evidence, not opinion:
+ *   H5 "prison break" p1 has Prison Break S1-S5 FIRST, T53;
+ *   mobile behaviour on the phone is unverified). Per page:
+ *   H5 subject/search, then mobile search/v2, merged by
+ *   subjectId (H5 set first, mobile adds only what H5 lacks).
+ *   Fallback triggers on ZERO USABLE ITEMS — a 200 with an
+ *   empty/wrong array is a failure, never a success. If both
+ *   routes are empty, H5 page 1 is retried once; still empty
+ *   -> empty + hasNext=false. The legacy search(query) is
+ *   DELETED entirely (the base wraps it with hasNext=false
+ *   always, so keeping it lets the app take a dead path).
+ * - PARSER mbSubjectsArray is strict now: candidates in order
+ *   items -> subjects -> subjectList -> list ->
+ *   results[].subjects (results LAST, most ambiguous); the
+ *   FIRST NON-EMPTY array whose entries parse as subjects wins
+ *   — never the first EXISTING key. The chosen key + counts
+ *   are logged (ms=, ms_key=, hs=, key=).
+ * - PAGER is the only stop condition: hasNext = pager.hasMore
+ *   when the pager exists; nextPage is a STRING ('2'), parsed
+ *   as text (T53/T55/T57). The "full page >= 20" rule is NEVER
+ *   used when a pager exists (H5 search pages are 10, ranking
+ *   pages 16/7 — the rule killed paging after p1, proven T55);
+ *   it is a cautious fallback ONLY when no pager exists, and
+ *   it is logged. Page 1 never returns hasNext=false when
+ *   totalCount > returned count.
+ * - HOME never drops a section for an empty first page: every
+ *   section stays visible with an empty/error state, each with
+ *   its own page number + endpoint (no global page counter).
+ *   getMainPage serves ONE page per call — no pre-fetching all
+ *   pages (that truncated the sideways scroll). fetchRankPage
+ *   walks the pager (while hasMore, cap 100 new cards / 10 API
+ *   pages per call) so a page that brings zero NEW cards while
+ *   hasMore=true is skipped instead of ending the row.
+ * - TOP100 stays on the MOBILE tab/ranking-list route
+ *   (fetchCatPage, categoryType 4741626294545400336 "Top Series
+ *   This Week") + fallback + never-drop (HomePageList always
+ *   added, hasNext=true while uncertain, lazy retry). The H5
+ *   ranking-list/content route for this id is NOT a source:
+ *   proven live it returns the Hindi-heavy 'Top Series' list
+ *   (T55/T56 — lang/region params change nothing), zero
+ *   overlap with his screenshots. categoryType
+ *   4516404531735022304 is "Trending", NOT Top 100 — never a
+ *   TOP100 source (it is only the token-mint URL in
+ *   mbGuestToken). Fallback for an empty TOP100 page 1 is the
+ *   mobile tab-operating "Must-watch Top 100" section's own
+ *   subjects (the row's true first page). DEBUG top=
+ *   (ok/empty/err:<code>) + count + route.
+ * - DEBUG is extended (ms=, ms_key=, hs=, pg=, hm=, nx=,
+ *   top=, tot=, pages=, src=h5|mobile|merged, key=) and the
+ *   last search + TOP100 diagnostics ride on the loadLinks
+ *   DEBUG line, so they are visible on the phone.
+ * Still NO trailer in v6. Still no coroutines anywhere.
  */
 class MovieBoxINProvider : MainAPI() {
     override var mainUrl = "https://api3.aoneroom.com"
@@ -311,6 +367,54 @@ class MovieBoxINProvider : MainAPI() {
 
     @Volatile
     private var mbHomeSections: List<MbHomeSection> = emptyList()
+
+    /** First-page cards of the mobile tab-operating "Must-watch
+     * Top 100" section (v6): the fixed cat: row's fallback when
+     * the mobile tab/ranking-list feed is empty on page 1.
+     * Kept OUT of mbHomeSections on purpose — the cat: entry
+     * owns that row, and a second entry with the same title
+     * would overwrite it in the app's expandable map (the app
+     * keys rows by name, HomeViewModel initial load). */
+    @Volatile
+    private var mbTop100TabCards: List<SearchResponse> = emptyList()
+
+    /** One parsed list-endpoint page (v6 — the pager contract):
+     * items, hasMore from the pager (never from page size while
+     * a pager exists), nextPage as a STRING ('2'), totalCount,
+     * the array key that won, and a short status for DEBUG. */
+    private data class MbPage(
+        val items: List<SearchResponse>,
+        val hasMore: Boolean,
+        val nextPage: String?,
+        val totalCount: Int?,
+        val key: String,
+        val status: String
+    )
+
+    /** A parsed subject with its own id (v6 — search merge
+     * dedups by subjectId, never by URL: two records can share
+     * a URL in the mobile shape). Falls back to detailPath when
+     * the record carries no subjectId. */
+    private data class MbSubjectHit(val id: String, val item: SearchResponse)
+
+    /** The pager object of a list response (v6): hasMore /
+     * nextPage / totalCount, each nullable when absent. nextPage
+     * is a STRING on this API ('2'), never an Int. */
+    private data class MbPager(
+        val hasMore: Boolean?,
+        val nextPage: String?,
+        val totalCount: Int?
+    )
+
+    /** Last search + TOP100 diagnostics (v6 — extended DEBUG).
+     * The home/search paths have no phone-visible surface of
+     * their own, so the latest lines ride on the loadLinks
+     * DEBUG line (see loadLinks) and are readable on the phone
+     * whenever an episode is opened. */
+    @Volatile
+    private var mbLastSearchDebug: String = ""
+    @Volatile
+    private var mbLastTopDebug: String = ""
 
     override val mainPage: List<MainPageData>
         get() {
@@ -494,7 +598,8 @@ class MovieBoxINProvider : MainAPI() {
 
     /** Tab-operating sections as home records (mobile first, H5
      * twin fallback). Titles deduped (first non-empty wins —
-     * the app keys rows by title); empty sections skipped.
+     * the app keys rows by title); empty sections are KEPT
+     * (v6 — a row is never dropped for an empty first page).
      * Populates mbHomeSections (the mainPage entries for the
      * next home load) and seeds the rank seen-sets.
      * v3 — genreTopId merge: rank pagination needs genreTopId,
@@ -522,8 +627,18 @@ class MovieBoxINProvider : MainAPI() {
         for (i in 0 until sections.length()) {
             val section = sections.optJSONObject(i) ?: continue
             val cards = sectionSubjects(section)
-            if (cards.isEmpty()) continue
             val title = section.optString("title").ifBlank { "✨Top Picks" }
+            // v6 — the mobile tab-operating "Must-watch Top 100"
+            // section is NOT a home row of its own: the fixed
+            // cat: entry owns that row (a second entry with the
+            // same title would overwrite it in the app's
+            // expandable map). Its subjects are kept aside as
+            // the cat: feed's page-1 fallback instead.
+            if (title.trim() == mbTop100Title ||
+                (title.contains("Must-watch") && title.contains("Top 100"))) {
+                if (cards.isNotEmpty()) mbTop100TabCards = cards
+                continue
+            }
             if (!seenTitles.add(title)) continue
             // v4: a mobile section may carry its ranking-list id
             // in its url (?id=<gid>, the website's ranking-list
@@ -635,31 +750,25 @@ class MovieBoxINProvider : MainAPI() {
     }
 
     /** One page of a ranking-list section (H5, no token, proven
-     * live 2026-11-16: Horror Movies pp.1-3 = 17/15/18 new
-     * cards, Popular Series 16/15/13, zero overlap, hasMore
-     * true throughout). Returns (newCards, hasMore): hasMore
-     * is false when the pager says so OR the page brought zero
-     * new cards (a clamped past-the-end page). */
+     * live: Horror Movies pp.1-3 = 17/15/18 new cards, Popular
+     * Series 16/15/13, zero overlap, hasMore true throughout;
+     * T57 re-verified 2026-11-16: subjectList, hasMore=true,
+     * nextPage STRING '2', totalCount=0).
+     * v6 — the pager contract: hasMore comes ONLY from
+     * pager.hasMore when it exists (never from page size — H5
+     * ranking pages are 16/7, so the old >=20 rule ended the
+     * row after page 1, proven T55). The call walks the pager
+     * (while hasMore, cap 100 NEW cards / 10 API pages): a page
+     * that brings zero NEW cards while hasMore=true is SKIPPED
+     * instead of ending the row (the v5 bug: such a page
+     * returned hasNext=false). Starts at the requested page —
+     * one app page per call, no pre-fetching all pages. */
     private suspend fun fetchRankPage(
         genreTopId: String,
         page: Int
-    ): Pair<List<SearchResponse>, Boolean> {
-        val url = "$mbWebBase/wefeed-h5api-bff/ranking-list/content" +
-            "?id=$genreTopId&page=$page&perPage=20"
-        val res = runCatching { app.get(url, headers = mbJsonHeaders) }
-            .getOrNull() ?: return emptyList<SearchResponse>() to false
-        if (res.code !in 200..299) return emptyList<SearchResponse>() to false
-        val json = runCatching { JSONObject(res.text) }.getOrNull()
-            ?: return emptyList<SearchResponse>() to false
-        val data = json.optJSONObject("data")
-            ?: return emptyList<SearchResponse>() to false
-        val arr = data.optJSONArray("subjectList")
-            ?: return emptyList<SearchResponse>() to false
-        val pager = data.optJSONObject("pager")
-        val hasMore = when (val hm = pager?.opt("hasMore")) {
-            is Boolean -> hm
-            is String -> hm.equals("true", ignoreCase = true)
-            else -> false
+    ): MbPage {
+        if (genreTopId.isBlank() || page < 1) {
+            return MbPage(emptyList(), false, null, null, "none", "err:bad-arg")
         }
         val seen = synchronized(mbRankSeenLock) {
             mbRankSeen.getOrPut(genreTopId) { HashSet() }.also {
@@ -667,41 +776,108 @@ class MovieBoxINProvider : MainAPI() {
             }
         }
         val out = ArrayList<SearchResponse>()
-        synchronized(mbRankSeenLock) {
-            for (i in 0 until arr.length()) {
-                val o = arr.optJSONObject(i) ?: continue
-                val dp = o.optString("detailPath")
-                if (dp.isBlank() || !seen.add(dp)) continue
-                parseSubject(o)?.let { out += it }
+        var cur = page
+        var hasMore = false
+        var nextPage: String? = null
+        var totalCount: Int? = null
+        var key = "none"
+        var status = "empty"
+        var attempts = 0
+        while (attempts < 10 && out.size < 100) {
+            attempts++
+            val url = "$mbWebBase/wefeed-h5api-bff/ranking-list/content" +
+                "?id=$genreTopId&page=$cur&perPage=20"
+            val res = runCatching { app.get(url, headers = mbJsonHeaders) }
+                .getOrNull()
+            if (res == null) {
+                status = "err:net"
+                break
             }
+            if (res.code !in 200..299) {
+                status = "err:${res.code}"
+                break
+            }
+            val json = runCatching { JSONObject(res.text) }.getOrNull()
+            if (json == null) {
+                status = "err:parse"
+                break
+            }
+            val data = json.optJSONObject("data")
+            if (data == null) {
+                status = "err:nodata"
+                break
+            }
+            val picked = mbSubjectsArray(data)
+            val pager = mbPager(data)
+            // Cautious fallback ONLY when the pager carries no
+            // hasMore at all (logged as "/full" in status).
+            val fullFallback = pager.hasMore == null
+            hasMore = pager.hasMore
+                ?: ((picked?.first?.length() ?: 0) >= 20)
+            nextPage = pager.nextPage
+            totalCount = pager.totalCount
+            key = picked?.second ?: "none"
+            val arr = picked?.first
+            if (arr != null) {
+                synchronized(mbRankSeenLock) {
+                    for (i in 0 until arr.length()) {
+                        val o = arr.optJSONObject(i) ?: continue
+                        val subj = o.optJSONObject("subject") ?: o
+                        val dp = subj.optString("detailPath")
+                        if (dp.isBlank() || !seen.add(dp)) continue
+                        parseSubject(subj)?.let { out += it }
+                    }
+                }
+            }
+            status = (if (out.isNotEmpty()) "ok" else "empty") +
+                if (fullFallback) "/full" else ""
+            // One non-empty page per call (lazy paging); an
+            // empty page with more behind it is skipped.
+            if (out.isNotEmpty()) break
+            if (!hasMore) break
+            cur = nextPage?.toIntOrNull() ?: (cur + 1)
         }
-        return out to (hasMore && out.isNotEmpty())
+        return MbPage(out, hasMore, nextPage, totalCount, key, status)
     }
 
-    /** One page of the mobile tab/ranking-list feed (v4 TOP100).
-     * The dex's only ranking call: GET {mobile base}/
-     * wefeed-mobile-bff/tab/ranking-list?tabId=0&categoryType=
-     * <ct>&page=<page>&perPage=20, signed headers (IN's shape)
-     * + the guest token. apig first, api3 fallback — both are
-     * mobile hosts; the phone reaches them (tok=mob proves the
-     * token mint works there), the sandbox gets 403 on both.
-     * Response items: data.subjects[] (dex shape) with
-     * data.subjectList[] / items[] / list[] as fallbacks; the
-     * pager is read tolerantly like fetchRankPage. Dedup by
-     * detailPath in a per-feed seen-set (cleared on page 1);
-     * hasNext is false when the pager says so OR the page
-     * brought zero new cards, and pages stop at 10 (~200
-     * cards — far past the 100 the list promises). Fail-soft:
-     * any non-200 / unparsable shape returns empty + false. */
+    /** One page of the mobile tab/ranking-list feed (v4 TOP100,
+     * v6 rewritten). The dex's only ranking call: GET {mobile
+     * base}/wefeed-mobile-bff/tab/ranking-list?tabId=0&
+     * categoryType=<ct>&page=<page>&perPage=20, signed headers
+     * (IN's shape) + the guest token. apig first, api3
+     * fallback — both are mobile hosts; the phone reaches them
+     * (tok=mob proves the token mint works there), the sandbox
+     * gets 403 on both. Response items: the strict
+     * mbSubjectsArray (data.subjects[] in the dex shape, with
+     * the other keys as fallbacks); the pager is read with the
+     * v6 contract (hasMore from the pager only, nextPage as a
+     * STRING). Dedup by detailPath in a per-feed seen-set
+     * (cleared on page 1).
+     * v6 fallbacks — a 403 / non-200 / empty first page does
+     * NOT end the row:
+     * - any categoryType EXCEPT the TOP100 id: the H5
+     *   ranking-list/content twin for the same id.
+     * - the TOP100 id itself: NEVER the H5 ranking-list route
+     *   (proven live it returns the Hindi-heavy 'Top Series'
+     *   list, T55/T56 — a wrong list, not the app's TOP100);
+     *   instead the mobile tab-operating "Must-watch Top 100"
+     *   section's own subjects (the row's true first page) on
+     *   page 1, and an empty retryable page after that.
+     * The row is NEVER dropped by the caller: this returns the
+     * status (ok/empty/err:<code>) + route so the DEBUG line
+     * can show top= and the row stays expandable. */
     private suspend fun fetchCatPage(
         categoryType: String,
         page: Int
-    ): Pair<List<SearchResponse>, Boolean> {
+    ): MbPage {
         if (categoryType.isBlank() || page < 1 || page > 10) {
-            return emptyList<SearchResponse>() to false
+            return MbPage(emptyList(), false, null, null, "none", "err:bad-arg")
         }
+        val isTop100 = categoryType == mbTop100CategoryType
         val (token, _) = mbGuestToken()
         val bases = listOf(mbMobileBase, mbApi3Base)
+        var lastCode = "?"
+        var mobileEmpty: MbPage? = null
         for (base in bases) {
             val url = "$base/wefeed-mobile-bff/tab/ranking-list" +
                 "?tabId=0&categoryType=$categoryType" +
@@ -716,17 +892,18 @@ class MovieBoxINProvider : MainAPI() {
                 }
                 app.get(url, headers = headers)
             }.getOrNull() ?: continue
+            lastCode = res.code.toString()
             if (res.code !in 200..299) continue
             val json = runCatching { JSONObject(res.text) }.getOrNull()
                 ?: continue
             val data = json.optJSONObject("data") ?: continue
-            val arr = mbSubjectsArray(data) ?: continue
-            val pager = data.optJSONObject("pager")
-            val pagerMore = when (val hm = pager?.opt("hasMore")) {
-                is Boolean -> hm
-                is String -> hm.equals("true", ignoreCase = true)
-                else -> null
-            }
+            val picked = mbSubjectsArray(data) ?: continue
+            val pager = mbPager(data)
+            // Cautious fallback ONLY when the pager carries no
+            // hasMore at all (logged as "/full" in status).
+            val fullFallback = pager.hasMore == null
+            val hasMore = pager.hasMore
+                ?: (picked.first.length() >= 20)
             val key = "cat:$categoryType"
             val seen = synchronized(mbRankSeenLock) {
                 mbRankSeen.getOrPut(key) { HashSet() }.also {
@@ -735,61 +912,126 @@ class MovieBoxINProvider : MainAPI() {
             }
             val out = ArrayList<SearchResponse>()
             synchronized(mbRankSeenLock) {
-                for (i in 0 until arr.length()) {
-                    val o = arr.optJSONObject(i) ?: continue
+                for (i in 0 until picked.first.length()) {
+                    val o = picked.first.optJSONObject(i) ?: continue
                     val subj = o.optJSONObject("subject") ?: o
                     val dp = subj.optString("detailPath")
                     if (dp.isBlank() || !seen.add(dp)) continue
                     parseSubject(subj)?.let { out += it }
                 }
             }
-            val more = pagerMore ?: (arr.length() >= 20)
-            return out to (more && out.isNotEmpty())
+            val status = (if (out.isNotEmpty()) "ok" else "empty") +
+                if (fullFallback) "/full" else ""
+            val result = MbPage(
+                out, hasMore, pager.nextPage, pager.totalCount,
+                picked.second, status
+            )
+            if (out.isNotEmpty()) {
+                updateTopDebug(result, "mobile")
+                return result
+            }
+            if (mobileEmpty == null) mobileEmpty = result
         }
-        return emptyList<SearchResponse>() to false
+        // --- fallback (mobile feed 403 / empty on both bases) ---
+        if (isTop100) {
+            // NEVER the H5 ranking-list route for this id (T55:
+            // 'Top Series' Hindi list — a wrong list, not the
+            // app's TOP100). The row's true first page lives in
+            // the mobile tab-operating section itself.
+            if (page <= 1) {
+                if (mbTop100TabCards.isEmpty()) {
+                    runCatching { fetchTabSections() }
+                }
+                val cards = mbTop100TabCards
+                if (cards.isNotEmpty()) {
+                    val result = MbPage(
+                        cards, true, "2", null, "tabs", "ok"
+                    )
+                    updateTopDebug(result, "tabs")
+                    return result
+                }
+            }
+            val result = MbPage(
+                emptyList(), true, null, null, "none",
+                "err:$lastCode"
+            )
+            updateTopDebug(result, "mobile")
+            return result
+        }
+        // Generic cat: sections: the H5 ranking-list twin.
+        val h5 = fetchRankPage(categoryType, page)
+        val result = MbPage(
+            h5.items, h5.hasMore, h5.nextPage, h5.totalCount,
+            h5.key, h5.status
+        )
+        updateTopDebug(result, "h5")
+        return result
     }
 
-    /** The "tabs" request. Page 1 refreshes the tab cache and
-     * returns every section's first page (hasNext = any rank
-     * section exists). Page>1 is the session-1 expansion
-     * fallback — the frozen mainPage has no per-section entries
-     * yet, so the app re-calls "tabs": return every rank
-     * section's next ranking-list page at once. */
+    /** Record the latest TOP100 fetch for the extended DEBUG
+     * line (v6): top= (ok/empty/err:<code>) + count + route. */
+    private fun updateTopDebug(page: MbPage, route: String) {
+        mbLastTopDebug = "top=${page.status} n=${page.items.size} " +
+            "route=$route key=${page.key} hm=${page.hasMore} " +
+            "nx=${page.nextPage ?: "-"}"
+    }
+
+    /** A rank section's first page (v6): its tab-operating
+     * subjects when they exist, else its ranking-list page 1.
+     * The tabs branch and the rank: branch MUST agree here —
+     * the app overwrites same-named rows by response order, so
+     * a disagreement would silently drop cards. */
+    private suspend fun mbRankFirstPage(s: MbHomeSection): List<SearchResponse> {
+        if (s.subjects.isNotEmpty()) return s.subjects
+        if (s.genreTopId.isBlank()) return emptyList()
+        return fetchRankPage(s.genreTopId, 1).items
+    }
+
+    /** The "tabs" request (v6). Page 1 refreshes the tab cache
+     * and returns every section's first page — NO section is
+     * ever dropped for an empty first page (an empty rank
+     * section is filled from its ranking-list page 1, and the
+     * TOP100 row is ALWAYS added, even empty, with its own
+     * cat: entry owning the retry). Page>1 is the session-1
+     * expansion fallback — the frozen mainPage has no
+     * per-section entries yet, so the app re-calls "tabs":
+     * return ONE page per section (never all pages). */
     private suspend fun getMainPageTabs(page: Int): HomePageResponse {
         if (page <= 1) {
             val sections = fetchTabSections()
-            if (sections.isEmpty()) return newHomePageResponse(emptyList(), false)
             val lists = ArrayList<HomePageList>()
-            // TOP100 first page (mobile feed; fail-soft — the
-            // row is still served by its own "cat:" entry).
-            val (topCards, topMore) =
-                fetchCatPage(mbTop100CategoryType, 1)
-            if (topCards.isNotEmpty()) {
+            // TOP100 first page — ALWAYS added, even empty
+            // (never drop the row; its cat: entry owns the
+            // retry and the hasNext).
+            val top = fetchCatPage(mbTop100CategoryType, 1)
+            lists += HomePageList(
+                mbTop100Title, top.items, isHorizontalImages = true
+            )
+            for (s in sections) {
                 lists += HomePageList(
-                    mbTop100Title, topCards, isHorizontalImages = true
+                    s.title, mbRankFirstPage(s), isHorizontalImages = true
                 )
             }
-            lists += sections.map { s ->
-                HomePageList(s.title, s.subjects, isHorizontalImages = true)
-            }
-            val hasNext = topMore ||
-                sections.any { it.genreTopId.isNotBlank() }
-            return newHomePageResponse(lists, hasNext)
+            // Response-level hasNext is copied by the app into
+            // EVERY row of this response, so it stays true
+            // while any row can expand; each row's own branch
+            // sets the per-row truth on the next load.
+            return newHomePageResponse(lists, true)
         }
         var anyMore = false
         val lists = ArrayList<HomePageList>()
-        val (topCards, topMore) = fetchCatPage(mbTop100CategoryType, page)
-        if (topMore) anyMore = true
-        if (topCards.isNotEmpty()) {
-            lists += HomePageList(
-                mbTop100Title, topCards, isHorizontalImages = true
-            )
-        }
+        val top = fetchCatPage(mbTop100CategoryType, page)
+        if (top.hasMore) anyMore = true
+        lists += HomePageList(
+            mbTop100Title, top.items, isHorizontalImages = true
+        )
         for (s in mbHomeSections) {
             if (s.genreTopId.isBlank()) continue
-            val (cards, hasMore) = fetchRankPage(s.genreTopId, page)
-            if (hasMore) anyMore = true
-            lists += HomePageList(s.title, cards, isHorizontalImages = true)
+            val rank = fetchRankPage(s.genreTopId, page)
+            if (rank.hasMore) anyMore = true
+            lists += HomePageList(
+                s.title, rank.items, isHorizontalImages = true
+            )
         }
         return newHomePageResponse(lists, anyMore)
     }
@@ -801,30 +1043,92 @@ class MovieBoxINProvider : MainAPI() {
         return when {
             request.data == "tabs" -> getMainPageTabs(page)
             request.data.startsWith("rank:") -> {
+                // v6: page 1 is the tab-operating first page
+                // (same content as the tabs branch — the app
+                // overwrites same-named rows by response order,
+                // so the two MUST agree); pages 2+ walk the
+                // ranking-list pager. The row is ALWAYS
+                // returned, even empty.
                 val gid = request.data.removePrefix("rank:")
-                if (gid.isBlank()) return newHomePageResponse(emptyList(), false)
-                val (cards, hasMore) = fetchRankPage(gid, page)
-                newHomePageResponse(
-                    listOf(
-                        HomePageList(request.name, cards, isHorizontalImages = true)
-                    ),
-                    hasMore
-                )
+                if (gid.isBlank()) {
+                    newHomePageResponse(
+                        listOf(
+                            HomePageList(
+                                request.name, emptyList(),
+                                isHorizontalImages = true
+                            )
+                        ),
+                        false
+                    )
+                } else if (page <= 1) {
+                    var section = mbHomeSections.firstOrNull {
+                        it.genreTopId == gid
+                    }
+                    if (section == null) {
+                        fetchTabSections()
+                        section = mbHomeSections.firstOrNull {
+                            it.genreTopId == gid
+                        }
+                    }
+                    val cards = if (section != null) {
+                        mbRankFirstPage(section)
+                    } else {
+                        fetchRankPage(gid, 1).items
+                    }
+                    newHomePageResponse(
+                        listOf(
+                            HomePageList(
+                                request.name, cards,
+                                isHorizontalImages = true
+                            )
+                        ),
+                        true
+                    )
+                } else {
+                    val rank = fetchRankPage(gid, page)
+                    newHomePageResponse(
+                        listOf(
+                            HomePageList(
+                                request.name, rank.items,
+                                isHorizontalImages = true
+                            )
+                        ),
+                        rank.hasMore
+                    )
+                }
             }
             request.data.startsWith("cat:") -> {
-                // TOP100 (v4): the mobile tab/ranking-list feed.
-                // Page 1 serves the row on home load; pages 2+
-                // are the sideways-scroll expansion (100 titles,
-                // stops only on a page with zero new cards).
+                // TOP100 (v4 source, v6 contract): the mobile
+                // tab/ranking-list feed. The row is ALWAYS
+                // returned, even empty (never drop); hasNext
+                // stays true while the outcome is uncertain so
+                // a sideways scroll retries the feed — it is
+                // false only for a proven-complete non-empty
+                // list (pager says no more pages).
                 val ct = request.data.removePrefix("cat:")
-                if (ct.isBlank()) return newHomePageResponse(emptyList(), false)
-                val (cards, hasMore) = fetchCatPage(ct, page)
-                newHomePageResponse(
-                    listOf(
-                        HomePageList(request.name, cards, isHorizontalImages = true)
-                    ),
-                    hasMore
-                )
+                if (ct.isBlank()) {
+                    newHomePageResponse(
+                        listOf(
+                            HomePageList(
+                                request.name, emptyList(),
+                                isHorizontalImages = true
+                            )
+                        ),
+                        false
+                    )
+                } else {
+                    val cat = fetchCatPage(ct, page)
+                    val hasNext = !(cat.items.isNotEmpty() && !cat.hasMore)
+                    newHomePageResponse(
+                        listOf(
+                            HomePageList(
+                                request.name, cat.items,
+                                isHorizontalImages = true
+                            )
+                        ),
+                        hasNext
+                    )
+                }
             }
             request.data.startsWith("tab:") -> {
                 // Non-rank sections (e.g. Coming Soon): their
@@ -855,23 +1159,56 @@ class MovieBoxINProvider : MainAPI() {
     // ---------------------------------------------------------------
     // Search — mobile search/v2 first (IN), H5 search fallback
     // ---------------------------------------------------------------
-    /** Parse one search page: (newItems, hasMore). Dedup by
-     * detailPath against the caller's seen-set (the site itself
-     * repeats titles across pages — different detailPaths are
-     * different records). */
-    /** Response-shape tolerance for list endpoints (v5 —
-     * rennvol subjectsOf + allforu parseSubjects): data.items
-     * (H5 search, proven live T48: items only, totalCount 128)
-     * / data.subjects (the mobile dex shape) / data.subjectList
-     * / data.list / data.results[].subjects. Order matters: H5
-     * carries items only; the mobile routes carry subjects /
-     * subjectList. The v4 parser missed "subjects" entirely —
-     * the mobile search/v2 response shape. */
-    private fun mbSubjectsArray(data: JSONObject): JSONArray? {
-        data.optJSONArray("items")?.let { return it }
-        data.optJSONArray("subjects")?.let { return it }
-        data.optJSONArray("subjectList")?.let { return it }
-        data.optJSONArray("list")?.let { return it }
+    /** The pager object of a list response (v6): hasMore /
+     * nextPage / totalCount, each nullable when absent.
+     * nextPage is a STRING on this API ('2'), never an Int. */
+    private fun mbPager(data: JSONObject): MbPager {
+        val p = data.optJSONObject("pager")
+            ?: return MbPager(null, null, null)
+        val hm = when (val v = p.opt("hasMore")) {
+            is Boolean -> v
+            is String -> v.equals("true", ignoreCase = true)
+            else -> null
+        }
+        val nx = when (val v = p.opt("nextPage")) {
+            is String -> v.ifBlank { null }
+            is Number -> v.toString()
+            else -> null
+        }
+        val tot = when (val v = p.opt("totalCount")) {
+            is Number -> v.toInt()
+            is String -> v.toIntOrNull()
+            else -> null
+        }
+        return MbPager(hm, nx, tot)
+    }
+
+    /** Does this array hold at least one entry that parses as
+     * a subject (non-blank detailPath + title, unwrapping a
+     * "subject" wrapper when present)? */
+    private fun mbParsesAsSubjects(arr: JSONArray): Boolean {
+        for (i in 0 until arr.length()) {
+            val o = arr.optJSONObject(i) ?: continue
+            val subj = o.optJSONObject("subject") ?: o
+            if (subj.optString("detailPath").isNotBlank() &&
+                subj.optString("title").isNotBlank()) return true
+        }
+        return false
+    }
+
+    /** Strict response-shape parser (v6 — panel consensus):
+     * candidates in order items -> subjects -> subjectList ->
+     * list -> results[].subjects (results LAST — most
+     * ambiguous, it may hold suggestions, not hits). The
+     * FIRST NON-EMPTY array whose entries parse as subjects
+     * wins — never the first EXISTING key (the v5 bug: a 200
+     * with an empty/wrong first array stopped the fallback).
+     * Returns the array + the key that won, or null. */
+    private fun mbSubjectsArray(data: JSONObject): Pair<JSONArray, String>? {
+        for (key in listOf("items", "subjects", "subjectList", "list")) {
+            val arr = data.optJSONArray(key) ?: continue
+            if (mbParsesAsSubjects(arr)) return arr to key
+        }
         val results = data.optJSONArray("results") ?: return null
         val merged = JSONArray()
         for (i in 0 until results.length()) {
@@ -881,45 +1218,64 @@ class MovieBoxINProvider : MainAPI() {
                 subs.optJSONObject(j)?.let { merged.put(it) }
             }
         }
-        return if (merged.length() > 0) merged else null
+        return if (mbParsesAsSubjects(merged)) {
+            merged to "results[].subjects"
+        } else null
     }
 
-    private fun searchPageItems(
-        root: JSONObject?,
-        seen: MutableSet<String>
-    ): Pair<List<SearchResponse>, Boolean> {
-        if (root == null) return emptyList<SearchResponse>() to false
-        val data = root.optJSONObject("data") ?: root
-        val arr = mbSubjectsArray(data)
-            ?: return emptyList<SearchResponse>() to false
-        val pager = data.optJSONObject("pager")
-        val hasMore = when (val hm = pager?.opt("hasMore")) {
-            is Boolean -> hm
-            is String -> hm.equals("true", ignoreCase = true)
-            // No pager at all: a full page means "more" (the
-            // mobile routes may not send a pager object).
-            else -> arr.length() >= 20
-        }
-        val out = ArrayList<SearchResponse>()
-        for (i in 0 until arr.length()) {
-            val o = arr.optJSONObject(i) ?: continue
-            val dp = o.optString("detailPath")
-            if (dp.isBlank() || !seen.add(dp)) continue
-            parseSubject(o)?.let { out += it }
-        }
-        return out to hasMore
+    /** One subject JSON object -> a hit carrying its own id
+     * (v6 — merge dedup is by subjectId). */
+    private fun mbParseHit(o: JSONObject?): MbSubjectHit? {
+        if (o == null) return null
+        val subj = o.optJSONObject("subject") ?: o
+        val item = parseSubject(subj) ?: return null
+        val sid = subj.optString("subjectId")
+            .ifBlank { subj.optString("detailPath") }
+        return MbSubjectHit(sid, item)
     }
 
-    /** One page of one search route (mobile search/v2 when
-     * mobile=true, H5 subject/search otherwise). Both routes
-     * need the guest token (H5 without one is a 400 "invalid
-     * token", proven live). */
-    private suspend fun searchRoutePage(
+    /** hasNext for one search route page (v6 — the pager
+     * contract): pager.hasMore when present; never the
+     * "full page >= 20" rule while a pager exists; page 1
+     * never ends when totalCount > returned count; the full
+     * page rule is a cautious fallback ONLY with no pager at
+     * all. */
+    private fun mbSearchHasNext(
+        pager: MbPager,
+        page: Int,
+        count: Int
+    ): Boolean {
+        pager.hasMore?.let { return it }
+        if (page == 1 && pager.totalCount != null) {
+            return pager.totalCount > count
+        }
+        return count >= 20
+    }
+
+    /** One search-route page (v6): hits with subjectIds, the
+     * pager, the array key that won, and the HTTP code. */
+    private data class MbSearchPage(
+        val hits: List<MbSubjectHit>,
+        val pager: MbPager,
+        val key: String,
+        val code: String
+    )
+
+    /** One page of one search route (v6): mobile search/v2
+     * when mobile=true, H5 subject/search otherwise. Both
+     * routes need the guest token (H5 without one is a 400
+     * "invalid token", proven live). Returns the hits with
+     * their subjectIds, the pager, the array key that won,
+     * and the HTTP code (or "net"/"parse" on failure) — so
+     * the caller can tell an empty page from a failed one. */
+    private suspend fun mbSearchPage(
         query: String,
         page: Int,
-        mobile: Boolean,
-        seen: MutableSet<String>
-    ): Pair<List<SearchResponse>, Boolean> {
+        mobile: Boolean
+    ): MbSearchPage {
+        val empty = MbSearchPage(
+            emptyList(), MbPager(null, null, null), "none", "?"
+        )
         return runCatching {
             val (token, _) = mbGuestToken()
             val body = JSONObject().apply {
@@ -961,44 +1317,46 @@ class MovieBoxINProvider : MainAPI() {
                     )
                 )
             }
-            if (res.code !in 200..299) return emptyList<SearchResponse>() to false
-            searchPageItems(
-                runCatching { JSONObject(res.text) }.getOrNull(), seen
+            if (res.code !in 200..299) {
+                return empty.copy(code = res.code.toString())
+            }
+            val json = runCatching { JSONObject(res.text) }.getOrNull()
+                ?: return empty.copy(code = "parse")
+            val data = json.optJSONObject("data") ?: json
+            val picked = mbSubjectsArray(data)
+            val pager = mbPager(data)
+            val hits = ArrayList<MbSubjectHit>()
+            val arr = picked?.first
+            if (arr != null) {
+                for (i in 0 until arr.length()) {
+                    mbParseHit(arr.optJSONObject(i))?.let { hits += it }
+                }
+            }
+            MbSearchPage(
+                hits, pager, picked?.second ?: "none",
+                res.code.toString()
             )
-        }.getOrDefault(emptyList<SearchResponse>() to false)
+        }.getOrDefault(empty.copy(code = "net"))
     }
 
-    /** ALL pages of one search route. Stops on hasMore=false, a
-     * page with zero NEW items, or 8 pages (~160 results — the
-     * bound that keeps search fast). Proven live on H5:
-     * "love" totalCount 452, pp.1-4 = 15/18/14/15 new cards;
-     * "prison break" p1 11 + p2 7 new. v1 fetched page 1 only
-     * (max 20, capped at 30 in the parser) — that was the
-     * "limited results" complaint. */
-    private suspend fun searchRoute(
-        query: String,
-        mobile: Boolean
-    ): List<SearchResponse> {
-        val out = ArrayList<SearchResponse>()
-        val seen = HashSet<String>()
-        for (page in 1..8) {
-            val (items, hasMore) = searchRoutePage(query, page, mobile, seen)
-            out += items
-            if (!hasMore || items.isEmpty()) break
-        }
-        return out
-    }
-
-    /** Paginated search (v5 — rennvol's shape). The app calls
-     * THIS, not the legacy list form: the base implementation
-     * wraps the legacy list with hasNext=false ALWAYS
-     * (MainAPI.kt:641-655), so v1–v4 search could never page
-     * past the one call's walk — the structural "limited
-     * search". One route-page per call here; hasNext comes
-     * from the route's pager, so the app pages through the
-     * whole catalog (totalCount 128 for "prison break", 452
-     * for "love", T48). Mobile route first, H5 fallback per
-     * page. */
+    /** Paginated search (v6 — panel consensus, H5 FIRST +
+     * mobile merge). The app calls THIS: the base wraps the
+     * legacy search(query) with hasNext=false ALWAYS
+     * (MainAPI.kt:641-655), so v1–v4 search could never page.
+     * Per page: H5 subject/search first (sandbox-proven —
+     * "prison break" p1 has Prison Break S1-S5 FIRST, T53),
+     * then mobile search/v2 for the same page, merged by
+     * subjectId (H5 set first, mobile adds only what H5
+     * lacks). A 200 with zero usable items is a FAILURE, not
+     * a success — the other route always runs. If both routes
+     * are empty, H5 page 1 is retried once; still empty ->
+     * empty + hasNext=false. hasNext comes from the pagers
+     * (either route having more pages means more).
+     * NOTE: the legacy search(query) is DELIBERATELY not
+     * overridden in v6 (deleted per the panel consensus) —
+     * the base wraps it with hasNext=false always, and the
+     * app only calls the paginated form (APIRepository.search
+     * -> api.search(query, page), verified in cs-src). */
     override suspend fun search(
         query: String,
         page: Int
@@ -1006,26 +1364,41 @@ class MovieBoxINProvider : MainAPI() {
         if (query.isBlank() || page < 1) {
             return emptyList<SearchResponse>().toNewSearchResponseList(false)
         }
-        val seen = HashSet<String>()
-        val (mobItems, mobMore) = searchRoutePage(query, page, true, seen)
-        if (mobItems.isNotEmpty()) {
-            return mobItems.toNewSearchResponseList(mobMore)
+        val h5 = mbSearchPage(query, page, mobile = false)
+        val mob = mbSearchPage(query, page, mobile = true)
+        val seenIds = HashSet<String>()
+        val out = ArrayList<SearchResponse>()
+        for (h in h5.hits) if (seenIds.add(h.id)) out += h.item
+        for (h in mob.hits) if (seenIds.add(h.id)) out += h.item
+        var src = when {
+            h5.hits.isNotEmpty() && mob.hits.isNotEmpty() -> "merged"
+            h5.hits.isNotEmpty() -> "h5"
+            mob.hits.isNotEmpty() -> "mobile"
+            else -> "none"
         }
-        val (h5Items, h5More) = searchRoutePage(query, page, false, seen)
-        return h5Items.toNewSearchResponseList(h5More && h5Items.isNotEmpty())
-    }
-
-    /** Legacy single-call search: kept for any caller that
-     * still uses it — the v4 behaviour (all pages of the
-     * mobile route, then all pages of H5). */
-    override suspend fun search(query: String): List<SearchResponse> {
-        if (query.isBlank()) return emptyList()
-        // Route 1 — IN's own search/v2 (signed POST on api3),
-        // ALL pages now, not just page 1.
-        val mob = searchRoute(query, mobile = true)
-        if (mob.isNotEmpty()) return mob
-        // Route 2 — H5 search, ALL pages.
-        return searchRoute(query, mobile = false)
+        var h5More = mbSearchHasNext(h5.pager, page, h5.hits.size)
+        val mobMore = mbSearchHasNext(mob.pager, page, mob.hits.size)
+        if (out.isEmpty()) {
+            // Both routes empty: one retry of H5 page 1, then
+            // empty + hasNext=false. (A retry of the same page
+            // is cheap and covers transient failures.)
+            val retry = mbSearchPage(query, 1, mobile = false)
+            for (h in retry.hits) if (seenIds.add(h.id)) out += h.item
+            if (retry.hits.isNotEmpty()) {
+                src = "h5-retry"
+                h5More = mbSearchHasNext(retry.pager, 1, retry.hits.size)
+            }
+        }
+        var hasMore = out.isNotEmpty() && (h5More || mobMore)
+        // Never end page 1 while the H5 catalog says more.
+        val h5Tot = h5.pager.totalCount
+        if (page == 1 && h5Tot != null && h5Tot > out.size) hasMore = true
+        mbLastSearchDebug = "src=$src key=${h5.key}/${mob.key} " +
+            "ms=${mob.hits.size} ms_key=${mob.key} hs=${h5.hits.size} " +
+            "pg=$page hm=$hasMore " +
+            "nx=${h5.pager.nextPage ?: mob.pager.nextPage ?: "-"} " +
+            "tot=${h5Tot ?: mob.pager.totalCount ?: "-"} pages=$page"
+        return out.toNewSearchResponseList(hasMore)
     }
 
     // ---------------------------------------------------------------
@@ -2142,7 +2515,7 @@ class MovieBoxINProvider : MainAPI() {
         if (subjectId.isBlank() || detailPath.isBlank()) {
             emitDebug(
                 listOf(
-                    "MovieBoxIN v5", "srv=0", "ext=0",
+                    "MovieBoxIN v6", "srv=0", "ext=0",
                     "t=${elapsed() / 1000}s", "tok=$tokVia",
                     "play=$playCode", "id-missing"
                 ),
@@ -2244,16 +2617,23 @@ class MovieBoxINProvider : MainAPI() {
         if (emitted == 0 || subDiag != "ar+en") {
             // A missing subtitle must never be silent again —
             // emit the DEBUG line even when playback links exist.
-            emitDebug(
-                listOf(
-                    "MovieBoxIN v5", "srv=$streamsFound",
-                    "ext=$emitted", "dubs=$dubCount",
-                    "t=${elapsed() / 1000}s",
-                    "tok=$tokVia", "play=$playCode",
-                    "se=$se", "ep=$ep", "sub=$subDiag"
-                ),
-                callback
-            )
+            // v6: the last search + TOP100 diagnostics ride
+            // along (the home/search paths have no phone-visible
+            // surface of their own).
+            val diag = ArrayList<String>()
+            diag += "MovieBoxIN v6"
+            diag += "srv=$streamsFound"
+            diag += "ext=$emitted"
+            diag += "dubs=$dubCount"
+            diag += "t=${elapsed() / 1000}s"
+            diag += "tok=$tokVia"
+            diag += "play=$playCode"
+            diag += "se=$se"
+            diag += "ep=$ep"
+            diag += "sub=$subDiag"
+            if (mbLastSearchDebug.isNotBlank()) diag += mbLastSearchDebug
+            if (mbLastTopDebug.isNotBlank()) diag += mbLastTopDebug
+            emitDebug(diag, callback)
         }
         return true
     }

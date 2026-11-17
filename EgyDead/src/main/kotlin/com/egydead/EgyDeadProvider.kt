@@ -100,6 +100,18 @@ class EgyDeadProvider : MainAPI() {
     // the harvested cf_clearance, cached per host in savedCookies.
     private val cloudflareKiller by lazy { CloudflareKiller() }
 
+    // v28 (2026-11-17, series links fix): load() and loadLinks() each
+    // re-fetched titleVideos(); the API has no ORDER BY, so a series
+    // with >100 video rows can return a different row set on the
+    // second call and the exact episode_id / season+episode match
+    // then finds zero targets (series have no "all" fallback, unlike
+    // movies — which is why movies worked and series didn't). Cache
+    // the rows load() already fetched (10 min TTL) and reuse them in
+    // loadLinks(), so both stages match against the same row set.
+    private val videosCache =
+        java.util.concurrent.ConcurrentHashMap<Int, Pair<Long, List<JSONObject>>>()
+    private val VIDEOS_CACHE_TTL_MS = 10L * 60L * 1000L
+
     // Stream-proxy relay (our own Render service). Playback goes through
     // it because egybestvid's stream tokens validate the fetching
     // identity's FULL header profile + IP (measured 2026-10-18), which no
@@ -507,8 +519,11 @@ class EgyDeadProvider : MainAPI() {
             // Episodes are built from the title's video rows: each row
             // carries its episode_id + season/episode numbers, so an
             // episode exists exactly when it has at least one server.
+            // v28: cache the rows so loadLinks() reuses this exact set.
+            val videoRows = titleVideos(id)
+            videosCache[id] = System.currentTimeMillis() to videoRows
             val byEpisode = LinkedHashMap<Int, JSONObject>()
-            for (v in titleVideos(id)) {
+            for (v in videoRows) {
                 if (v.isNull("episode_id")) continue
                 val epId = v.optInt("episode_id")
                 if (epId != 0 && !byEpisode.containsKey(epId)) byEpisode[epId] = v
@@ -584,7 +599,19 @@ class EgyDeadProvider : MainAPI() {
         val wantSeason = parts.getOrNull(2)?.toIntOrNull()
         val wantEpisode = parts.getOrNull(3)?.toIntOrNull()
 
-        val videos = runCatching { titleVideos(titleId) }.getOrDefault(emptyList())
+        // v28: reuse the rows load() already fetched when fresh, so the
+        // episode match runs against the same row set that built the
+        // episode list; otherwise fetch and cache the result.
+        val cachedVideos = videosCache[titleId]
+        val videos = if (cachedVideos != null &&
+            System.currentTimeMillis() - cachedVideos.first < VIDEOS_CACHE_TTL_MS
+        ) {
+            cachedVideos.second
+        } else {
+            val fresh = runCatching { titleVideos(titleId) }.getOrDefault(emptyList())
+            videosCache[titleId] = System.currentTimeMillis() to fresh
+            fresh
+        }
         ping("vids", videos.size)
         // Matching cascade against the operator's messy linkage: exact
         // episode_id first, then season/episode numbers; a "movie" whose

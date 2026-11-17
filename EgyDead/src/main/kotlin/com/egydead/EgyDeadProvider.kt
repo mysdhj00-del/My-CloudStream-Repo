@@ -68,6 +68,18 @@ import java.net.URLEncoder
  * is the judge; Wecima2 proves the mechanism works on this phone for a
  * same-class CF challenge. loadLinks embed digs stay plain (other
  * hosts, proven working) and the relay doors are untouched.
+ *
+ * v27 (2026-11-17, DIAGNOSTIC-ONLY — panel 2026-11-17 3/6, ordered
+ * by Mohamed 18:23): loadLinks' DEBUG line gains
+ * `| host:<raw host of first matched src> | name:<name of first
+ * matched row>` (host:- name:- when nothing matched). The host is
+ * RAW, not normalized — bare youtube.com vs www.youtube.com is the
+ * distinction the panel needs. No behaviour change, no new
+ * extractor, no Killer change, no relay change. This will NOT make
+ * Prison Break play; it only makes the next DEBUG screenshot
+ * decisive (YouTube + extr:N>0 = NewPipe-unavailable; bare YouTube
+ * + extr:0 = one-line extractor prefix fix; other host = resolver
+ * candidate; vids:N/0 = matching/pagination fix).
  */
 class EgyDeadProvider : MainAPI() {
     override var mainUrl = "https://egydead.ca"
@@ -700,6 +712,20 @@ class EgyDeadProvider : MainAPI() {
         diag += "door:$doorUsed"
         ping("done", relayed)
         diag += "extr:$extracted"
+        // v27 (DIAGNOSTIC-ONLY, panel 2026-11-17 3/6: Haiku, Mistral,
+        // GPT-5.4 mini; Mohamed ordered the build 18:23): append the
+        // first matched row's raw src host + JSON name so the next
+        // DEBUG screenshot names the host. Raw host, NOT normalized —
+        // the bare-vs-www distinction (youtube.com vs
+        // www.youtube.com) is exactly what the panel wants to see.
+        // No rows matched -> host:- name:-. No behaviour change.
+        val dbgFirst = sortedTargets.firstOrNull()
+        val dbgHost = dbgFirst?.optString("src")?.trim()
+            ?.substringAfter("://")?.substringBefore('/')?.takeIf { it.isNotEmpty() } ?: "-"
+        val dbgName = dbgFirst?.optString("name")?.trim()
+            ?.takeIf { it.isNotEmpty() } ?: dbgHost
+        diag += "host:$dbgHost"
+        diag += "name:$dbgName"
         emitDebug(diag, callback)
         return true
     }

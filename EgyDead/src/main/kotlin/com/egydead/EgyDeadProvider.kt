@@ -100,17 +100,20 @@ class EgyDeadProvider : MainAPI() {
     // the harvested cf_clearance, cached per host in savedCookies.
     private val cloudflareKiller by lazy { CloudflareKiller() }
 
-    // v28 (2026-11-17, series links fix): load() and loadLinks() each
-    // re-fetched titleVideos(); the API has no ORDER BY, so a series
-    // with >100 video rows can return a different row set on the
-    // second call and the exact episode_id / season+episode match
-    // then finds zero targets (series have no "all" fallback, unlike
-    // movies — which is why movies worked and series didn't). Cache
-    // the rows load() already fetched (10 min TTL) and reuse them in
-    // loadLinks(), so both stages match against the same row set.
-    private val videosCache =
-        java.util.concurrent.ConcurrentHashMap<Int, Pair<Long, List<JSONObject>>>()
-    private val VIDEOS_CACHE_TTL_MS = 10L * 60L * 1000L
+    // v29 (2026-11-17): v28's cache was an INSTANCE field — if
+    // CloudStream recreates the provider between load() (title page)
+    // and loadLinks() (episode tap), the cache is wiped and loadLinks
+    // falls back to re-fetching (v27 behaviour). The cache is STATIC
+    // (companion object) so it survives re-instantiation for the
+    // plugin classloader's lifetime. TTL 30 min: title video rows
+    // change rarely, and 30 min staleness is harmless (worst case
+    // one dead server row among working ones). load() stores the rows
+    // it fetched; loadLinks() reuses them when fresh.
+    companion object {
+        private val videosCache =
+            java.util.concurrent.ConcurrentHashMap<Int, Pair<Long, List<JSONObject>>>()
+        private val VIDEOS_CACHE_TTL_MS = 30L * 60L * 1000L
+    }
 
     // Stream-proxy relay (our own Render service). Playback goes through
     // it because egybestvid's stream tokens validate the fetching

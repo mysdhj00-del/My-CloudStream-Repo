@@ -23,6 +23,7 @@ import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.loadExtractor
 import com.lagradost.cloudstream3.utils.newExtractorLink
+import com.lagradost.cloudstream3.network.CloudflareKiller
 import org.json.JSONObject
 import java.net.URLEncoder
 
@@ -49,6 +50,24 @@ import java.net.URLEncoder
  *   HTML carries a plain JW `file:` master.m3u8 — dug LOCALLY on the phone
  *   (stream tokens may be IP-bound; nothing is dug server-side), with
  *   CloudStream's built-in extractors as the fallback for other hosts.
+ *
+ * v26 (2026-11-17): the .ca zone now answers EVERY plain request with
+ * Cloudflare's "Just a moment..." JS challenge (measured live: boot AND
+ * API both HTTP 403, Cf-Mitigated: challenge, on the sandbox AND on the
+ * phone — EGY-DIAG boot[c403|ck0|csrf0|bd0|len5688] api[c403|cfm1]).
+ * The v15 premise ("the .ca zone carries no such challenge") no longer
+ * holds; egydead.life answers the identical challenge and tv10 is 522
+ * (origin dead), so no domain move fixes this. Fix: boot + API now go
+ * through CloudflareKiller (the app's own solver, same pattern as
+ * Wecima2 v7+ — passthrough unless CF answers 403/503, then a
+ * background WebView solves the challenge and retries with the
+ * harvested cf_clearance, cached per host). The boot diagnostic gains
+ * |cf<0|1> (cf_clearance present after the solve attempt) so the next
+ * screenshot says whether the solve itself failed. The WebView solve
+ * cannot be run from the sandbox (no Android WebView here) — the phone
+ * is the judge; Wecima2 proves the mechanism works on this phone for a
+ * same-class CF challenge. loadLinks embed digs stay plain (other
+ * hosts, proven working) and the relay doors are untouched.
  */
 class EgyDeadProvider : MainAPI() {
     override var mainUrl = "https://egydead.ca"
@@ -57,6 +76,17 @@ class EgyDeadProvider : MainAPI() {
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries, TvType.Anime)
     override val hasMainPage = true
     override val hasQuickSearch = false
+
+    // v26: sections load one after another, never as a parallel burst —
+    // the first section triggers the boot (and a possible WebView solve)
+    // and the rest reuse the 10-min session; a burst could fire several
+    // concurrent solves (Wecima2 lesson).
+    override var sequentialMainPage = true
+
+    // v26: the app's own Cloudflare solver (see header). Passthrough
+    // unless CF answers 403/503, then WebView-solves and retries with
+    // the harvested cf_clearance, cached per host in savedCookies.
+    private val cloudflareKiller by lazy { CloudflareKiller() }
 
     // Stream-proxy relay (our own Render service). Playback goes through
     // it because egybestvid's stream tokens validate the fetching
@@ -120,7 +150,7 @@ class EgyDeadProvider : MainAPI() {
         // the shell GET hiccuped on the phone. Now it degrades: a stale
         // session is still attempted, and a total failure reports
         // false so the caller can bow out cleanly.
-        val resp = runCatching { app.get("$mainUrl/", headers = browserHeaders) }
+        val resp = runCatching { app.get("$mainUrl/", headers = browserHeaders, interceptor = cloudflareKiller) }
             .getOrNull()
         if (resp == null) {
             bootDiag = "exc"
@@ -139,9 +169,15 @@ class EgyDeadProvider : MainAPI() {
         rawCookieHeader = pairs.joinToString("; ")
         csrfToken = Regex(""""csrf_token":"([^"]+)"""").find(resp.text)
             ?.groupValues?.getOrNull(1).orEmpty()
+        // v26: cf=1 when the killer harvested a cf_clearance for this
+        // host — the one-screenshot discriminator for "solve failed"
+        // vs "solved but the session still did not come up".
+        val cfSolved = cloudflareKiller.savedCookies["egydead.ca"]
+            ?.containsKey("cf_clearance") == true
         bootDiag = "c${resp.code}|ck${pairs.size}${if (fromMap) "m" else ""}" +
             "|csrf${if (csrfToken.isNotEmpty()) 1 else 0}" +
-            "|bd${if (resp.text.contains("bootstrapData")) 1 else 0}|len${resp.text.length}"
+            "|bd${if (resp.text.contains("bootstrapData")) 1 else 0}|len${resp.text.length}" +
+            "|cf${if (cfSolved) 1 else 0}"
         sessionAtMs = System.currentTimeMillis()
         return true
     }
@@ -171,13 +207,13 @@ class EgyDeadProvider : MainAPI() {
             return null
         }
         var resp = runCatching {
-            app.get("$mainUrl$path", headers = apiHeaders())
+            app.get("$mainUrl$path", headers = apiHeaders(), interceptor = cloudflareKiller)
         }.getOrNull() ?: run { lastApiDiag = "exc"; return null }
         lastApiDiag = apiDiagOf(resp)
         if (resp.code == 401 || resp.code == 419) {
             ensureSession(force = true)
             resp = runCatching {
-                app.get("$mainUrl$path", headers = apiHeaders())
+                app.get("$mainUrl$path", headers = apiHeaders(), interceptor = cloudflareKiller)
             }.getOrNull() ?: run { lastApiDiag = "exc2"; return null }
             lastApiDiag = apiDiagOf(resp) + "r"
         }

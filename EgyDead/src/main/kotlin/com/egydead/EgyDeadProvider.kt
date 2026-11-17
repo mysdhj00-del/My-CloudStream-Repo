@@ -586,6 +586,31 @@ class EgyDeadProvider : MainAPI() {
         }
     }
 
+    // v30 RAW-DATA BEACON (diagnostic): loadLinks() sends the exact
+    // `data` string it received to the relay log FIRST, before any
+    // parsing — so a tap on the phone is visible server-side even
+    // when parsing returns false immediately. The relay's /relay/ping
+    // already logs {stage, n, pv, door}; n carries the raw data
+    // (URL-encoded, truncated to 80 chars). Also a version marker:
+    // a "raw" ping proves the phone is on v30; no raw ping proves it
+    // is not. Wrapped in runCatching — a beacon failure can never
+    // break loadLinks.
+    private suspend fun rawPing(data: String) {
+        runCatching {
+            val n = URLEncoder.encode(data.take(80), "UTF-8")
+            for (base in listOf(RELAY_BASE, RELAY_BASE_2)) {
+                val ok = runCatching {
+                    app.get(
+                        "$base/relay/ping?pv=21&stage=raw&n=$n",
+                        headers = browserHeaders
+                    )
+                    true
+                }.getOrDefault(false)
+                if (ok) return
+            }
+        }
+    }
+
     // ---------- links ----------
 
     override suspend fun loadLinks(
@@ -594,13 +619,37 @@ class EgyDeadProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
+        // v30: beacon the raw data FIRST — before any parsing — so the
+        // exact string the phone sent is visible in the relay log even
+        // when parsing fails and loadLinks returns false. Also a
+        // version marker: a "raw" ping proves the phone is on v30.
+        rawPing(data)
         val diag = mutableListOf<String>()
-        val parts = data.removePrefix("ca://").split('/')
-        val titleId = parts.getOrNull(0)?.toIntOrNull() ?: return false
+        // v30 robust titleId parse: ca:// exactly as before; a page
+        // URL ("/title/<id>" — the watch links also use the plural
+        // "/titles/<id>", e.g. the S1E1 link Mohamed sent) yields its
+        // id and plays the FIRST episode (minimum season/episode
+        // pair, see the "first" step below). Anything else still
+        // returns false — the beacon above has already logged it.
+        val fromPageUrl = !data.startsWith("ca://")
+        val titleId: Int
+        val episodeId: Int
+        val wantSeason: Int?
+        val wantEpisode: Int?
+        if (!fromPageUrl) {
+            val parts = data.removePrefix("ca://").split('/')
+            titleId = parts.getOrNull(0)?.toIntOrNull() ?: return false
+            episodeId = parts.getOrNull(1)?.toIntOrNull() ?: 0
+            wantSeason = parts.getOrNull(2)?.toIntOrNull()
+            wantEpisode = parts.getOrNull(3)?.toIntOrNull()
+        } else {
+            titleId = Regex("""/titles?/(\d+)""").find(data)
+                ?.groupValues?.getOrNull(1)?.toIntOrNull() ?: return false
+            episodeId = 0
+            wantSeason = null
+            wantEpisode = null
+        }
         ping("start", titleId)
-        val episodeId = parts.getOrNull(1)?.toIntOrNull() ?: 0
-        val wantSeason = parts.getOrNull(2)?.toIntOrNull()
-        val wantEpisode = parts.getOrNull(3)?.toIntOrNull()
 
         // v28: reuse the rows load() already fetched when fresh, so the
         // episode match runs against the same row set that built the
@@ -630,6 +679,23 @@ class EgyDeadProvider : MainAPI() {
             mode = "se"
             targets = videos.filter {
                 it.optInt("season_num") == wantSeason && it.optInt("episode_num") == wantEpisode
+            }
+        }
+        // v30: a page URL carries no episode — play the FIRST episode
+        // (minimum season/episode pair), never "all" rows (that would
+        // emit every episode's servers for one tap).
+        if (targets.isEmpty() && fromPageUrl && videos.isNotEmpty()) {
+            mode = "first"
+            val withEp = videos.filter { !it.isNull("episode_id") }
+            val first = withEp.minWithOrNull(
+                compareBy({ it.optInt("season_num", 1) }, { it.optInt("episode_num", 1) })
+            )
+            if (first != null) {
+                val s0 = first.optInt("season_num", 1)
+                val e0 = first.optInt("episode_num", 1)
+                targets = videos.filter {
+                    it.optInt("season_num", 1) == s0 && it.optInt("episode_num", 1) == e0
+                }
             }
         }
         if (targets.isEmpty() && episodeId == 0 && videos.isNotEmpty()) {

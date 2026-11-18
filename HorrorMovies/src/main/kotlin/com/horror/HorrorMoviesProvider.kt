@@ -374,6 +374,19 @@ import okhttp3.RequestBody.Companion.toRequestBody
  * the crash cause is still undecided and investigation
  * continues after the restore.
  *
+ * v24 (2026-11-19, FAIL-FAST — per-lane 10s load timeout,
+ * NO deletions): Mohamed's diagnosis 2026-11-19 00:58 EET
+ * is slow loading — the home waits for loading and the page
+ * never loads («بطء التحميل هو السبب يعني ينتظر تحميل ولا
+ * تتحمل الصفحة») — and he ordered «لا تحدف شي» (delete
+ * nothing). getMainPage used unbounded app.get for every
+ * lane, so one slow/hung site could hang the whole home and
+ * the app exits. Every home fetch now goes through the
+ * HttpURLConnection helper with a 10 s connect+read timeout
+ * (same pattern as the existing httpGetText): a slow lane
+ * returns empty quickly instead of hanging home. ALL 7 lanes
+ * stay, MovieBox FIRST, no lane/extension/code deleted.
+ *
  * RATING: CloudStream's card type has no rating slot in this app
  * version, so ratings ride the detail page: the plot line opens
  * with «★ التقييم: X/10» wherever the source page provides one
@@ -461,9 +474,9 @@ class HorrorMoviesProvider : MainAPI() {
         // (zero new items) ends it even if hasMore claims true.
         if (lane == "moviebox") {
             val url = if (page <= 1) base else "$base&page=$page"
-            val text = runCatching {
-                app.get(url, headers = mbJsonHeaders).text
-            }.getOrNull()
+            // v24: fail-fast 10 s fetch — a slow MovieBox ranking
+            // call returns empty instead of hanging the home.
+            val text = httpGetTextHeaders(url, homeFetchTimeoutMs, mbJsonHeaders)
             if (text.isNullOrBlank()) {
                 return newHomePageResponse(emptyList(), false)
             }
@@ -517,8 +530,13 @@ class HorrorMoviesProvider : MainAPI() {
             "lar" -> if (page <= 1) base else base + "?page=$page"
             else -> base
         }
+        // v24: fail-fast 10 s fetch — a slow site returns empty
+        // instead of hanging the home. Jsoup.parse(html, url)
+        // keeps the base URI so abs:href / abs:src still resolve.
+        val html = httpGetTextHeaders(url, homeFetchTimeoutMs, browserHeaders)
+            ?: return newHomePageResponse(emptyList(), false)
         val doc = runCatching {
-            app.get(url, headers = browserHeaders).document
+            Jsoup.parse(html, url)
         }.getOrNull() ?: return newHomePageResponse(emptyList(), false)
         val cards = when (lane) {
             "moviz", "eg", "myc", "lar", "top", "af" -> parseLaneCards(lane, doc)
@@ -1767,6 +1785,37 @@ class HorrorMoviesProvider : MainAPI() {
      * Titles with no Latin part (fully Arabic titles) cannot be
      * resolved by IMDb suggest and get no subtitle in v4.
      */
+    /** v24: per-lane fail-fast timeout for home fetches (10 s).
+     * A slow/hung site must return null quickly instead of
+     * hanging the whole home. Same HttpURLConnection pattern
+     * as httpGetText, but with caller-supplied headers so the
+     * HTML lanes keep their browser headers and the MovieBox
+     * lane keeps its JSON headers. No coroutines — the real
+     * Gradle classpath does not expose them, so plain
+     * HttpURLConnection is used instead. */
+    private val homeFetchTimeoutMs = 10_000
+
+    private fun httpGetTextHeaders(
+        url: String,
+        timeoutMs: Int,
+        headers: Map<String, String>
+    ): String? {
+        return runCatching {
+            val conn = java.net.URL(url).openConnection()
+                as java.net.HttpURLConnection
+            conn.requestMethod = "GET"
+            conn.connectTimeout = timeoutMs
+            conn.readTimeout = timeoutMs
+            for ((k, v) in headers) conn.setRequestProperty(k, v)
+            val stream = if (conn.responseCode in 200..299) {
+                conn.inputStream
+            } else {
+                return@runCatching null
+            }
+            stream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+        }.getOrNull()
+    }
+
     private fun httpGetText(url: String, timeoutMs: Int): String? {
         return runCatching {
             val conn = java.net.URL(url).openConnection()

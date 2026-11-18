@@ -364,6 +364,16 @@ import okhttp3.RequestBody.Companion.toRequestBody
  * the lane returns only when the phone verdict proves it
  * was (or was not) the crash cause.
  *
+ * v23 (2026-11-18, RESTORE — MovieBox home lane restored
+ * per Mohamed's explicit order «إعادة القسم»): his on-device
+ * verdict 2026-11-18 19:38 EET was v22 STILL EXITS, so the
+ * lane was NOT the crash cause. The MovieBox entry is back
+ * FIRST in mainPageOf (his standing 2026-11-15 order) and
+ * the getMainPage moviebox branch is restored to the v21
+ * form. This version does NOT claim to fix the exit crash;
+ * the crash cause is still undecided and investigation
+ * continues after the restore.
+ *
  * RATING: CloudStream's card type has no rating slot in this app
  * version, so ratings ride the detail page: the plot line opens
  * with «★ التقييم: X/10» wherever the source page provides one
@@ -388,9 +398,11 @@ class HorrorMoviesProvider : MainAPI() {
     private val relayBase = "https://egydead-stremio.onrender.com"
 
     override val mainPage = mainPageOf(
-        // v22 TEST: MovieBox home lane removed (was FIRST since
-        // v17 by the user's order) to isolate the re-add crash
-        // reported 2026-11-18. Playback code untouched.
+        // v17: MovieBox FIRST by the user's explicit order.
+        // v23: restored after the v22 test proved the lane was
+        // NOT the re-add crash cause (v22 still exited).
+        "moviebox:https://moviebox.sg/wefeed-h5api-bff/ranking-list/content?id=8614980535946986176&perPage=20" to
+            "أفلام رعب — MovieBox",
         "moviz:https://www.moviz.land/tag/%d8%b1%d8%b9%d8%a8/" to
             "أفلام رعب — موفيز لاند",
         "eg:https://egy.bet/genre/%d8%b1%d8%b9%d8%a8/" to
@@ -448,9 +460,6 @@ class HorrorMoviesProvider : MainAPI() {
         // NOT end the section, and a clamped past-the-end page
         // (zero new items) ends it even if hasMore claims true.
         if (lane == "moviebox") {
-            // v22 TEST: home lane disabled for crash isolation —
-            // return empty if ever called; playback code untouched.
-            return newHomePageResponse(emptyList(), false)
             val url = if (page <= 1) base else "$base&page=$page"
             val text = runCatching {
                 app.get(url, headers = mbJsonHeaders).text
@@ -466,16 +475,12 @@ class HorrorMoviesProvider : MainAPI() {
                 return newHomePageResponse(emptyList(), false)
             }
             if (page <= 1) mbSeenDetailPaths.clear()
-            // v22 NOTE: the early return above makes this branch
-            // dead code, so the compiler loses the smart-cast from
-            // the `list == null` check — the `?.` below are no-ops
-            // if the lane is re-enabled (both are non-null there).
-            val pager = dataObj?.optJSONObject("pager")
-            val rawCount = list?.length() ?: 0
+            val pager = dataObj.optJSONObject("pager")
+            val rawCount = list.length()
             var rawNew = 0
             val cards = ArrayList<SearchResponse>()
             for (i in 0 until rawCount) {
-                val o = list?.optJSONObject(i) ?: continue
+                val o = list.optJSONObject(i) ?: continue
                 val dp = o.optString("detailPath")
                 if (dp.isBlank()) continue
                 if (!mbSeenDetailPaths.add(dp)) continue

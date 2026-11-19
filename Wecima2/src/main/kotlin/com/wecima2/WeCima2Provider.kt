@@ -194,6 +194,23 @@ import org.jsoup.nodes.Element
  *   GET /search?s=12 on .tips returns the site's own 404 page, not
  *   JSON status:false — search is POST-only there, which does NOT
  *   affect the provider's POST search.
+ * - v19 (2026-11-19, DIAGNOSTIC ONLY — the .tips decode failure):
+ *   on-device v18 verdict (Mohamed's screenshot 15:31 EET, film
+ *   Sanguine 2026): page=200, btn=6, dec=0, ok=0 — the six
+ *   <btn data-url> values all fail the .cx decode recipe, so the
+ *   site HAS servers but the decoder cannot read the .tips format.
+ *   Raw HTML is unobtainable from every external route, so the
+ *   provider itself must report the values: the loadLinks DEBUG
+ *   line now carries raw0len / raw0 (first 45 chars) / raw0tail
+ *   (last 12) / xpg0 (first data-xpage) for the first button, plus
+ *   try:cx/nodrop/arab/plain/safe counts for five candidate decodes
+ *   tried on every button (cx = strip '+', drop 3, base64; nodrop =
+ *   strip '+', base64; arab = prepend "aHR0c", base64; plain = raw
+ *   value already a URL; safe = URL-safe base64 after strip + drop
+ *   3). A link is emitted ONLY from a candidate whose result
+ *   validates as http(s):// or // — never a non-URL string. No
+ *   decode is claimed fixed until the phone test names the winning
+ *   recipe.
  */
 class WeCima2Provider : MainAPI() {
     override var mainUrl = "https://wecima.tips"
@@ -977,6 +994,45 @@ class WeCima2Provider : MainAPI() {
         }
     }
 
+    /**
+     * Validates a decoded candidate: only a real embed URL may ever
+     * be emitted — http(s):// or //-relative (upgraded to https:).
+     * Anything else (garbage base64 output, partial strings) is null.
+     */
+    private fun asEmbedUrl(decoded: String?): String? {
+        if (decoded == null) return null
+        return when {
+            decoded.startsWith("//") -> "https:$decoded"
+            decoded.startsWith("http://") || decoded.startsWith("https://") -> decoded
+            else -> null
+        }
+    }
+
+    /**
+     * v19 diagnostic: tries FIVE candidate decodes on one .tips
+     * <btn data-url> value and returns the first that yields a valid
+     * embed URL, plus which recipe won ("" when none did). Order is
+     * diagnostic, not preferential: plain first (is it already a
+     * URL?), then the .cx recipe, then no-drop base64, then the
+     * Arab-repo variant (prepend "aHR0c", base64), then URL-safe
+     * base64 (after strip + drop 3). NO recipe is claimed fixed —
+     * the phone test names the winner via the try: counts.
+     */
+    private fun decodeTipsUrl(raw: String): Pair<String?, String> {
+        val v = raw.trim()
+        if (v.isEmpty()) return null to ""
+        if (v.startsWith("http://") || v.startsWith("https://")) return v to "plain"
+        val cx = decodeCxUrl(v)
+        if (cx != null && (cx.startsWith("http://") || cx.startsWith("https://"))) return cx to "cx"
+        val nodrop = asEmbedUrl(b64decode(v.replace("+", "")))
+        if (nodrop != null) return nodrop to "nodrop"
+        val arab = asEmbedUrl(b64decode("aHR0c$v"))
+        if (arab != null) return arab to "arab"
+        val safe = asEmbedUrl(b64decode(v.replace("+", "").drop(3).replace("-", "+").replace("_", "/")))
+        if (safe != null) return safe to "safe"
+        return null to ""
+    }
+
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -996,6 +1052,14 @@ class WeCima2Provider : MainAPI() {
         var pageCode = 0
         var btnCount = 0
         var decodedCount = 0
+        // v19 diagnostic: per-candidate wins + first button's raw value.
+        var tryCx = 0
+        var tryNoDrop = 0
+        var tryArab = 0
+        var tryPlain = 0
+        var trySafe = 0
+        var raw0 = ""
+        var xpg0 = "-"
         // v14: ok now counts REAL links emitted (loadExtractor's
         // boolean counts extractor runs, not links — it returns
         // true even when the extractor emits nothing).
@@ -1009,8 +1073,22 @@ class WeCima2Provider : MainAPI() {
             pageCode = 200
             val btns = doc.select("btn[data-url]")
             btnCount = btns.size
+            val first = btns.firstOrNull()
+            if (first != null) {
+                raw0 = first.attr("data-url")
+                val xp = first.attr("data-xpage")
+                if (xp.isNotBlank()) xpg0 = xp
+            }
             for (b in btns) {
-                val embed = decodeCxUrl(b.attr("data-url")) ?: continue
+                val (embed, which) = decodeTipsUrl(b.attr("data-url"))
+                if (embed == null) continue
+                when (which) {
+                    "cx" -> tryCx++
+                    "nodrop" -> tryNoDrop++
+                    "arab" -> tryArab++
+                    "plain" -> tryPlain++
+                    "safe" -> trySafe++
+                }
                 decodedCount++
                 try {
                     // v14: direct packed-JS extraction first —
@@ -1031,10 +1109,16 @@ class WeCima2Provider : MainAPI() {
         // Bahar: only an "Update Server" placeholder btn),
         // say so in the source list instead of a bare Mux.
         val okCount = emittedLinks
+        // v19: the first button's raw data-url + per-candidate wins.
+        // Raw HTML is unobtainable from every external route, so this
+        // line IS the evidence — it is read off a phone screenshot.
+        val raw0diag = if (btnCount == 0) "raw0len=- | raw0=- | raw0tail=- | xpg0=-"
+            else "raw0len=${raw0.length} | raw0=${raw0.take(45)} | raw0tail=${raw0.takeLast(12)} | xpg0=$xpg0"
+        val tryDiag = "try:cx$tryCx/nodrop$tryNoDrop/arab$tryArab/plain$tryPlain/safe$trySafe"
         val debugName = if (okCount == 0)
-            "DEBUG v14 | no-servers-on-site | page=$pageCode | btn=$btnCount | dec=$decodedCount | ok=0 | $subDiag"
+            "DEBUG v14 | no-servers-on-site | page=$pageCode | btn=$btnCount | dec=$decodedCount | ok=0 | $raw0diag | $tryDiag | $subDiag"
         else
-            "DEBUG v14 | play | page=$pageCode | btn=$btnCount | dec=$decodedCount | ok=$okCount | $subDiag"
+            "DEBUG v14 | play | page=$pageCode | btn=$btnCount | dec=$decodedCount | ok=$okCount | $raw0diag | $tryDiag | $subDiag"
         // v13 (panel #4, 6/6 unanimous 2026-11-06): the two
         // string args were SWAPPED — debugName sat in the
         // source slot and "Mux" in the name slot, so the UI

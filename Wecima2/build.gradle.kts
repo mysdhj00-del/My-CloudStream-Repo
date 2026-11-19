@@ -1,12 +1,12 @@
 // Wecima2 CloudStream plugin module.
-version = 17
+version = 18
 
 android {
     namespace = "com.wecima2"
 }
 
 cloudstream {
-    description = "Wecima2 - wecima.cx: Arabic dubbed/subtitled movies, series and anime (WecimaEngine)"
+    description = "Wecima2 - wecima.tips: Arabic dubbed/subtitled movies, series and anime (WecimaEngine)"
     authors = listOf("Saher")
 
     /**

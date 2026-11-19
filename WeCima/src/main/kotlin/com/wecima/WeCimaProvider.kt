@@ -198,6 +198,24 @@ import org.jsoup.nodes.Element
  *   issue ZERO requests, so a flagged address can cool while the app
  *   keeps showing content.
  * - Every request carries an Android-Chrome header set.
+ * - v36 (2026-11-19): wecima.tips is the operator's NEW mobile-theme
+ *   host — a DIFFERENT URL model, NOT a host rename (verified live:
+ *   home/section/series-hub/watch pages via crawler + live browser).
+ *   Films: /watch/<slug>-movie. Series hubs: /series/<slug>-series.
+ *   Episode hrefs are read VERBATIM from the hub (E2's slug is
+ *   cumulative: /watch/s01-e01-s01-e02) — never constructed by
+ *   pattern. Sections: /movies, /seriestv, /seriestv/episodes,
+ *   /category/<slug> (+ /page/N), /anime, /trends. NO /film/,
+ *   /episode/, /search?s=, wp-json on .tips; search is an in-page
+ *   modal with no URL (AJAX endpoint unknown) — PENDING. The
+ *   resolve protocol (POST /watch/resolve) on .tips is UNVERIFIED
+ *   (markers never readable: script source blocked, sandbox
+ *   CF-403) — loadLinksTips tries the markers when present, else
+ *   the player iframe; playback UNVERIFIED until on-device test.
+ *   weciema.net redirects to weciema.name and does NOT work on
+ *   Mohamed's phone (2026-11-19) — NO weciema fallback in v36;
+ *   the old /film/+/episode/ branch stays intact for old history
+ *   entries only. WP chain (vin/tattoo/gripe) unchanged.
  */
 class WeCimaProvider : MainAPI() {
     // v22 (2026-11-03): operator moved domains — WP gripe→vin, mobile theme→weciema.net.
@@ -230,6 +248,12 @@ class WeCimaProvider : MainAPI() {
     // slug-mapped fallbacks for post pages.
     private val gripeUrl = "https://wecima.gripe"
     private val mobileUrl = "https://weciema.net"
+
+    // v36: the operator's NEW mobile-theme host (see the header
+    // note). It is THE mobile host in v36; mobileUrl above is kept
+    // only for the old /film/+/episode/ branch (old history entries)
+    // and the legacy mobile search.
+    private val tipsUrl = "https://wecima.tips"
 
     private class Fetched(val document: Document, val code: Int, val host: String)
 
@@ -275,6 +299,7 @@ class WeCimaProvider : MainAPI() {
         var firstBad: Fetched? = null
         for (candidate in candidates) {
             val host = when {
+                candidate.startsWith(tipsUrl) -> tipsUrl
                 candidate.startsWith(mobileUrl) -> mobileUrl
                 candidate.startsWith(altUrl) -> altUrl
                 else -> mainUrl
@@ -302,26 +327,19 @@ class WeCimaProvider : MainAPI() {
         return Fetched(res.document, res.code, mainUrl)
     }
 
-    // Sections mirror the mobile theme's own category menu (v9, now weciema.net),
-    // plus the WP home row (v23) so home covers both backends.
+    // Sections live on wecima.tips (v36, the new mobile theme) on
+    // its real paths (verified live 2026-11-19): /movies, /seriestv,
+    // /seriestv/episodes, /category/<slug>, /anime, /trends. The old
+    // weciema.net sections are gone — that host does not work on
+    // Mohamed's phone (2026-11-19). WP home row kept.
     override val mainPage = mainPageOf(
-        "$mobileUrl/" to "المضاف حديثا",
-        "$mobileUrl/category/افلام-اجنبي" to "أفلام أجنبية",
-        "$mobileUrl/category/افلام-عربي" to "أفلام عربية",
-        "$mobileUrl/category/افلام-هندي" to "أفلام هندية",
-        "$mobileUrl/category/افلام-تركية" to "أفلام تركية",
-        "$mobileUrl/category/افلام-اسيوية" to "أفلام آسيوية",
-        "$mobileUrl/category/افلام-انمي" to "أفلام أنمي",
-        "$mobileUrl/category/مسلسلات-عربي" to "مسلسلات عربية",
-        "$mobileUrl/category/مسلسلات-اجنبي" to "مسلسلات أجنبية",
-        "$mobileUrl/category/مسلسلات-تركية" to "مسلسلات تركية",
-        "$mobileUrl/category/مسلسلات-اسيوية" to "مسلسلات آسيوية",
-        "$mobileUrl/category/مسلسلات-هندية" to "مسلسلات هندية",
-        "$mobileUrl/category/مسلسلات-مدبلجة" to "مسلسلات مدبلجة",
-        "$mobileUrl/category/مسلسلات-انمي" to "مسلسلات أنمي",
-        "$mobileUrl/category/برامج-تلفزيونية" to "برامج تلفزيونية",
-        "$mobileUrl/category/عروض-مصارعة" to "عروض مصارعة",
-        "$mobileUrl/category/مسلسلات-رمضان-2026" to "مسلسلات رمضان 2026",
+        "$tipsUrl/" to "المضاف حديثا",
+        "$tipsUrl/movies" to "أفلام",
+        "$tipsUrl/seriestv" to "مسلسلات",
+        "$tipsUrl/seriestv/episodes" to "آخر الحلقات",
+        "$tipsUrl/category/ramadan-series-2026" to "مسلسلات رمضان 2026",
+        "$tipsUrl/anime" to "أنمي و كرتون",
+        "$tipsUrl/trends" to "تريندج",
         "$mainUrl/" to "آخر الإضافات",
     )
 
@@ -448,8 +466,72 @@ class WeCimaProvider : MainAPI() {
         return seen.values.toList()
     }
 
+    // ---------- wecima.tips cards (v36) ----------
+
+    /** A .tips card anchor: films are /watch/<slug>-movie, series
+     * hubs are /series/<slug>-series, latest-episode cards are
+     * /watch/<slug> with a season-episode slug (s01-e01). Title
+     * prefers the image alt (cleanest: "مشاهدة فيلم ..." — the
+     * anchor text carries rating/quality/genre prefixes). */
+    private fun Element.toTipsCard(): SearchResponse? {
+        val href = fixUrl(attr("href"))
+        if (!href.startsWith(tipsUrl)) return null
+        val isFilm = href.contains("/watch/") && href.endsWith("-movie")
+        val isSeries = href.contains("/series/") && href.endsWith("-series")
+        val isEpisode = href.contains("/watch/") && !isFilm &&
+            Regex("""/watch/s\d+-e\d+""").containsMatchIn(href)
+        if (!isFilm && !isSeries && !isEpisode) return null
+        val img = selectFirst("img")
+        val rawTitle = img?.attr("alt")?.ifBlank { null }
+            ?: attr("title").ifBlank { null }
+            ?: text()
+        var title = cleanTitle(rawTitle)
+        // Anchor text carries "5.8 WEB-DL كوميدي ..." prefixes — strip
+        // a leading rating + quality token when the alt was missing.
+        title = title.replace(
+            Regex("""^\d+(\.\d+)?\s+(WEB-DL|HDCAM|DVDRip|Bluray|HDTS|HDTV|WEBRip|BRRip|SD|HD)\s+"""),
+            ""
+        ).trim()
+        if (title.isBlank()) return null
+        val poster = fixUrlNull(img?.attr("src"))?.takeIf { it.startsWith("http") }
+            ?: fixUrlNull(img?.attr("data-src"))
+        val year = Regex("""(19|20)\d{2}""").find(title)?.value?.toIntOrNull()
+        val decoded = decode(href)
+        val anime = isAnime(decoded)
+        return when {
+            isFilm && anime -> newAnimeSearchResponse(title, href, TvType.Anime) {
+                this.posterUrl = poster
+                this.year = year
+            }
+            isFilm -> newMovieSearchResponse(title, href, TvType.Movie) {
+                this.posterUrl = poster
+                this.year = year
+            }
+            anime -> newAnimeSearchResponse(title, href, TvType.Anime) {
+                this.posterUrl = poster
+                this.year = year
+            }
+            else -> newTvSeriesSearchResponse(title, href, TvType.TvSeries) {
+                this.posterUrl = poster
+                this.year = year
+            }
+        }
+    }
+
+    private fun Document.parseTipsCards(): List<SearchResponse> {
+        val seen = LinkedHashMap<String, SearchResponse>()
+        select("a[href]").forEach { a ->
+            val card = runCatching { a.toTipsCard() }.getOrNull() ?: return@forEach
+            seen.putIfAbsent(card.url, card)
+        }
+        return seen.values.toList()
+    }
+
     private fun Document.parseCards(): List<SearchResponse> {
-        // Mobile documents carry a.show-card cards; WP documents don't.
+        // .tips documents carry /watch/ + /series/ hrefs (no class
+        // needed — card classes were never observable); old-mobile
+        // documents carry a.show-card cards; WP documents don't.
+        if (select("a[href*=\"wecima.tips/watch/\"], a[href*=\"wecima.tips/series/\"]").isNotEmpty()) return parseTipsCards()
         if (select("a.show-card").isNotEmpty()) return parseMobileCards()
         val seen = LinkedHashMap<String, SearchResponse>()
         select(".GridItem").forEach { item ->
@@ -475,10 +557,13 @@ class WeCimaProvider : MainAPI() {
     // ---------- API ----------
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        // Sections live on wecima.mobile, which paginates ?page={n}
-        // (verified on the home page and category archives).
+        // .tips sections paginate /page/{n}/ (verified live:
+        // /category/ramadan-series-2026/page/2); WP + old-mobile
+        // sections keep ?page={n}.
         val base = request.data.trimEnd('/')
-        val url = if (page <= 1) base else "$base?page=$page"
+        val url = if (page <= 1) base
+        else if (base.startsWith(tipsUrl)) "$base/page/$page/"
+        else "$base?page=$page"
         // v20: a fresh cached section is served with NO request at all.
         val cachedSec = sectionCache[url]
         if (cachedSec != null &&
@@ -528,7 +613,12 @@ class WeCimaProvider : MainAPI() {
     // Non-mobile URLs stay null; a twin that yields nothing falls
     // through to DEBUG (four niche sections have no WP twin).
     private fun wpSectionTwin(url: String): String? {
-        val base = url.trimEnd('/').substringBefore("?page=")
+        val base = url.trimEnd('/').substringBefore("?page=").substringBefore("/page/")
+        // v36: .tips sections have no exact WP twin except the home
+        // row (WP home = latest additions) and the Ramadan category
+        // (best-effort slug); other .tips sections return null.
+        if (base == tipsUrl) return "$mainUrl/"
+        if (base == "$tipsUrl/category/ramadan-series-2026") return "$mainUrl/category/مسلسلات-رمضان-2026/"
         if (base == mobileUrl) return "$mainUrl/"
         if (!base.startsWith("$mobileUrl/category/")) return null
         val slug = base.removePrefix("$mobileUrl/category/")
@@ -737,6 +827,9 @@ class WeCimaProvider : MainAPI() {
     }
 
     override suspend fun load(url: String): LoadResponse {
+        // v36: .tips is its own theme — route before the WP /series/
+        // branch below (a .tips hub is a /series/ URL too).
+        if (url.contains("wecima.tips")) return loadTips(url)
         if (url.contains("wecima.mobile") || url.contains("weciema.net")) return loadMobile(url)
         val document = fetchPage(url).document
         val decoded = decode(url)
@@ -975,6 +1068,13 @@ class WeCimaProvider : MainAPI() {
         // Field diagnostics: stage markers are surfaced as one playable DEBUG
         // source when nothing playable is found.
         val diag = mutableListOf<String>()
+        // v36: .tips watch pages are their own theme — resolve on
+        // .tips, not via the old-mobile chain.
+        if (data.contains("wecima.tips")) {
+            val ok = loadLinksTips(data, diag, subtitleCallback, callback)
+            if (!ok) emitDebug(diag, callback)
+            return true
+        }
         if (data.contains("wecima.mobile") || data.contains("weciema.net")) {
             val ok = loadLinksMobile(data, diag, subtitleCallback, callback)
             if (!ok) emitDebug(diag, callback)
@@ -1266,6 +1366,265 @@ class WeCimaProvider : MainAPI() {
         return true
     }
 
+    // ---------- wecima.tips load / playback (v36) ----------
+
+    /** Season/episode from a .tips episode slug: the LAST sXX-eYY
+     * pair wins — E2's slug is cumulative (s01-e01-s01-e02). This
+     * only PARSES slugs; it never builds an episode URL. */
+    private fun tipsSeasonEpisode(slug: String): Pair<Int, Int>? {
+        val matches = Regex("""s(\d+)-e(\d+)""").findAll(slug).toList()
+        val last = matches.lastOrNull() ?: return null
+        val s = last.groupValues[1].toIntOrNull() ?: return null
+        val e = last.groupValues[2].toIntOrNull() ?: return null
+        return s to e
+    }
+
+    private suspend fun loadTips(url: String): LoadResponse {
+        val document = fetchPage(url).document
+        val decoded = decode(url)
+        val anime = isAnime(decoded)
+        val rawTitle = document.selectFirst("h1")?.text()
+            ?: document.selectFirst("meta[property=\"og:title\"]")?.attr("content")
+            ?: document.title()
+        val titleBase = cleanTitle(rawTitle).substringBefore(" | ").trim()
+        val poster = document.pagePoster()
+            ?: fixUrlNull(document.selectFirst("img")?.attr("src"))
+        val plot = document.pagePlot()
+
+        if (url.contains("/series/")) {
+            // Series hub: episode hrefs are read VERBATIM from the
+            // page — never constructed (E2's slug is cumulative).
+            // Only /watch/ non-movie links are episodes; /series/
+            // links are the similar-shows row.
+            val title = titleBase.ifBlank {
+                decode(url).substringAfter("/series/").trimEnd('/')
+                    .removeSuffix("-series").replace('-', ' ').trim()
+            }
+            if (title.isBlank()) throw ErrorLoadingException("No title")
+            val episodes = mutableListOf<Episode>()
+            val seen = HashSet<String>()
+            document.select("a[href]").forEach { a ->
+                val href = fixUrl(a.attr("href"))
+                if (!href.startsWith(tipsUrl) || !href.contains("/watch/") ||
+                    href.endsWith("-movie") || !seen.add(href)
+                ) return@forEach
+                val slug = href.trimEnd('/').substringAfterLast("/")
+                val se = tipsSeasonEpisode(slug)
+                val num = se?.second
+                val linkText = a.text().trim()
+                episodes += newEpisode(href) {
+                    this.name = num?.let { "الحلقة $it" }
+                        ?: linkText.ifBlank { cleanTitle(decode(slug).replace('-', ' ')) }
+                    this.season = se?.first ?: 1
+                    this.episode = num
+                }
+            }
+            episodes.sortWith(compareBy({ it.season ?: 1 }, { it.episode ?: Int.MAX_VALUE }))
+            if (episodes.isEmpty()) throw ErrorLoadingException("No episodes")
+            return newTvSeriesLoadResponse(
+                title, url,
+                if (anime) TvType.Anime else TvType.TvSeries,
+                episodes
+            ) {
+                this.posterUrl = poster
+                this.plot = plot
+                this.trailers = trailerFor(title, isSeries = true, acceptPv = anime)
+            }
+        }
+
+        // A /watch/ page: -movie is a film; anything else is an
+        // episode watch page (single-episode series — the hub link on
+        // the page, when present, names the series).
+        val isFilm = url.trimEnd('/').endsWith("-movie")
+        if (!isFilm) {
+            val hub = document.select("a[href*=\"/series/\"]").firstOrNull()
+            val seriesTitle = cleanTitle(
+                hub?.attr("title")?.ifBlank { null } ?: hub?.text() ?: ""
+            ).substringBefore(" | ").trim().ifBlank { titleBase }
+            val slug = url.trimEnd('/').substringAfterLast("/")
+            val se = tipsSeasonEpisode(slug)
+            val ep = newEpisode(url) {
+                this.name = se?.second?.let { "الحلقة $it" } ?: titleBase
+                this.season = se?.first ?: 1
+                this.episode = se?.second
+            }
+            return newTvSeriesLoadResponse(
+                seriesTitle.ifBlank { titleBase }, url,
+                if (anime) TvType.Anime else TvType.TvSeries,
+                listOf(ep)
+            ) {
+                this.posterUrl = poster
+                this.plot = plot
+                this.trailers = trailerFor(seriesTitle, isSeries = true, acceptPv = anime)
+            }
+        }
+
+        if (titleBase.isBlank()) throw ErrorLoadingException("No title")
+        return newMovieLoadResponse(
+            titleBase, url,
+            if (anime) TvType.Anime else TvType.Movie,
+            url
+        ) {
+            this.posterUrl = poster
+            this.plot = plot
+            this.trailers = trailerFor(titleBase, isSeries = false, acceptPv = anime)
+        }
+    }
+
+    /**
+     * .tips playback (v36): the watch page IS the data URL. Its
+     * resolve protocol (POST /watch/resolve) is UNVERIFIED on .tips
+     * — the markers were never readable from any client (script
+     * source blocked; sandbox CF-403). So: when watchResolveKey /
+     * csrfToken / const servers are present, run the same resolve
+     * machinery as the old mobile chain against the .tips host; when
+     * they are absent, fall back to the player iframe / server
+     * embeds rendered on the watch page itself. NEVER invent a
+     * key/token. Playback is UNVERIFIED until Mohamed tests it on
+     * his phone.
+     */
+    private suspend fun loadLinksTips(
+        data: String,
+        diag: MutableList<String>,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        diag += "tips=1"
+        val safeData = pctEncodeNonAscii(data)
+        if (safeData != data) diag += "enc=1"
+        // The watch page is fetched fresh every play press — a
+        // cached page would carry a stale resolve key/token.
+        var watchErr: String? = null
+        var res = runCatching { app.get(safeData, headers = browserHeaders, referer = safeData) }
+            .onFailure { watchErr = it.javaClass.simpleName }.getOrNull()
+        for (attempt in 2..3) {
+            if (res != null) break
+            Thread.sleep(if (attempt == 2) 1500L else 4000L)
+            res = runCatching { app.get(safeData, headers = browserHeaders, referer = safeData) }
+                .onFailure { watchErr = it.javaClass.simpleName }.getOrNull()
+            if (res != null) watchErr = null
+        }
+        diag += "watch=${res?.code ?: "err"}"
+        if (watchErr != null) diag += "werr=$watchErr"
+        if (res == null) return false
+        val cookies = runCatching { res.cookies }.getOrNull().orEmpty()
+        val text = res.text
+        val watchTitle = Regex("""<title>([^<]*)</title>""").find(text)?.groupValues?.get(1)?.trim()
+        val key = Regex("""watchResolveKey\s*=\s*"([^"]+)"""").find(text)?.groupValues?.get(1)
+        val csrf = Regex("""csrfToken\s*=\s*"([^"]+)"""").find(text)?.groupValues?.get(1)
+        val serversJson = Regex("""const servers = (\[.*?\]);""", RegexOption.DOT_MATCHES_ALL)
+            .find(text)?.groupValues?.get(1)
+        val serverTokens = mutableListOf<String>()
+        var serverCount = 0
+        if (serversJson != null) {
+            val arr = runCatching { org.json.JSONArray(serversJson) }.getOrNull()
+            if (arr != null) {
+                serverCount = arr.length()
+                for (i in 0 until arr.length()) {
+                    serverTokens += arr.optJSONObject(i)?.optString("resolve_token") ?: ""
+                }
+            }
+        }
+        diag += "servers=$serverCount"
+        val cookieHeader = cookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
+
+        var embeds: List<String>? = null
+        if (key != null && csrf != null && serverTokens.isNotEmpty()) {
+            diag += "resolve=try"
+            var hits = phase1Mobile(serverTokens, key, csrf, cookieHeader, safeData, diag, tipsUrl)
+            if (hits.isEmpty()) {
+                diag += "rewarm=1"
+                val res2 = runCatching {
+                    app.get(safeData, headers = browserHeaders, referer = safeData)
+                }.getOrNull()
+                val text2 = res2?.let { runCatching { it.text }.getOrNull() }
+                val key2 = text2?.let {
+                    Regex("""watchResolveKey\s*=\s*"([^"]+)"""").find(it)?.groupValues?.get(1)
+                }
+                val csrf2 = text2?.let {
+                    Regex("""csrfToken\s*=\s*"([^"]+)"""").find(it)?.groupValues?.get(1)
+                }
+                val cookies2 = res2?.let { runCatching { it.cookies }.getOrNull() }.orEmpty()
+                if (key2 != null && csrf2 != null) {
+                    hits = phase1Mobile(
+                        serverTokens, key2, csrf2,
+                        cookies2.entries.joinToString("; ") { e -> "${e.key}=${e.value}" },
+                        safeData, diag, tipsUrl
+                    )
+                }
+            }
+            val set = LinkedHashSet<String>()
+            hits.forEach { set += it.second }
+            diag += "resolved=${hits.size}"
+            diag += "embeds=${set.size}"
+            embeds = set.toList()
+        } else {
+            diag += "resolve=nomarkers"
+        }
+
+        // Fastest extractor hosts first; every server is still tried.
+        var found = false
+        val ordered = (embeds ?: emptyList()).sortedBy { hostPriority(it) }
+        val unresolved = mutableListOf<String>()
+        for (embed in ordered) {
+            if (loadExtractor(embed, safeData, subtitleCallback, callback)) {
+                found = true
+            } else {
+                unresolved += embed
+            }
+        }
+        if (!found && embeds == null) {
+            // No resolve markers: fall back to the player iframe /
+            // server embeds rendered on the watch page itself.
+            val doc = runCatching { org.jsoup.Jsoup.parse(text, safeData) }.getOrNull()
+            val frames = LinkedHashSet<String>()
+            doc?.select("iframe[src]")?.forEach {
+                val src = it.attr("src").trim()
+                if (src.startsWith("http")) frames += fixUrl(src)
+            }
+            doc?.select("[data-watch]")?.forEach {
+                val link = it.attr("data-watch").trim()
+                if (link.startsWith("http")) frames += fixUrl(link)
+            }
+            diag += "iframe=${frames.size}"
+            for (frame in frames) {
+                if (loadExtractor(frame, safeData, subtitleCallback, callback)) {
+                    found = true
+                } else {
+                    unresolved += frame
+                }
+            }
+        }
+        if (!found) {
+            var scanned = 0
+            for (embed in unresolved) {
+                if (scanEmbed(embed, safeData, callback)) {
+                    scanned++
+                    found = true
+                }
+            }
+            diag += "scan=$scanned"
+        }
+        if (!found) {
+            var relayed = 0
+            for (embed in unresolved.take(3)) {
+                relayed += resolveViaRelay(embed, safeData, callback)
+            }
+            diag += "relay=$relayed"
+            if (relayed > 0) found = true
+        }
+        if (!found) {
+            // Same WordPress fallback as the old mobile chain: the
+            // title also lives on wecima.vin.
+            diag += "wpFb=1"
+            if (wpFallbackMobile(data, watchTitle, subtitleCallback, callback)) {
+                diag += "wpFbHit=1"
+                return true
+            }
+        }
+        return found
+    }
+
     // ---------- wecima.mobile load / playback ----------
 
     /** Mobile series title: the slug stem before the episode marker. */
@@ -1509,13 +1868,14 @@ class WeCimaProvider : MainAPI() {
         key: String,
         csrf: String,
         cookieHeader: String,
-        watchUrl: String
+        watchUrl: String,
+        baseUrl: String
     ): Pair<String?, Boolean> {
         val ua = browserHeaders["User-Agent"] ?: "Mozilla/5.0"
         val body = JSONObject().put("key", key).put("token", token)
             .put("human_signal", JSONObject.NULL).toString()
         val postReq = okhttp3.Request.Builder()
-            .url("$mobileUrl/watch/resolve")
+            .url("$baseUrl/watch/resolve")
             .header("User-Agent", ua)
             .header("X-CSRF-TOKEN", csrf)
             .header("X-Requested-With", "XMLHttpRequest")
@@ -1540,7 +1900,7 @@ class WeCimaProvider : MainAPI() {
         val frag = (rText?.let { runCatching { JSONObject(it) }.getOrNull() })
             ?.takeIf { it.optBoolean("ok") }?.optString("url")?.takeIf { it.isNotBlank() }
             ?: return null to gated
-        val fragUrl = if (frag.startsWith("http")) frag else mobileUrl + frag
+        val fragUrl = if (frag.startsWith("http")) frag else baseUrl + frag
         val getReq = okhttp3.Request.Builder()
             .url(fragUrl)
             .header("User-Agent", ua)
@@ -1551,7 +1911,7 @@ class WeCimaProvider : MainAPI() {
         return runCatching {
             rawClientNoFollow.newCall(getReq).execute().use { resp ->
                 val loc = resp.header("Location")
-                if (loc != null && loc.startsWith("http") && !loc.contains("wecima.mobile") && !loc.contains("weciema.net")) {
+                if (loc != null && loc.startsWith("http") && !loc.contains("wecima.mobile") && !loc.contains("weciema.net") && !loc.contains("wecima.tips")) {
                     loc
                 } else {
                     val t = runCatching { resp.body?.string() }.getOrNull() ?: ""
@@ -1610,7 +1970,8 @@ class WeCimaProvider : MainAPI() {
         csrf: String,
         cookieHeader: String,
         watchUrl: String,
-        diag: MutableList<String>
+        diag: MutableList<String>,
+        baseUrl: String
     ): List<Pair<Int, String>> {
         val hits = java.util.Collections.synchronizedList(mutableListOf<Pair<Int, String>>())
         val fails = java.util.Collections.synchronizedList(mutableListOf<Int>())
@@ -1629,7 +1990,7 @@ class WeCimaProvider : MainAPI() {
                     if (token.isBlank() || gateHit.get()) {
                         fails += index
                     } else {
-                        val (embed, gated) = resolveOneMobile(token, key, csrf, cookieHeader, watchUrl)
+                        val (embed, gated) = resolveOneMobile(token, key, csrf, cookieHeader, watchUrl, baseUrl)
                         if (gated) { gates += true; gateHit.set(true) }
                         if (embed != null) hits += index to embed else fails += index
                     }
@@ -1705,7 +2066,7 @@ class WeCimaProvider : MainAPI() {
                 }.getOrDefault(emptyList())
                 if (tokens.isEmpty()) return@runCatching
                 val sink = mutableListOf<String>()
-                val hits = phase1Mobile(tokens, key, csrf, session.second, watchUrl, sink)
+                val hits = phase1Mobile(tokens, key, csrf, session.second, watchUrl, sink, mobileUrl)
                 if (hits.isNotEmpty()) {
                     playCache[url] = System.currentTimeMillis() to hits.map { it.second }
                 }
@@ -1772,7 +2133,7 @@ class WeCimaProvider : MainAPI() {
             diag += "servers=${servers.size}"
             if (key == null || csrf == null || servers.isEmpty()) return false
             val cookieHeader = cookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
-            var hits = phase1Mobile(serverTokens, key, csrf, cookieHeader, watchUrl, diag)
+            var hits = phase1Mobile(serverTokens, key, csrf, cookieHeader, watchUrl, diag, mobileUrl)
             if (hits.isEmpty()) {
                 // Re-warm once: fresh watch page -> fresh session.
                 diag += "rewarm=1"
@@ -1791,7 +2152,7 @@ class WeCimaProvider : MainAPI() {
                     hits = phase1Mobile(
                         serverTokens, key2, csrf2,
                         cookies2.entries.joinToString("; ") { e -> "${e.key}=${e.value}" },
-                        watchUrl, diag
+                        watchUrl, diag, mobileUrl
                     )
                 }
             }

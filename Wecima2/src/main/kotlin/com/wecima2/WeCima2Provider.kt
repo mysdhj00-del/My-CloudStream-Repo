@@ -28,7 +28,7 @@ import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 
 /**
- * Wecima2 provider for CloudStream 3 — dedicated to https://wecima.cx.
+ * Wecima2 provider for CloudStream 3 — dedicated to https://wecima.tips.
  *
  * Traced live 2026-11-03/04 against the real WecimaEngine frontend
  * (a THIRD WeCima frontend: neither the WP theme on wecima.vin nor
@@ -49,7 +49,7 @@ import org.jsoup.nodes.Element
  *   doodstream / mixdrop / luluvdo / dhcplay / savefiles / byselapuix /
  *   vidspeed / 1vid / bysesukior / hgcloud / playmogo embeds — all
  *   standard file-host embeds handed to loadExtractor.
- * - Search: POST https://wecima.cx/search with form field q=<query>
+ * - Search: POST https://wecima.tips/search with form field q=<query>
  *   (CRACKED 2026-11-04: the field NAME is the key — GET /search?s=
  *   and POST with s=/search=/keyword= all return status:false + empty,
  *   even from inside a real browser session; POST q= returns
@@ -171,9 +171,32 @@ import org.jsoup.nodes.Element
  *   btn decoded to luluvdo/dhcplay/doodstream), so a Mux-only
  *   episode tap on-phone is a phone-context failure, not an
  *   empty watch page — re-test asked on v10.
+ * - v18 (2026-11-19, HOST CHANGE ONLY — parser untouched): mainUrl
+ *   https://wecima.cx -> https://wecima.tips. The operator moved the
+ *   domain: .cx 301-redirects to .tips (curl-verified 2026-11-19
+ *   10:15 UTC and re-confirmed 10:31 UTC), same catalog (34 titles,
+ *   same order), same URL model (/watch/<slug>-movie,
+ *   /series/<slug>-series, /watch/<slug>-sNN-eMM,
+ *   /category/<slug>/page/N), same server presentation (film watch
+ *   page Server 1-6 + iframe, episode watch page 9 servers +
+ *   iframe), live search works (avengers -> 7 results, live browser
+ *   2026-11-19 12:19-12:26 EET). .cx kept ONLY as a legacy alias in
+ *   this comment — NOT a fetch fallback (it 301s to .tips, and a
+ *   search POST to .cx follows the 301 as a GET and returns empty,
+ *   so v17's search is likely already broken by the redirect).
+ *   UNVERIFIED — the btn data-url decode on .tips data: raw HTML is
+ *   unobtainable from every sandbox route (CF-403 on curl, Render
+ *   relay, text crawler; browser tools show the accessibility tree
+ *   only, view-source refused), so card markup (a), the decode (b)
+ *   and POST /search (c) could NOT be re-run against .tips data —
+ *   unobtainable, not failed. The phone test + DEBUG lines (home
+ *   DEBUG cards, loadLinks DEBUG line) are the verdict. Also noted:
+ *   GET /search?s=12 on .tips returns the site's own 404 page, not
+ *   JSON status:false — search is POST-only there, which does NOT
+ *   affect the provider's POST search.
  */
 class WeCima2Provider : MainAPI() {
-    override var mainUrl = "https://wecima.cx"
+    override var mainUrl = "https://wecima.tips"
     override var name = "Wecima2"
     override val hasMainPage = true
     override var lang = "ar"
@@ -198,7 +221,7 @@ class WeCima2Provider : MainAPI() {
         val out = HashMap<String, String>()
         out["User-Agent"] = headers["User-Agent"] ?: "Mozilla/5.0"
         out["Referer"] = "$mainUrl/"
-        cloudflareKiller.savedCookies["wecima.cx"]?.let { cookies ->
+        cloudflareKiller.savedCookies["wecima.tips"]?.let { cookies ->
             if (cookies.isNotEmpty()) {
                 out["Cookie"] = cookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
             }
@@ -238,7 +261,7 @@ class WeCima2Provider : MainAPI() {
         "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
         "Accept-Language" to "ar,en;q=0.9",
         "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Referer" to "https://wecima.cx/",
+        "Referer" to "https://wecima.tips/",
     )
 
     // ---------- cards ----------

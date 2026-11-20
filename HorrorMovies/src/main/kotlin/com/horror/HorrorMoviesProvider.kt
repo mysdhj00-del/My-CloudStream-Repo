@@ -460,127 +460,18 @@ class HorrorMoviesProvider : MainAPI() {
         page: Int,
         request: MainPageRequest
     ): HomePageResponse {
-        val (lane, base) = request.data.split(":", limit = 2)
-        // v17: MovieBox — JSON ranking-list, NOT an HTML page.
-        // Arabic-subtitled ONLY: a film with no Arabic in its
-        // subtitles field never becomes a card. Pagination (fixed
-        // v17 — v16 used rawCount >= 20, but pages return 17/15/18
-        // films, so page 1 gave hasNext=false and the section
-        // stopped at 2 Arabic films): hasNext reads
-        // data.pager.hasMore AND the section stops only when a
-        // page brings zero NEW raw items (seen-set by detailPath,
-        // cleared on page 1) — a page with zero Arabic cards does
-        // NOT end the section, and a clamped past-the-end page
-        // (zero new items) ends it even if hasMore claims true.
-        if (lane == "moviebox") {
-            val url = if (page <= 1) base else "$base&page=$page"
-            // v24: fail-fast 10 s fetch — a slow MovieBox ranking
-            // call returns empty instead of hanging the home.
-            val text = httpGetTextHeaders(url, homeFetchTimeoutMs, mbJsonHeaders)
-            if (text.isNullOrBlank()) {
-                return newHomePageResponse(emptyList(), false)
-            }
-            val dataObj = runCatching {
-                JSONObject(text).optJSONObject("data")
-            }.getOrNull()
-            val list = dataObj?.optJSONArray("subjectList")
-            if (list == null) {
-                return newHomePageResponse(emptyList(), false)
-            }
-            if (page <= 1) mbSeenDetailPaths.clear()
-            val pager = dataObj.optJSONObject("pager")
-            val rawCount = list.length()
-            var rawNew = 0
-            val cards = ArrayList<SearchResponse>()
-            for (i in 0 until rawCount) {
-                val o = list.optJSONObject(i) ?: continue
-                val dp = o.optString("detailPath")
-                if (dp.isBlank()) continue
-                if (!mbSeenDetailPaths.add(dp)) continue
-                rawNew++
-                if (!hasArabicSub(o.optString("subtitles"))) continue
-                val title = o.optString("title")
-                if (title.isBlank()) continue
-                val poster = o.optJSONObject("cover")
-                    ?.optString("url")?.ifBlank { null }
-                movieCard(
-                    title,
-                    "$mbWebBase/ar/moviedetail/$dp",
-                    poster
-                )?.let { cards += it }
-            }
-            val apiHasMore = if (pager != null && pager.has("hasMore")) {
-                pager.optBoolean("hasMore")
-            } else {
-                rawNew > 0
-            }
-            return newHomePageResponse(
-                listOf(
-                    HomePageList(request.name, cards, isHorizontalImages = true)
-                ),
-                apiHasMore && rawNew > 0
-            )
-        }
-        val url = when (lane) {
-            "moviz" -> if (page <= 1) base else base + "page/$page/"
-            "eg" -> if (page <= 1) base else base + "page/$page/"
-            "top" -> if (page <= 1) base else base + "page/$page/"
-            "af" -> if (page <= 1) base else base + "page/$page/"
-            "myc" -> if (page <= 1) base else base + "&page=$page"
-            "lar" -> if (page <= 1) base else base + "?page=$page"
-            else -> base
-        }
-        // v24: fail-fast 10 s fetch — a slow site returns empty
-        // instead of hanging the home. Jsoup.parse(html, url)
-        // keeps the base URI so abs:href / abs:src still resolve.
-        val html = httpGetTextHeaders(url, homeFetchTimeoutMs, browserHeaders)
-            ?: return newHomePageResponse(emptyList(), false)
-        val doc = runCatching {
-            Jsoup.parse(html, url)
-        }.getOrNull() ?: return newHomePageResponse(emptyList(), false)
-        val cards = when (lane) {
-            "moviz", "eg", "myc", "lar", "top", "af" -> parseLaneCards(lane, doc)
-            else -> emptyList()
-        }
-        // v8: a next-page link alone lies on the last page (TopCinema
-        // p74 still links /page/75/, which is empty) — hasNext also
-        // requires page < last page parsed from the pagination bar.
-        val nextLink = when (lane) {
-            "moviz", "eg", "top", "af" -> doc.select("a[href*=/page/${page + 1}/]").isNotEmpty()
-            "myc" -> doc.select("a[href*=page=${page + 1}]").isNotEmpty()
-            "lar" -> doc.select("a[href]").any {
-                it.attr("href").contains("?page=${page + 1}")
-            }
-            else -> false
-        }
-        val lastPage: Int? = when (lane) {
-            "moviz", "eg", "top", "af" -> doc.select("a[href*=/page/]")
-                .mapNotNull { a ->
-                    // Numbered links only: the » next-arrow also
-                    // carries a /page/N+1/ href and would fake a
-                    // further last page (TopCinema p74 links » to
-                    // an empty p75 while the numbers stop at 74).
-                    if (a.text().trim().toIntOrNull() == null) {
-                        return@mapNotNull null
-                    }
-                    Regex("""/page/(\d+)/""").find(a.attr("href"))
-                        ?.groupValues?.get(1)?.toIntOrNull()
-                }.maxOrNull()
-            "myc", "lar" -> doc.select("a[href]")
-                .mapNotNull { a ->
-                    if (a.text().trim().toIntOrNull() == null) {
-                        return@mapNotNull null
-                    }
-                    Regex("""[?&]page=(\d+)""").find(a.attr("href"))
-                        ?.groupValues?.get(1)?.toIntOrNull()
-                }.maxOrNull()
-            else -> null
-        }
-        val hasNext = nextLink && (lastPage == null || page < lastPage)
-        return newHomePageResponse(
-            listOf(HomePageList(request.name, cards, isHorizontalImages = true)),
-            hasNext
-        )
+        // v25 (2026-11-20, DIAGNOSTIC — empty home): v24 is
+        // installed on the phone and STILL exits, on an older
+        // CloudStream version with only our repo — so the crash
+        // is NOT slow loading, NOT the MovieBox lane, NOT the
+        // app version, NOT a repo mix. This build returns an
+        // EMPTY home (no sections, no fetches at all) to split
+        // the cause: if v25 opens, the crash is in one of the
+        // 7 lanes' data/fetch; if v25 still exits, it is in the
+        // addon itself (dex/init) or stored data on the phone.
+        // Everything else (load, parts, subtitles, trailer,
+        // MovieBox playback) is byte-identical to v24.
+        return newHomePageResponse(emptyList(), false)
     }
 
     private fun parseLaneCards(lane: String, doc: Document): List<SearchResponse> {

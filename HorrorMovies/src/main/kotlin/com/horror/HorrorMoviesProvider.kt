@@ -431,6 +431,20 @@ import okhttp3.RequestBody.Companion.toRequestBody
  * or the timeline points to a data change, and v27's set
  * is tested next. getMainPage byte-identical to v24/v26.
  *
+ * v29 (2026-11-22, MOVIZ-ONLY - is it MovieBox-specific
+ * or any section?): v28 (MovieBox alone) EXITS, but the
+ * live MovieBox list is CLEAN - 17 films, all normal
+ * titles/posters/detailPaths, 17/17 Arabic after the
+ * diacritic-strip normalizer (the raw "0 Arabic" count
+ * was my error: subtitles carry tashkeel). The one 404
+ * poster (Obsession) was transient CDN propagation -
+ * it returns 200 now. So no bad card is visible in the
+ * sandbox region's data. This build declares ONLY the
+ * moviz HTML lane: if v29 EXITS too, the crash is in
+ * home sections generally (not MovieBox data); if v29
+ * is STABLE, it is MovieBox-specific (fetch/region/
+ * timing on his line). getMainPage byte-identical.
+ *
  * RATING: CloudStream's card type has no rating slot in this app
  * version, so ratings ride the detail page: the plot line opens
  * with «★ التقييم: X/10» wherever the source page provides one
@@ -458,8 +472,8 @@ class HorrorMoviesProvider : MainAPI() {
         // v17: MovieBox FIRST by the user's explicit order.
         // v23: restored after the v22 test proved the lane was
         // NOT the re-add crash cause (v22 still exited).
-        "moviebox:https://moviebox.sg/wefeed-h5api-bff/ranking-list/content?id=8614980535946986176&perPage=20" to
-            "أفلام رعب — MovieBox",
+        "moviz:https://www.moviz.land/tag/%d8%b1%d8%b9%d8%a8/" to
+            "أفلام رعب — موفيز لاند"
     )
 
     private fun cleanHtml(s: String): String =

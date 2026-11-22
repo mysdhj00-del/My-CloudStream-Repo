@@ -407,6 +407,17 @@ import okhttp3.RequestBody.Companion.toRequestBody
  * exits alone, a lane's data is the cause and lanes are
  * bisected one at a time next. No other change vs v25.
  *
+ * v27 (2026-11-22, BISECT 1/2 - first 3 lanes only):
+ * v26 (all 7 lanes) EXITS on the phone on a clean slate
+ * (only HorrorMovies, fresh data), while v25 (empty home)
+ * was STABLE - so the crash is in a lane's data/fetch.
+ * This build declares ONLY moviebox + moviz + eg in
+ * mainPageOf (the other 4 lanes are not fetched at all);
+ * getMainPage code is byte-identical to v24/v26. If v27
+ * EXITS, the culprit is in these 3 lanes; if v27 is
+ * STABLE, it is in myc / lar / top / af. Next build
+ * splits the guilty half again.
+ *
  * RATING: CloudStream's card type has no rating slot in this app
  * version, so ratings ride the detail page: the plot line opens
  * with «★ التقييم: X/10» wherever the source page provides one
@@ -440,14 +451,6 @@ class HorrorMoviesProvider : MainAPI() {
             "أفلام رعب — موفيز لاند",
         "eg:https://egy.bet/genre/%d8%b1%d8%b9%d8%a8/" to
             "أفلام رعب — إيجي بست",
-        "myc:https://vid.mycima.cc/categories-cimawbas.php?cat=horror-movies" to
-            "أفلام رعب — ماي سيما",
-        "lar:https://larozatv.com/category/%D8%B1%D8%B9%D8%A8" to
-            "أفلام رعب — لاروز",
-        "top:https://topcinema.film/genre/%D8%B1%D8%B9%D8%A8/" to
-            "أفلام رعب — توب سينما",
-        "af:https://aflamstream.com/category/%D8%A3%D9%81%D9%84%D8%A7%D9%85-%D8%B1%D8%B9%D8%A8-%D9%85%D8%AA%D8%B1%D8%AC%D9%85%D8%A9-%D9%88%D8%AC%D8%AF%D9%8A%D8%AF%D8%A9/" to
-            "أفلام رعب — أفلام ستريم"
     )
 
     private fun cleanHtml(s: String): String =

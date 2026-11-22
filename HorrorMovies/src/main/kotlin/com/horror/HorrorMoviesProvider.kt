@@ -418,6 +418,19 @@ import okhttp3.RequestBody.Companion.toRequestBody
  * STABLE, it is in myc / lar / top / af. Next build
  * splits the guilty half again.
  *
+ * v28 (2026-11-22, MOVIEBOX-ONLY - direct test of his
+ * claim): Mohamed 2026-11-22 19:07: "لا هذه المشكلة
+ * ظهرت بعد قسم moivebox" - the crash appeared AFTER the
+ * MovieBox section was added (v17 introduced the lane).
+ * This build declares ONLY moviebox in mainPageOf; v27
+ * (moviebox+moviz+eg) is superseded untested. If v28
+ * EXITS alone, the MovieBox lane is the cause (then the
+ * bad card/data inside it is hunted next: perPage cap
+ * or first-half/second-half of its 20 cards). If v28 is
+ * STABLE alone, the crash needs MovieBox + another lane,
+ * or the timeline points to a data change, and v27's set
+ * is tested next. getMainPage byte-identical to v24/v26.
+ *
  * RATING: CloudStream's card type has no rating slot in this app
  * version, so ratings ride the detail page: the plot line opens
  * with «★ التقييم: X/10» wherever the source page provides one
@@ -447,10 +460,6 @@ class HorrorMoviesProvider : MainAPI() {
         // NOT the re-add crash cause (v22 still exited).
         "moviebox:https://moviebox.sg/wefeed-h5api-bff/ranking-list/content?id=8614980535946986176&perPage=20" to
             "أفلام رعب — MovieBox",
-        "moviz:https://www.moviz.land/tag/%d8%b1%d8%b9%d8%a8/" to
-            "أفلام رعب — موفيز لاند",
-        "eg:https://egy.bet/genre/%d8%b1%d8%b9%d8%a8/" to
-            "أفلام رعب — إيجي بست",
     )
 
     private fun cleanHtml(s: String): String =

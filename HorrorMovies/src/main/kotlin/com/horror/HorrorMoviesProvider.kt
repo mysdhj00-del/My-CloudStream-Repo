@@ -863,13 +863,17 @@ class HorrorMoviesProvider : MainAPI() {
      * persistent cache. A refresh that finds zero cards does
      * NOT overwrite the cache (a changed markup must not wipe
      * the row). 2-thread pool (gentle on his 4G); one refresh
-     * per lane at a time (guarded set). */
+     * per lane at a time (guarded set).
+     * v39: the task waits 2 s before fetching — same reason as
+     * the IMDb fill: the refresh is invisible, so it yields the
+     * bandwidth to the poster images. */
     private fun laneRefreshBackground(lane: String, base: String) {
         synchronized(laneRefreshing) {
             if (!laneRefreshing.add(lane)) return
         }
         try {
             laneRefreshPool.execute {
+                runCatching { Thread.sleep(2000) }
                 try {
                     runCatching {
                         val html = httpGetTextHeaders(base, homeFetchTimeoutMs, browserHeaders)
@@ -1252,12 +1256,14 @@ class HorrorMoviesProvider : MainAPI() {
     // The resolution cache itself is HorrorImdbCache
     // (persistent, in the Plugin file) — the v34 in-memory
     // map is gone (it died on every app close).
-    // Fill pool: 4 threads (panel majority), shared for the
-    // app's lifetime, never shut down; the fill fires once
-    // per home load at most (imdbFillRunning guard) and
-    // resolves only missing/stale titles.
+    // Fill pool: v39: 2 threads (was 4, panel majority) — the
+    // fill is invisible background work, and 2 threads halve
+    // the burst competing with the poster images on his 4G.
+    // Shared for the app's lifetime, never shut down; the fill
+    // fires once per home load at most (imdbFillRunning guard)
+    // and resolves only missing/stale titles.
     private val imdbFillPool by lazy {
-        Executors.newFixedThreadPool(4)
+        Executors.newFixedThreadPool(2)
     }
     @Volatile
     private var imdbFillRunning = false
@@ -1268,7 +1274,11 @@ class HorrorMoviesProvider : MainAPI() {
      * The coordinator occupies one pool thread only while
      * minting (~0.5 s), then the per-title tasks run on the
      * pool. A failed mint just means MovieBox is skipped
-     * (blank token) — FasselHD and the lanes still run. */
+     * (blank token) — FasselHD and the lanes still run.
+     * v39: the coordinator waits 2 s before starting — the
+     * fill is invisible (its results show on the NEXT home
+     * load), so it yields the bandwidth to the poster images
+     * the user is looking at right now. */
     private fun imdbFillBackground(titles: List<String>) {
         if (titles.isEmpty()) return
         synchronized(this) {
@@ -1278,6 +1288,7 @@ class HorrorMoviesProvider : MainAPI() {
         val jobs = titles.toList()
         try {
             imdbFillPool.execute {
+                runCatching { Thread.sleep(2000) }
                 val token = runCatching { mbWebTokenBlocking() }.getOrNull().orEmpty()
                 val remaining = AtomicInteger(jobs.size)
                 try {

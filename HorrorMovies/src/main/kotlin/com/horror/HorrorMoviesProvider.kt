@@ -748,6 +748,39 @@ class HorrorMoviesProvider : MainAPI() {
                 apiHasMore && rawNew > 0
             )
         }
+        // v38: lane rows come from the persistent cache
+        // (HorrorLaneCache, 24 h TTL) — the app launches ALL
+        // home sections in parallel but AWAITS them all before
+        // rendering (APIRepository.getMainPage: async + await),
+        // so one live lane fetch (4–5 s from the sandbox, the
+        // 10 s timeout on his line) held the instant IMDb row
+        // hostage and the home took exactly 10 s. Now page 1
+        // returns its cached cards immediately (zero network)
+        // and a background refresh re-fetches the page; a stale
+        // entry still shows its cards (better than empty) while
+        // the refresh runs. Only a lane with NO entry at all
+        // returns empty (its refresh fills it for the next
+        // load). Page 2+ is a live fetch — the user scrolling
+        // sideways waits for that page; it is not the home-load
+        // path.
+        if (page <= 1 && lane in listOf("moviz", "eg", "myc", "lar", "top", "af")) {
+            val cached = HorrorLaneCache.get(lane)
+            if (cached != null) {
+                if (System.currentTimeMillis() - cached.at >= HorrorLaneCache.TTL_MS) {
+                    laneRefreshBackground(lane, base)
+                }
+                val cards = ArrayList<SearchResponse>()
+                for (c in cached.cards) {
+                    movieCard(c.title, c.url, c.poster)?.let { cards += it }
+                }
+                return newHomePageResponse(
+                    listOf(HomePageList(request.name, cards, isHorizontalImages = true)),
+                    cached.hasMore
+                )
+            }
+            laneRefreshBackground(lane, base)
+            return newHomePageResponse(emptyList(), false)
+        }
         val url = when (lane) {
             "moviz" -> if (page <= 1) base else base + "page/$page/"
             "eg" -> if (page <= 1) base else base + "page/$page/"
@@ -769,9 +802,25 @@ class HorrorMoviesProvider : MainAPI() {
             "moviz", "eg", "myc", "lar", "top", "af" -> parseLaneCards(lane, doc)
             else -> emptyList()
         }
-        // v8: a next-page link alone lies on the last page (TopCinema
-        // p74 still links /page/75/, which is empty) — hasNext also
-        // requires page < last page parsed from the pagination bar.
+        // v38: hasNext is shared with the background refresh
+        // (laneHasMore) — one definition, one behaviour.
+        val hasNext = laneHasMore(lane, doc, page)
+        return newHomePageResponse(
+            listOf(HomePageList(request.name, cards, isHorizontalImages = true)),
+            hasNext
+        )
+    }
+
+    /** v38: whether page `page` of a lane has a next page — a
+     * next-page link AND page < last numbered page. Shared by
+     * the live lane branch and the background refresh.
+     * v8: a next-page link alone lies on the last page
+     * (TopCinema p74 still links /page/75/, which is empty) —
+     * hasNext also requires page < last page parsed from the
+     * pagination bar (numbered links only: the » next-arrow
+     * also carries a /page/N+1/ href and would fake a further
+     * last page). */
+    private fun laneHasMore(lane: String, doc: Document, page: Int): Boolean {
         val nextLink = when (lane) {
             "moviz", "eg", "top", "af" -> doc.select("a[href*=/page/${page + 1}/]").isNotEmpty()
             "myc" -> doc.select("a[href*=page=${page + 1}]").isNotEmpty()
@@ -783,10 +832,6 @@ class HorrorMoviesProvider : MainAPI() {
         val lastPage: Int? = when (lane) {
             "moviz", "eg", "top", "af" -> doc.select("a[href*=/page/]")
                 .mapNotNull { a ->
-                    // Numbered links only: the » next-arrow also
-                    // carries a /page/N+1/ href and would fake a
-                    // further last page (TopCinema p74 links » to
-                    // an empty p75 while the numbers stop at 74).
                     if (a.text().trim().toIntOrNull() == null) {
                         return@mapNotNull null
                     }
@@ -803,11 +848,52 @@ class HorrorMoviesProvider : MainAPI() {
                 }.maxOrNull()
             else -> null
         }
-        val hasNext = nextLink && (lastPage == null || page < lastPage)
-        return newHomePageResponse(
-            listOf(HomePageList(request.name, cards, isHorizontalImages = true)),
-            hasNext
-        )
+        return nextLink && (lastPage == null || page < lastPage)
+    }
+
+    private val laneRefreshPool by lazy {
+        Executors.newFixedThreadPool(2)
+    }
+    private val laneRefreshing = HashSet<String>()
+
+    /** v38: background refresh for one lane's home row — fetches
+     * the lane page (10 s timeout; it is background, so a slow
+     * site cannot stall the home), parses it with the same
+     * parseLaneCards, and writes the cards + hasMore to the
+     * persistent cache. A refresh that finds zero cards does
+     * NOT overwrite the cache (a changed markup must not wipe
+     * the row). 2-thread pool (gentle on his 4G); one refresh
+     * per lane at a time (guarded set). */
+    private fun laneRefreshBackground(lane: String, base: String) {
+        synchronized(laneRefreshing) {
+            if (!laneRefreshing.add(lane)) return
+        }
+        try {
+            laneRefreshPool.execute {
+                try {
+                    runCatching {
+                        val html = httpGetTextHeaders(base, homeFetchTimeoutMs, browserHeaders)
+                        if (!html.isNullOrBlank()) {
+                            val doc = Jsoup.parse(html, base)
+                            val cards = parseLaneCards(lane, doc)
+                            if (cards.isNotEmpty()) {
+                                HorrorLaneCache.put(
+                                    lane,
+                                    cards.map {
+                                        HorrorLaneCache.Card(it.name, it.url, it.posterUrl)
+                                    },
+                                    laneHasMore(lane, doc, 1)
+                                )
+                            }
+                        }
+                    }
+                } finally {
+                    synchronized(laneRefreshing) { laneRefreshing.remove(lane) }
+                }
+            }
+        } catch (_: Exception) {
+            synchronized(laneRefreshing) { laneRefreshing.remove(lane) }
+        }
     }
 
     private fun parseLaneCards(lane: String, doc: Document): List<SearchResponse> {

@@ -1183,7 +1183,12 @@ class HorrorMoviesProvider : MainAPI() {
                 imdbFillPool.execute {
                     try {
                         runCatching {
-                            imdbResolveTitleBlocking(title, token)?.let { found ->
+                            // v36: try the stale entry's source
+                            // first — most re-resolves hit on the
+                            // first request.
+                            val preferred = HorrorImdbCache.get(imdbKey(title))
+                                ?.source?.takeIf { it != "?" }
+                            imdbResolveTitleBlocking(title, token, preferred)?.let { found ->
                                 HorrorImdbCache.put(
                                     imdbKey(title),
                                     found.first, found.second, found.third
@@ -1231,20 +1236,44 @@ class HorrorMoviesProvider : MainAPI() {
      * lanes still run.
      * v35: returns (url, poster, source) — the source is
      * stored in the persistent cache (panel: try the last
-     * successful source first on a later re-resolve). */
+     * successful source first on a later re-resolve).
+     * v36: preferredSource does exactly that — the
+     * background fill passes the stale entry's source, so
+     * most re-resolves hit on the FIRST request instead of
+     * walking the whole chain (the preferred source is not
+     * retried in the standard-order pass). */
     private fun imdbResolveTitleBlocking(
         title: String,
-        mbToken: String
+        mbToken: String,
+        preferredSource: String? = null
     ): Triple<String, String?, String>? {
-        if (mbToken.isNotBlank()) {
-            runCatching { imdbSearchMovieBoxBlocking(title, mbToken) }.getOrNull()
-                ?.let { return Triple(it.first, it.second, "moviebox") }
+        val lanes = listOf("moviz", "eg", "myc", "lar", "top", "af")
+        fun tryMovieBox(): Triple<String, String?, String>? {
+            if (mbToken.isBlank()) return null
+            return runCatching { imdbSearchMovieBoxBlocking(title, mbToken) }.getOrNull()
+                ?.let { Triple(it.first, it.second, "moviebox") }
         }
-        runCatching { imdbSearchFasselBlocking(title) }.getOrNull()
-            ?.let { return Triple(it.first, it.second, "fassel") }
-        for (lane in listOf("moviz", "eg", "myc", "lar", "top", "af")) {
-            runCatching { imdbSearchLane(lane, title) }.getOrNull()
-                ?.let { return Triple(it.first, it.second, lane) }
+        fun tryFassel(): Triple<String, String?, String>? {
+            return runCatching { imdbSearchFasselBlocking(title) }.getOrNull()
+                ?.let { Triple(it.first, it.second, "fassel") }
+        }
+        fun tryLane(lane: String): Triple<String, String?, String>? {
+            return runCatching { imdbSearchLane(lane, title) }.getOrNull()
+                ?.let { Triple(it.first, it.second, lane) }
+        }
+        val pref = preferredSource
+        if (pref != null) {
+            when (pref) {
+                "moviebox" -> tryMovieBox()?.let { return it }
+                "fassel" -> tryFassel()?.let { return it }
+                else -> if (pref in lanes) tryLane(pref)?.let { return it }
+            }
+        }
+        if (pref != "moviebox") tryMovieBox()?.let { return it }
+        if (pref != "fassel") tryFassel()?.let { return it }
+        for (lane in lanes) {
+            if (lane == pref) continue
+            tryLane(lane)?.let { return it }
         }
         return null
     }

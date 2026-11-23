@@ -458,6 +458,35 @@ import okhttp3.RequestBody.Companion.toRequestBody
  * so MovieBox can be restored if its cause is found.
  * getMainPage byte-identical to v24/v26.
  *
+ * v32 (2026-11-23, his order «لقسم idmb — نفس باقي
+ * الاقسام»): TWO things for the IMDb section, the same
+ * as the other sections. (1) SUBTITLE GEAR, three modes
+ * (Goojara/AnimeVerse pattern): «العربية» / «الإنجليزية» /
+ * «العربية + الإنجليزية» (default dual), chosen in the
+ * settings gear — the old single English on/off switch is
+ * replaced (migration: old ON -> dual, old OFF -> ar).
+ * OpenSubtitles (key-free, IMDb-id resolved) supplies the
+ * Arabic + English files with the same sync-first ranking
+ * as before (23.976fps BluRay/WEB UTF-8); dual merges them
+ * through the relay mergesubs (verified 200+WEBVTT first)
+ * with the local merge as fallback, exactly like the
+ * MovieBox dual. MovieBox captions follow the same mode
+ * (mbEmitFromArray reads HorrorSubs.mode). The gear is
+ * addon-wide, so every section's films get it, IMDb
+ * included. (2) FASSELHD as an IMDb-section source:
+ * imdbResolveTitle now tries MovieBox, then FasselHD
+ * (panel API kahitdgku.com/faselhd15/public/api, search
+ * endpoint, exact normalized-title match, movie rows
+ * only), then the 6 HTML lanes — first hit wins. A
+ * FasselHD-resolved film plays through the new load() +
+ * loadLinksFassel branches (detail -> videos -> stock
+ * extractors, direct .mp4/.m3u8 emitted as-is; the
+ * probe/dig/relay phases of the FasselHD addon are NOT
+ * ported — a server no stock extractor handles yields
+ * nothing). Verified live 2026-11-23: search «Weapons»
+ * returns the 2025 film first (id 29099, the title
+ * MovieBox lacks), detail carries 28 video servers.
+ *
  * v31 (2026-11-23, NEW "IMDb" section - his order):
  * the section takes its film list from IMDb's horror
  * interest page (imdb.com/interest/horror/) and brings
@@ -1026,11 +1055,161 @@ class HorrorMoviesProvider : MainAPI() {
         title: String
     ): Pair<String, String?>? {
         runCatching { imdbSearchMovieBox(title) }.getOrNull()?.let { return it }
+        // v32: FasselHD next — its panel API search is a real
+        // catalog, stronger than scraping the HTML lanes.
+        runCatching { imdbSearchFassel(title) }.getOrNull()?.let { return it }
         for (lane in listOf("moviz", "eg", "myc", "lar", "top", "af")) {
             runCatching { imdbSearchLane(lane, title) }.getOrNull()
                 ?.let { return it }
         }
         return null
+    }
+
+    // ---------- v32: FasselHD (panel API, same source as the
+    // FasselHD v13 addon) ----------
+    private val fasApiPrimary = "https://kahitdgku.com/faselhd15/public/api"
+    private val fasConfigUrl = "https://watchit.tn/api_urls.json"
+    private var fasLiveBase: String? = null
+    private var fasConfigTried = false
+    private var fasConfigBase: String? = null
+
+    /** GETs a path on the live FasselHD API base; body or null. */
+    private suspend fun fasApiGet(path: String): String? {
+        val bases = ArrayList<String>()
+        fasLiveBase?.let { bases += it }
+        if (fasApiPrimary !in bases) bases += fasApiPrimary
+        if (!fasConfigTried) {
+            fasConfigTried = true
+            fasConfigBase = runCatching {
+                val cfg = app.get(fasConfigUrl, headers = browserHeaders).text
+                JSONObject(cfg).optString("backupApiUrlNoureddine").trim().trimEnd('/')
+            }.getOrNull()?.ifBlank { null }
+        }
+        fasConfigBase?.let { if (it !in bases) bases += it }
+        for (base in bases) {
+            val res = runCatching { app.get("$base/$path", headers = browserHeaders) }.getOrNull()
+            val text = res?.text
+            if (res != null && res.code == 200 && text != null &&
+                (text.startsWith("{") || text.startsWith("["))
+            ) {
+                fasLiveBase = base
+                return text
+            }
+        }
+        return null
+    }
+
+    private suspend fun fasApiJson(path: String): JSONObject? {
+        val text = fasApiGet(path) ?: return null
+        return runCatching { JSONObject(text) }.getOrNull()
+    }
+
+    /** v32: one IMDb title on FasselHD — panel search, movie
+     * rows only, exact normalized-title match, first hit wins
+     * (same contract as imdbSearchLane). Returns the detail
+     * URL (a "movie:<id>" token on fasselhd.com, which load()
+     * and loadLinksFassel understand) + poster. Verified live
+     * 2026-11-23: «Weapons» returns the 2025 film first
+     * (id 29099) — the title MovieBox lacks. */
+    private suspend fun imdbSearchFassel(
+        title: String
+    ): Pair<String, String?>? {
+        val q = java.net.URLEncoder.encode(title, "UTF-8")
+        val root = fasApiJson("search/$q/1") ?: return null
+        val rows = root.optJSONArray("search") ?: return null
+        val seedKey = imdbKey(title)
+        for (i in 0 until rows.length()) {
+            val row = rows.optJSONObject(i) ?: continue
+            if (row.optString("type").lowercase() != "movie") continue
+            val t = row.optString("title").ifBlank { row.optString("name") }
+            if (t.isBlank() || !isMovieTitle(t) || imdbKey(t) != seedKey) continue
+            val id = row.optString("id")
+            if (id.isBlank()) continue
+            return "https://fasselhd.com/movie:$id" to
+                row.optString("poster_path").ifBlank { null }
+        }
+        return null
+    }
+
+    /** v32: the videos "header" field — a bare URL is the
+     * referer; otherwise "Key: Value|Key: Value" pairs. */
+    private fun fasParseHeaderField(raw: String): Pair<String?, Map<String, String>> {
+        val t = raw.trim()
+        if (t.isBlank()) return null to emptyMap()
+        if (t.startsWith("http")) return t to emptyMap()
+        val extra = LinkedHashMap<String, String>()
+        if (t.contains(":")) {
+            for (part in t.split("|")) {
+                val kv = part.split(":", limit = 2)
+                if (kv.size == 2) {
+                    val k = kv[0].trim()
+                    val v = kv[1].trim()
+                    if (k.isNotBlank() && v.isNotBlank() &&
+                        k.all { it.isLetterOrDigit() || it == '-' }
+                    ) extra[k] = v
+                }
+            }
+        }
+        return null to extra
+    }
+
+    private fun fasIsDirect(url: String): Boolean {
+        val clean = url.substringBefore("?").lowercase()
+        return clean.endsWith(".m3u8") || clean.endsWith(".mp4")
+    }
+
+    /** v32: FasselHD playback — detail -> videos -> stock
+     * extractors; direct .mp4/.m3u8 emitted as-is. The
+     * FasselHD addon's probe/dig/relay phases are NOT ported
+     * — a server no stock extractor handles yields nothing. */
+    private suspend fun loadLinksFassel(
+        data: String,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit,
+        elapsed: () -> Long
+    ): Boolean {
+        val id = Regex("""movie:(\d+)""").find(data)?.groupValues?.get(1)
+        if (id.isNullOrBlank()) {
+            emitDebug(listOf("Horror·Fassel", "id-missing"), callback)
+            return true
+        }
+        val root = fasApiJson("media/detail/$id/1")
+        val videos = root?.optJSONArray("videos")
+        if (videos == null || videos.length() == 0) {
+            emitDebug(listOf("Horror·Fassel", "no-videos"), callback)
+            return true
+        }
+        var emitted = 0
+        val counting: (ExtractorLink) -> Unit = { link ->
+            emitted++
+            callback(link)
+        }
+        for (i in 0 until videos.length()) {
+            if (emitted >= 6 || elapsed() > 25000) break
+            val v = videos.optJSONObject(i) ?: continue
+            val link = v.optString("link")
+            if (link.isBlank()) continue
+            val server = v.optString("server").ifBlank { "FasselHD" }
+            val (ref, _) = fasParseHeaderField(v.optString("header"))
+            val referer = ref ?: "https://fasselhd.com/"
+            if (fasIsDirect(link)) {
+                emitDirectLabeled("FasselHD $server", link, referer, counting)
+            } else {
+                runCatching {
+                    loadExtractor(link, referer, subtitleCallback, counting)
+                }
+            }
+        }
+        if (emitted == 0) {
+            emitDebug(
+                listOf(
+                    "Horror·Fassel", "srv=${videos.length()}",
+                    "ext=0", "t=${elapsed() / 1000}s"
+                ),
+                callback
+            )
+        }
+        return true
     }
 
     // ---------------------------------------------------------------
@@ -1446,6 +1625,29 @@ class HorrorMoviesProvider : MainAPI() {
                     if (parts.size > 1) this.recommendations = parts
                 }
             }
+            // v32: FasselHD — panel API detail; the URL carries
+            // a "movie:<id>" token.
+            url.contains("fasselhd.com") -> {
+                val id = Regex("""movie:(\d+)""").find(url)?.groupValues?.get(1)
+                    ?: return movieFallback(url)
+                val root = fasApiJson("media/detail/$id/1")
+                    ?: return movieFallback(url)
+                val title = cleanMovieTitle(
+                    root.optString("title").ifBlank { root.optString("original_name") }
+                )
+                val poster = root.optString("poster_path").ifBlank { null }
+                val desc = root.optString("overview").ifBlank { null }
+                val year = Regex("""(19|20)\d\d""")
+                    .find(root.optString("release_date"))?.value?.toIntOrNull()
+                val trailers = trailerFor(title)
+                newMovieLoadResponse(title.ifBlank { "فاصل إتش دي" }, url, TvType.Movie, subData(url, title)) {
+                    this.posterUrl = poster
+                    this.backgroundPosterUrl = root.optString("backdrop_path").ifBlank { null }
+                    this.plot = desc
+                    this.year = year
+                    this.trailers = trailers
+                }
+            }
             else -> movieFallback(url)
         }
     }
@@ -1775,10 +1977,12 @@ class HorrorMoviesProvider : MainAPI() {
     ): Boolean {
         val t0 = System.currentTimeMillis()
         fun elapsed() = System.currentTimeMillis() - t0
-        // Auto English subtitles first (settings switch, default ON).
+        // v32: subtitle gear, three modes (ar/en/dual, default
+        // dual) — OpenSubtitles Arabic + English, merged for
+        // dual. Applies to every film, IMDb section included.
         val (realData, subTitle, _) = parseSubData(data)
-        if (HorrorSubs.autoEnglish && subTitle.isNotBlank()) {
-            emitEnglishSub(subTitle, subtitleCallback)
+        if (subTitle.isNotBlank()) {
+            emitSubs(subTitle, subtitleCallback)
         }
         return when {
             realData.contains("moviz.land") -> loadLinksMoviz(realData, subtitleCallback, callback, ::elapsed)
@@ -1787,6 +1991,8 @@ class HorrorMoviesProvider : MainAPI() {
             realData.contains("larozatv") -> loadLinksLaRos(realData, subtitleCallback, callback, ::elapsed)
             realData.contains("topcinema") -> loadLinksTop(realData, subtitleCallback, callback, ::elapsed)
             realData.contains("aflamstream") -> loadLinksAf(realData, subtitleCallback, callback, ::elapsed)
+            // v32: FasselHD — the URL carries a "movie:<id>" token.
+            realData.contains("fasselhd.com") -> loadLinksFassel(realData, subtitleCallback, callback, ::elapsed)
             // v17: MovieBox — full data string (carries subjectId).
             isMovieBox(realData) -> loadLinksMovieBox(data, subtitleCallback, callback, ::elapsed)
             else -> {
@@ -2239,11 +2445,52 @@ class HorrorMoviesProvider : MainAPI() {
         return fallback
     }
 
-    private suspend fun emitEnglishSub(
+    /** Best OpenSubtitles file for one language, sync-first ranking. */
+    private fun bestSubFor(arr: JSONArray, lang: String): String? {
+        return rankedSubsFor(arr, lang).firstOrNull()
+    }
+
+    /** All OpenSubtitles files for one language, best score first. */
+    private fun rankedSubsFor(arr: JSONArray, lang: String): List<String> {
+        val scored = ArrayList<Pair<Int, String>>()
+        for (i in 0 until arr.length()) {
+            val o = arr.optJSONObject(i) ?: continue
+            if (o.optString("lang") != lang) continue
+            val u = o.optString("url")
+            if (u.isBlank()) continue
+            var score = 0
+            if (o.optInt("fpsMilli", 0) == 23976) score += 3
+            val fmt = o.optString("releaseFormat")
+            if (fmt == "BluRay" || fmt == "WEB") score += 2
+            if (o.optString("SubEncoding") == "UTF-8") score += 1
+            scored.add(score to u)
+        }
+        return scored.sortedByDescending { it.first }.map { it.second }
+    }
+
+    /** v32: subtitle gear, three modes (HorrorSubs.mode, default
+     * dual) — Title (+year) -> IMDb suggest (key-free) ->
+     * OpenSubtitles. Sync-first ranking (v7): don't take the
+     * first file — a subtitle timed for 25fps on a 23.976fps
+     * stream drifts more and more as the film plays. Prefer
+     * 23.976fps BluRay/WEB UTF-8 files, which match the
+     * standard movie streams best.
+     * - "ar": Arabic only (no English fallback — the mode
+     *   says Arabic; the MovieBox route may still add its
+     *   own Arabic for a MovieBox film).
+     * - "en": English only (the old v6 behaviour).
+     * - "dual": Arabic + the merged Arabic+English (relay
+     *   mergesubs, verified 200+WEBVTT first; local merge
+     *   as fallback — same machinery as the MovieBox dual);
+     *   Arabic only when no English exists, English only
+     *   when no Arabic exists. Playback never waits on
+     *   subtitles. */
+    private suspend fun emitSubs(
         title: String,
         subtitleCallback: (SubtitleFile) -> Unit
-    ) {
-        runCatching {
+    ): String {
+        val mode = HorrorSubs.mode
+        return runCatching {
             val year = Regex("""(19|20)\d\d""").find(title)?.value?.toIntOrNull()
             for (candidate in latinTitleCandidates(title)) {
                 val tt = resolveImdbId(candidate, year) ?: continue
@@ -2254,34 +2501,53 @@ class HorrorMoviesProvider : MainAPI() {
                 val arr = runCatching {
                     JSONObject(json).optJSONArray("subtitles")
                 }.getOrNull() ?: continue
-                // Sync-first ranking (v7): don't take the first eng file.
-                // A subtitle timed for 25fps on a 23.976fps stream drifts
-                // more and more as the film plays — the classic desync.
-                // Prefer 23.976fps BluRay/WEB UTF-8 files, which match
-                // the standard movie streams best.
-                var bestUrl = ""
-                var bestScore = -1
-                for (i in 0 until arr.length()) {
-                    val o = arr.optJSONObject(i) ?: continue
-                    if (o.optString("lang") != "eng") continue
-                    val url = o.optString("url")
-                    if (url.isBlank()) continue
-                    var score = 0
-                    if (o.optInt("fpsMilli", 0) == 23976) score += 3
-                    val fmt = o.optString("releaseFormat")
-                    if (fmt == "BluRay" || fmt == "WEB") score += 2
-                    if (o.optString("SubEncoding") == "UTF-8") score += 1
-                    if (score > bestScore) {
-                        bestScore = score
-                        bestUrl = url
+                val ara = bestSubFor(arr, "ara")
+                val eng = bestSubFor(arr, "eng")
+                return when (mode) {
+                    "ar" -> {
+                        if (ara != null) {
+                            subtitleCallback(SubtitleFile("العربية", ara))
+                            "sub:ar"
+                        } else "sub:no-match"
+                    }
+                    "en" -> {
+                        if (eng != null) {
+                            subtitleCallback(SubtitleFile("English", eng))
+                            "sub:en"
+                        } else "sub:no-match"
+                    }
+                    else -> {
+                        if (eng != null && ara != null) {
+                            val mergeUrl = "$mbSubsRelayBase/relay/mergesubs?eng=" +
+                                java.net.URLEncoder.encode(eng, "UTF-8") +
+                                "&ara=" + java.net.URLEncoder.encode(ara, "UTF-8")
+                            subtitleCallback(SubtitleFile("العربية", ara))
+                            val mergeOk = runCatching {
+                                val r = app.get(mergeUrl)
+                                r.code in 200..299 && r.text.contains("WEBVTT")
+                            }.getOrDefault(false)
+                            if (mergeOk) {
+                                subtitleCallback(SubtitleFile("العربية + الإنجليزية", mergeUrl))
+                                "sub:dual"
+                            } else {
+                                val stored = mbMergeCaptionsLocal(ara, eng)
+                                if (stored != null) {
+                                    subtitleCallback(SubtitleFile("العربية + الإنجليزية", stored))
+                                    "sub:dual"
+                                } else "sub:ar+mf"
+                            }
+                        } else if (ara != null) {
+                            subtitleCallback(SubtitleFile("العربية", ara))
+                            "sub:ar-only"
+                        } else if (eng != null) {
+                            subtitleCallback(SubtitleFile("English", eng))
+                            "sub:en-only"
+                        } else "sub:no-match"
                     }
                 }
-                if (bestUrl.isNotBlank()) {
-                    subtitleCallback(SubtitleFile("English", bestUrl))
-                    return
-                }
             }
-        }
+            "sub:no-tt"
+        }.getOrDefault("sub:err")
     }
 
     /** Packs title (+year, parsed from the title) into a loadLinks data string. */
@@ -3506,6 +3772,25 @@ class HorrorMoviesProvider : MainAPI() {
     ): String? {
         val (ara, eng) = mbPickCaptions(arr)
         if (ara == null && eng == null) return null
+        // v32: the subtitle gear mode gates MovieBox captions
+        // too — "ar" emits Arabic only, "en" English only,
+        // "dual" (default) keeps the v19 behaviour below.
+        when (HorrorSubs.mode) {
+            "ar" -> {
+                if (ara != null) {
+                    subtitleCallback(SubtitleFile("العربية", ara))
+                    return "ar"
+                }
+                return null
+            }
+            "en" -> {
+                if (eng != null) {
+                    subtitleCallback(SubtitleFile("English", eng))
+                    return "en"
+                }
+                return null
+            }
+        }
         if (ara != null) subtitleCallback(SubtitleFile("العربية", ara))
         if (ara != null && eng != null) {
             val mergeUrl = "$mbSubsRelayBase/relay/mergesubs?eng=" +

@@ -624,6 +624,16 @@ class HorrorMoviesProvider : MainAPI() {
         page: Int,
         request: MainPageRequest
     ): HomePageResponse {
+        // v42 DIAGNOSTIC (temporary, TV only): the TV app still
+        // exits after v40 (URL encoding) and v41 (TV lane cap),
+        // so the cause is undecided. On a TV this build returns
+        // an EMPTY home and fires NO background work, to separate
+        // a Plugin.load() crash from a home-content crash.
+        // If the TV still exits: the crash is in Plugin.load()
+        // (or the plugin file). If it opens (empty home): the
+        // crash is in the home content (or the background work).
+        // The phone is unaffected. REMOVE before the next version.
+        if (HorrorEnv.isTv) return newHomePageResponse(emptyList(), false)
         val (lane, base) = request.data.split(":", limit = 2)
         // v31: IMDb section — seed titles from IMDb's horror
         // interest list, each resolved to one card (MovieBox

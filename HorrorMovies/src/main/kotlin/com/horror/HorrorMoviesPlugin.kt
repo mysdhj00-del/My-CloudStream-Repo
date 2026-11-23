@@ -3,6 +3,7 @@ package com.horror
 import android.app.AlertDialog
 import android.content.Context
 import android.content.SharedPreferences
+import android.content.pm.PackageManager
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
 import org.json.JSONArray
@@ -308,9 +309,22 @@ object HorrorLaneCache {
     }
 }
 
+// v41: TV detection — the TV (leanback) app exits when the
+// addon is put on it, while the phone is fine (v40's URL
+// encoding did not fix it). The remaining suspect is the
+// image burst: 128 posters at once on a TV with far less RAM
+// than the phone. The provider caps the lane rows on TV only.
+object HorrorEnv {
+    @Volatile
+    var isTv = false
+}
+
 @CloudstreamPlugin
 class HorrorMoviesPlugin : Plugin() {
     override fun load(context: Context) {
+        HorrorEnv.isTv = runCatching {
+            context.packageManager.hasSystemFeature(PackageManager.FEATURE_LEANBACK)
+        }.getOrDefault(false)
         val prefs = context.getSharedPreferences(HorrorSubs.PREFS, Context.MODE_PRIVATE)
         HorrorSubs.loadFrom(prefs)
         HorrorImdbCache.loadFrom(

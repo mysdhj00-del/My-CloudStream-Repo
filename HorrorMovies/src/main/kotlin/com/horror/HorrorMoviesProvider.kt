@@ -29,9 +29,9 @@ import javax.crypto.spec.SecretKeySpec
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.toRequestBody
 import java.util.concurrent.Callable
-import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * HorrorMovies (أفلام رعب) — horror movies aggregated from the four
@@ -620,87 +620,60 @@ class HorrorMoviesProvider : MainAPI() {
     ): HomePageResponse {
         val (lane, base) = request.data.split(":", limit = 2)
         // v31: IMDb section — seed titles from IMDb's horror
-        // interest list, each resolved LIVE to one card
-        // (MovieBox search first, then FasselHD, then the 6
-        // HTML lanes' search, first hit wins) and deduped by
-        // normalized title.
+        // interest list, each resolved to one card (MovieBox
+        // search first, then FasselHD, then the 6 HTML lanes'
+        // search, first hit wins) and deduped by normalized
+        // title.
         // v33: the sideways scroll shows ALL pages — the whole
         // seed on page 1, hasNext=false, page > 1 empty.
-        // v34: FAST — the v33 row was slow because the 29
-        // titles resolved SEQUENTIALLY. Now: (1) a 1-hour
-        // in-memory cache — repeat home loads skip the network
-        // entirely; (2) the uncached titles resolve IN PARALLEL
-        // on a 10-thread pool (blocking twins of the search
-        // calls — no coroutines in this codebase, same
-        // Executors pattern as the FasselHD probe pool);
-        // (3) a 12 s overall deadline — a title that has not
-        // resolved by then is skipped this load instead of
-        // holding the whole row hostage (retried on the next
-        // home load). The token and the FasselHD config are
-        // warmed once on this thread first, so workers never
-        // race on them. Results merge back in seed order.
+        // v35: FAST, panel design (2026-11-23, 6 models on
+        // duck.ai, UNANIMOUS): v34 was still slow because its
+        // in-memory cache died on every close/reopen, so every
+        // test was a cold start — 29 titles x up to 8 searches
+        // (up to 232 requests), 10 threads = ~3 waves gated
+        // by the slowest request, and the 12 s deadline only
+        // truncated the row instead of speeding it. The fix:
+        // a PERSISTENT disk cache (HorrorImdbCache,
+        // SharedPreferences, 14-day TTL — panel majority 3/6;
+        // URLs are stable for weeks), getMainPage returns
+        // immediately from disk with ZERO network on the
+        // critical path (the only call is the cached-token
+        // mint, instant when warm, one call cold), a
+        // placeholder card for a cache miss whose URL is a
+        // synthetic "imdb-resolve:" token resolved lazily in
+        // load() on tap (one title, 8 s cap), and a
+        // background fill (4 threads, panel majority) for
+        // missing/stale titles only, fired after the row
+        // returns. No coroutines anywhere (CI has none).
         if (lane == "imdb") {
             if (page > 1) {
                 return newHomePageResponse(emptyList(), false)
             }
             val now = System.currentTimeMillis()
             val token = runCatching { mbWebToken().first }.getOrNull().orEmpty()
-            runCatching { fasWarmConfig() }
-            val fresh = LinkedHashMap<String, Pair<String, String?>>()
-            val toResolve = ArrayList<String>()
-            for ((title, _) in imdbHorrorSeed) {
-                val key = imdbKey(title)
-                val hit = imdbResolveCache[key]
-                if (hit != null && now - hit.at < imdbResolveCacheTtlMs) {
-                    fresh[key] = hit.url to hit.poster
-                } else if (!toResolve.contains(title)) {
-                    toResolve += title
-                }
-            }
-            if (toResolve.isNotEmpty()) {
-                val pool = Executors.newFixedThreadPool(minOf(10, toResolve.size))
-                try {
-                    val futures = toResolve.associateWith { title ->
-                        pool.submit(Callable<Pair<String, String?>?> {
-                            runCatching { imdbResolveTitleBlocking(title, token) }.getOrNull()
-                        })
-                    }
-                    val deadline = System.currentTimeMillis() + 12_000
-                    while (System.currentTimeMillis() < deadline) {
-                        if (futures.values.all { it.isDone }) break
-                        Thread.sleep(50)
-                    }
-                    for ((title, future) in futures) {
-                        val found = if (future.isDone) {
-                            runCatching { future.get() }.getOrNull()
-                        } else {
-                            future.cancel(true)
-                            null
-                        }
-                        if (found != null) {
-                            val key = imdbKey(title)
-                            fresh[key] = found
-                            imdbResolveCache[key] = CachedImdbResolve(
-                                found.first, found.second,
-                                System.currentTimeMillis()
-                            )
-                        }
-                    }
-                } finally {
-                    pool.shutdownNow()
-                }
-            }
+            val toFill = ArrayList<String>()
             val cards = ArrayList<SearchResponse>()
             val seenTitles = HashSet<String>()
             for ((title, rating) in imdbHorrorSeed) {
                 if (!seenTitles.add(imdbKey(title))) continue
-                val (url, poster) = fresh[imdbKey(title)] ?: continue
+                val key = imdbKey(title)
                 val display = if (rating.isNotBlank()) {
                     "$title ★ $rating"
                 } else {
                     title
                 }
-                movieCard(display, url, poster)?.let { cards += it }
+                val hit = HorrorImdbCache.get(key)
+                if (hit != null && now - hit.at < HorrorImdbCache.TTL_MS) {
+                    movieCard(display, hit.url, hit.poster)?.let { cards += it }
+                } else {
+                    if (!toFill.contains(title)) toFill += title
+                    val resolveUrl = "imdb-resolve:" +
+                        java.net.URLEncoder.encode(title, "UTF-8")
+                    movieCard(display, resolveUrl, null)?.let { cards += it }
+                }
+            }
+            if (toFill.isNotEmpty()) {
+                imdbFillBackground(toFill, token)
             }
             return newHomePageResponse(
                 listOf(
@@ -1183,38 +1156,95 @@ class HorrorMoviesProvider : MainAPI() {
         return null
     }
 
-    // v34: IMDb resolution cache — the seed is fixed, so a
-    // resolved (title -> url, poster) mapping is reused for
-    // an hour; repeat home loads skip the network entirely.
-    // Instance fields (like the MovieBox token cache) — the
-    // provider instance lives as long as the app process.
-    // ConcurrentHashMap: pool workers read/write it.
-    private val imdbResolveCache = ConcurrentHashMap<String, CachedImdbResolve>()
-    private val imdbResolveCacheTtlMs = 3600_000L
+    // v35: background fill + tap-resolve machinery (panel).
+    // The resolution cache itself is HorrorImdbCache
+    // (persistent, in the Plugin file) — the v34 in-memory
+    // map is gone (it died on every app close).
+    // Fill pool: 4 threads (panel majority), shared for the
+    // app's lifetime, never shut down; the fill fires once
+    // per home load at most (imdbFillRunning guard) and
+    // resolves only missing/stale titles.
+    private val imdbFillPool by lazy {
+        Executors.newFixedThreadPool(4)
+    }
+    @Volatile
+    private var imdbFillRunning = false
 
-    private data class CachedImdbResolve(
-        val url: String,
-        val poster: String?,
-        val at: Long
-    )
+    private fun imdbFillBackground(titles: List<String>, token: String) {
+        if (titles.isEmpty()) return
+        synchronized(this) {
+            if (imdbFillRunning) return
+            imdbFillRunning = true
+        }
+        val jobs = titles.toList()
+        val remaining = AtomicInteger(jobs.size)
+        try {
+            for (title in jobs) {
+                imdbFillPool.execute {
+                    try {
+                        runCatching {
+                            imdbResolveTitleBlocking(title, token)?.let { found ->
+                                HorrorImdbCache.put(
+                                    imdbKey(title),
+                                    found.first, found.second, found.third
+                                )
+                            }
+                        }
+                    } finally {
+                        if (remaining.decrementAndGet() == 0) {
+                            imdbFillRunning = false
+                        }
+                    }
+                }
+            }
+        } catch (_: Exception) {
+            imdbFillRunning = false
+        }
+    }
+
+    /** v35: resolve ONE title on a worker thread with an 8 s
+     * cap (tap path). The common MovieBox hit is ~1 s; an
+     * unresolvable title returns null instead of hanging
+     * load() for the full cascade (~27 s). */
+    private val imdbTapPool by lazy {
+        Executors.newSingleThreadExecutor()
+    }
+
+    private fun imdbResolveOne(
+        title: String,
+        token: String
+    ): Triple<String, String?, String>? {
+        return try {
+            val future = imdbTapPool.submit(Callable {
+                runCatching { imdbResolveTitleBlocking(title, token) }.getOrNull()
+            })
+            runCatching { future.get(8, TimeUnit.SECONDS) }.getOrNull()
+        } catch (_: Exception) {
+            null
+        }
+    }
 
     /** v34: blocking twin of imdbResolveTitle — same order
      * (MovieBox, then FasselHD, then the 6 HTML lanes),
      * first hit wins. Runs on a worker thread. A blank token
      * skips MovieBox (the mint failed) — FasselHD and the
-     * lanes still run. */
+     * lanes still run.
+     * v35: returns (url, poster, source) — the source is
+     * stored in the persistent cache (panel: try the last
+     * successful source first on a later re-resolve). */
     private fun imdbResolveTitleBlocking(
         title: String,
         mbToken: String
-    ): Pair<String, String?>? {
+    ): Triple<String, String?, String>? {
         if (mbToken.isNotBlank()) {
             runCatching { imdbSearchMovieBoxBlocking(title, mbToken) }.getOrNull()
-                ?.let { return it }
+                ?.let { return Triple(it.first, it.second, "moviebox") }
         }
-        runCatching { imdbSearchFasselBlocking(title) }.getOrNull()?.let { return it }
+        runCatching { imdbSearchFasselBlocking(title) }.getOrNull()
+            ?.let { return Triple(it.first, it.second, "fassel") }
         for (lane in listOf("moviz", "eg", "myc", "lar", "top", "af")) {
             runCatching { imdbSearchLane(lane, title) }.getOrNull()
-                ?.let { return it }
+                ?.let { return Triple(it.first, it.second, lane) }
         }
         return null
     }
@@ -1668,6 +1698,28 @@ class HorrorMoviesProvider : MainAPI() {
 
     override suspend fun load(url: String): LoadResponse {
         return when {
+            // v35: IMDb placeholder card (panel) — the home row
+            // shows the seed title with a synthetic URL when the
+            // persistent cache has no fresh entry; the title is
+            // resolved lazily HERE, on tap, for this ONE title
+            // only, on a worker thread with an 8 s cap (the
+            // common MovieBox hit is ~1 s; an unresolvable
+            // title falls back instead of hanging the detail
+            // page). A hit is written to the persistent cache,
+            // so the next home load shows the real card.
+            url.startsWith("imdb-resolve:") -> {
+                val title = runCatching {
+                    java.net.URLDecoder.decode(
+                        url.removePrefix("imdb-resolve:"), "UTF-8"
+                    )
+                }.getOrNull().orEmpty()
+                if (title.isBlank()) return movieFallback(url)
+                val token = runCatching { mbWebToken().first }.getOrNull().orEmpty()
+                val found = imdbResolveOne(title, token)
+                if (found == null) return movieFallback(url)
+                HorrorImdbCache.put(imdbKey(title), found.first, found.second, found.third)
+                return load(found.first)
+            }
             url.contains("moviz.land") -> {
                 val doc = runCatching {
                     app.get(url, headers = browserHeaders).document

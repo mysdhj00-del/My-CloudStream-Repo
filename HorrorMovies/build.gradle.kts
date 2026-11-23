@@ -1,5 +1,5 @@
 // HorrorMovies CloudStream plugin module.
-version = 42
+version = 43
 
 android {
     namespace = "com.horror"

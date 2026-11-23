@@ -601,8 +601,14 @@ class HorrorMoviesProvider : MainAPI() {
     private fun movieCard(title: String, url: String, poster: String?): SearchResponse? {
         val name = cleanMovieTitle(title)
         if (name.isBlank() || url.isBlank()) return null
-        return newMovieSearchResponse(name, url, TvType.Movie) {
-            this.posterUrl = poster
+        // v40: percent-encode non-ASCII in the URL and poster —
+        // lar/af (and the lane search results) carry RAW Arabic
+        // in their slugs/poster paths; a raw non-ASCII URL is
+        // invalid (RFC 3986) and the TV app exits on it, while
+        // the phone tolerates it. encodeNonAsciiUrl is a no-op
+        // for ASCII, so already-encoded URLs are untouched.
+        return newMovieSearchResponse(name, encodeNonAsciiUrl(url) ?: url, TvType.Movie) {
+            this.posterUrl = encodeNonAsciiUrl(poster)
         }
     }
 

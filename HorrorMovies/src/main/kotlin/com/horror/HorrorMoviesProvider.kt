@@ -624,16 +624,20 @@ class HorrorMoviesProvider : MainAPI() {
         page: Int,
         request: MainPageRequest
     ): HomePageResponse {
-        // v42 DIAGNOSTIC (temporary, TV only): the TV app still
-        // exits after v40 (URL encoding) and v41 (TV lane cap),
-        // so the cause is undecided. On a TV this build returns
-        // an EMPTY home and fires NO background work, to separate
-        // a Plugin.load() crash from a home-content crash.
-        // If the TV still exits: the crash is in Plugin.load()
-        // (or the plugin file). If it opens (empty home): the
-        // crash is in the home content (or the background work).
-        // The phone is unaffected. REMOVE before the next version.
-        if (HorrorEnv.isTv) return newHomePageResponse(emptyList(), false)
+        // v43 DIAGNOSTIC (temporary, ALL devices): v42 was TV-only
+        // (gated on HorrorEnv.isTv) and the TV STILL exited — but
+        // that result is only valid if the TV is detected as a
+        // leanback device; if his "screen app" is the regular app
+        // on a TV, isTv is false and v42's empty home never
+        // applied. So this build returns an EMPTY home on EVERY
+        // device and fires NO background work, to separate a
+        // Plugin.load() crash from a home-content crash for
+        // certain. If the TV still exits: the crash is in
+        // Plugin.load() (or the plugin file). If it opens (empty
+        // home): the crash is in the home content (or the
+        // background work). The phone's home is empty too, only
+        // for this one test. REMOVE before the next version.
+        return newHomePageResponse(emptyList(), false)
         val (lane, base) = request.data.split(":", limit = 2)
         // v31: IMDb section — seed titles from IMDb's horror
         // interest list, each resolved to one card (MovieBox
@@ -725,11 +729,9 @@ class HorrorMoviesProvider : MainAPI() {
             }
             val dataObj = runCatching {
                 JSONObject(text).optJSONObject("data")
-            }.getOrNull()
-            val list = dataObj?.optJSONArray("subjectList")
-            if (list == null) {
-                return newHomePageResponse(emptyList(), false)
-            }
+            }.getOrNull() ?: return newHomePageResponse(emptyList(), false)
+            val list = dataObj.optJSONArray("subjectList")
+                ?: return newHomePageResponse(emptyList(), false)
             if (page <= 1) mbSeenDetailPaths.clear()
             val pager = dataObj.optJSONObject("pager")
             val rawCount = list.length()

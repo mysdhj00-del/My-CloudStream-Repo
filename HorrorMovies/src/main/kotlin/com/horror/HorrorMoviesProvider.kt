@@ -445,6 +445,19 @@ import okhttp3.RequestBody.Companion.toRequestBody
  * is STABLE, it is MovieBox-specific (fetch/region/
  * timing on his line). getMainPage byte-identical.
  *
+ * v30 (2026-11-23, ROLLBACK to the pre-problem home -
+ * his order "ارجع الإضافة الي الإصدار قبل المشكلة"):
+ * the MovieBox home lane was added in v16 (2026-11-15),
+ * so the version before the problem is v15's home: the
+ * 6 HTML lanes (moviz, eg, myc, lar, top, af), NO
+ * MovieBox lane in mainPageOf. v29 (moviz-only) is
+ * superseded UNTESTED. Everything else is kept: parts
+ * row v21, trailer v4, subtitle gear, fail-fast v24.
+ * The MovieBox branch code in getMainPage/load/loadLinks
+ * stays but is unreachable while no lane declares it,
+ * so MovieBox can be restored if its cause is found.
+ * getMainPage byte-identical to v24/v26.
+ *
  * RATING: CloudStream's card type has no rating slot in this app
  * version, so ratings ride the detail page: the plot line opens
  * with «★ التقييم: X/10» wherever the source page provides one
@@ -469,11 +482,20 @@ class HorrorMoviesProvider : MainAPI() {
     private val relayBase = "https://egydead-stremio.onrender.com"
 
     override val mainPage = mainPageOf(
-        // v17: MovieBox FIRST by the user's explicit order.
-        // v23: restored after the v22 test proved the lane was
-        // NOT the re-add crash cause (v22 still exited).
+        // v30 ROLLBACK: the v15 home (before the MovieBox
+        // lane, added in v16) - 6 HTML lanes, no MovieBox.
         "moviz:https://www.moviz.land/tag/%d8%b1%d8%b9%d8%a8/" to
-            "أفلام رعب — موفيز لاند"
+            "أفلام رعب — موفيز لاند",
+        "eg:https://egy.bet/genre/%d8%b1%d8%b9%d8%a8/" to
+            "أفلام رعب — إيجي بست",
+        "myc:https://vid.mycima.cc/categories-cimawbas.php?cat=horror-movies" to
+            "أفلام رعب — ماي سيما",
+        "lar:https://larozatv.com/category/%D8%B1%D8%B9%D8%A8" to
+            "أفلام رعب — لاروز",
+        "top:https://topcinema.film/genre/%D8%B1%D8%B9%D8%A8/" to
+            "أفلام رعب — توب سينما",
+        "af:https://aflamstream.com/category/%D8%A3%D9%81%D9%84%D8%A7%D9%85-%D8%B1%D8%B9%D8%A8-%D9%85%D8%AA%D8%B1%D8%AC%D9%85%D8%A9-%D9%88%D8%AC%D8%AF%D9%8A%D8%AF%D8%A9/" to
+            "أفلام رعب — أفلام ستريم"
     )
 
     private fun cleanHtml(s: String): String =

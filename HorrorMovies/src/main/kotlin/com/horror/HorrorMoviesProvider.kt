@@ -458,6 +458,18 @@ import okhttp3.RequestBody.Companion.toRequestBody
  * so MovieBox can be restored if its cause is found.
  * getMainPage byte-identical to v24/v26.
  *
+ * v33 (2026-11-23, his order «اجعل التمرير الجانبي
+ * idmb كل الصفحات»): the IMDb section's sideways scroll
+ * now shows ALL pages — the whole seed (29 films) is
+ * returned on page 1, hasNext=false, page > 1 empty.
+ * The row is one horizontal list, so every film is
+ * reachable by scrolling right, no need to open the
+ * expanded grid. Tradeoff (accepted): the row takes
+ * longer to fill, because all 29 titles are resolved
+ * live (MovieBox, then FasselHD, then the lanes) before
+ * the row appears — the other sections load in parallel,
+ * so only this row waits.
+ *
  * v32 (2026-11-23, his order «لقسم idmb — نفس باقي
  * الاقسام»): TWO things for the IMDb section, the same
  * as the other sections. (1) SUBTITLE GEAR, three modes
@@ -582,21 +594,18 @@ class HorrorMoviesProvider : MainAPI() {
         val (lane, base) = request.data.split(":", limit = 2)
         // v31: IMDb section — seed titles from IMDb's horror
         // interest list, each resolved LIVE to one card
-        // (MovieBox search first, then the 6 HTML lanes'
-        // search, first hit wins) and deduped by normalized
-        // title. 10 seed titles per page.
+        // (MovieBox search first, then FasselHD, then the 6
+        // HTML lanes' search, first hit wins) and deduped by
+        // normalized title.
+        // v33: the sideways scroll shows ALL pages — the whole
+        // seed on page 1, hasNext=false, page > 1 empty.
         if (lane == "imdb") {
-            val pageSize = 10
-            val start = (page - 1) * pageSize
-            if (start < 0 || start >= imdbHorrorSeed.size) {
+            if (page > 1) {
                 return newHomePageResponse(emptyList(), false)
             }
-            val slice = imdbHorrorSeed.subList(
-                start, minOf(start + pageSize, imdbHorrorSeed.size)
-            )
             val cards = ArrayList<SearchResponse>()
             val seenTitles = HashSet<String>()
-            for ((title, rating) in slice) {
+            for ((title, rating) in imdbHorrorSeed) {
                 if (!seenTitles.add(imdbKey(title))) continue
                 val (url, poster) = runCatching {
                     imdbResolveTitle(title)
@@ -612,7 +621,7 @@ class HorrorMoviesProvider : MainAPI() {
                 listOf(
                     HomePageList(request.name, cards, isHorizontalImages = true)
                 ),
-                start + pageSize < imdbHorrorSeed.size
+                false
             )
         }
         // v17: MovieBox — JSON ranking-list, NOT an HTML page.

@@ -637,20 +637,26 @@ class HorrorMoviesProvider : MainAPI() {
         // SharedPreferences, 14-day TTL — panel majority 3/6;
         // URLs are stable for weeks), getMainPage returns
         // immediately from disk with ZERO network on the
-        // critical path (the only call is the cached-token
-        // mint, instant when warm, one call cold), a
-        // placeholder card for a cache miss whose URL is a
-        // synthetic "imdb-resolve:" token resolved lazily in
-        // load() on tap (one title, 8 s cap), and a
-        // background fill (4 threads, panel majority) for
-        // missing/stale titles only, fired after the row
-        // returns. No coroutines anywhere (CI has none).
+        // critical path, a placeholder card for a cache miss
+        // whose URL is a synthetic "imdb-resolve:" token
+        // resolved lazily in load() on tap (one title, 8 s
+        // cap), and a background fill (4 threads, panel
+        // majority) for missing/stale titles only, fired
+        // after the row returns. No coroutines anywhere (CI
+        // has none).
+        // v37: the 3 s ceiling (his order 2026-11-23 16:39) —
+        // the ONE remaining network call on this path, the
+        // web-token mint, moved to the background fill
+        // (mbWebTokenBlocking, coordinator task), so this
+        // branch is now pure disk + card building and returns
+        // in milliseconds. The row is local; only the app's
+        // own rendering and the poster image loads sit between
+        // the user and the row.
         if (lane == "imdb") {
             if (page > 1) {
                 return newHomePageResponse(emptyList(), false)
             }
             val now = System.currentTimeMillis()
-            val token = runCatching { mbWebToken().first }.getOrNull().orEmpty()
             val toFill = ArrayList<String>()
             val cards = ArrayList<SearchResponse>()
             val seenTitles = HashSet<String>()
@@ -673,7 +679,7 @@ class HorrorMoviesProvider : MainAPI() {
                 }
             }
             if (toFill.isNotEmpty()) {
-                imdbFillBackground(toFill, token)
+                imdbFillBackground(toFill)
             }
             return newHomePageResponse(
                 listOf(
@@ -1170,36 +1176,50 @@ class HorrorMoviesProvider : MainAPI() {
     @Volatile
     private var imdbFillRunning = false
 
-    private fun imdbFillBackground(titles: List<String>, token: String) {
+    /** v37: the fill is now self-contained — it mints the web
+     * token ITSELF on a worker thread (blocking twin) via a
+     * coordinator task, so getMainPage pays ZERO network.
+     * The coordinator occupies one pool thread only while
+     * minting (~0.5 s), then the per-title tasks run on the
+     * pool. A failed mint just means MovieBox is skipped
+     * (blank token) — FasselHD and the lanes still run. */
+    private fun imdbFillBackground(titles: List<String>) {
         if (titles.isEmpty()) return
         synchronized(this) {
             if (imdbFillRunning) return
             imdbFillRunning = true
         }
         val jobs = titles.toList()
-        val remaining = AtomicInteger(jobs.size)
         try {
-            for (title in jobs) {
-                imdbFillPool.execute {
-                    try {
-                        runCatching {
-                            // v36: try the stale entry's source
-                            // first — most re-resolves hit on the
-                            // first request.
-                            val preferred = HorrorImdbCache.get(imdbKey(title))
-                                ?.source?.takeIf { it != "?" }
-                            imdbResolveTitleBlocking(title, token, preferred)?.let { found ->
-                                HorrorImdbCache.put(
-                                    imdbKey(title),
-                                    found.first, found.second, found.third
-                                )
+            imdbFillPool.execute {
+                val token = runCatching { mbWebTokenBlocking() }.getOrNull().orEmpty()
+                val remaining = AtomicInteger(jobs.size)
+                try {
+                    for (title in jobs) {
+                        imdbFillPool.execute {
+                            try {
+                                runCatching {
+                                    // v36: try the stale entry's source
+                                    // first — most re-resolves hit on the
+                                    // first request.
+                                    val preferred = HorrorImdbCache.get(imdbKey(title))
+                                        ?.source?.takeIf { it != "?" }
+                                    imdbResolveTitleBlocking(title, token, preferred)?.let { found ->
+                                        HorrorImdbCache.put(
+                                            imdbKey(title),
+                                            found.first, found.second, found.third
+                                        )
+                                    }
+                                }
+                            } finally {
+                                if (remaining.decrementAndGet() == 0) {
+                                    imdbFillRunning = false
+                                }
                             }
                         }
-                    } finally {
-                        if (remaining.decrementAndGet() == 0) {
-                            imdbFillRunning = false
-                        }
                     }
+                } catch (_: Exception) {
+                    imdbFillRunning = false
                 }
             }
         } catch (_: Exception) {
@@ -3811,6 +3831,61 @@ class HorrorMoviesProvider : MainAPI() {
             mbCachedWebAt = now
         }
         return tok to "web"
+    }
+
+    /** v37: BLOCKING twin of mbTokenFrom — same ranking-list
+     * call, same headers, same token extraction (x-user
+     * header first, then the body token). The suspend version
+     * uses app.get, which a worker thread cannot call; this
+     * one uses raw HttpURLConnection, so the background fill
+     * can mint the web token WITHOUT the home-load path
+     * paying for it. Timeout 8 s (same as the H5 search).
+     * Unsigned headers only — the fill needs the WEB token,
+     * never the signed mobile mint. */
+    private fun mbTokenFromBlocking(
+        url: String,
+        ua: String
+    ): String? {
+        return runCatching {
+            val conn = java.net.URL(url).openConnection()
+                as java.net.HttpURLConnection
+            conn.requestMethod = "GET"
+            conn.connectTimeout = 8000
+            conn.readTimeout = 8000
+            conn.setRequestProperty("User-Agent", ua)
+            conn.setRequestProperty("Accept", "application/json, text/plain, */*")
+            if (conn.responseCode !in 200..299) return@runCatching null
+            val fromHeader = conn.getHeaderField("x-user")
+                ?.let { runCatching { JSONObject(it).optString("token") }.getOrNull() }
+                ?.ifBlank { null }
+            if (!fromHeader.isNullOrBlank()) return@runCatching fromHeader
+            val body = conn.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+            if (body.isBlank()) return@runCatching null
+            val j = runCatching { JSONObject(body) }.getOrNull()
+                ?: return@runCatching null
+            j.optString("token").ifBlank { null }
+                ?: j.optJSONObject("data")?.optString("token")?.ifBlank { null }
+        }.getOrNull()
+    }
+
+    /** v37: BLOCKING twin of mbWebToken — same 1 h in-memory
+     * cache (already @Volatile, shared with the suspend
+     * path), same ranking-list mint. Called by the
+     * background fill's coordinator, never by getMainPage. */
+    private fun mbWebTokenBlocking(): String? {
+        val now = System.currentTimeMillis()
+        val cached = mbCachedWebToken
+        if (cached != null && now - mbCachedWebAt < 3600_000) {
+            return cached
+        }
+        val webUrl = "$mbWebBase/wefeed-h5api-bff/ranking-list/content" +
+            "?id=$mbRankId&page=1&perPage=1"
+        val tok = mbTokenFromBlocking(webUrl, browserUA)
+        if (tok != null) {
+            mbCachedWebToken = tok
+            mbCachedWebAt = now
+        }
+        return tok
     }
 
     private fun mbStreamUrl(s: JSONObject): String? {

@@ -779,8 +779,14 @@ class HorrorMoviesProvider : MainAPI() {
                 for (c in cached.cards) {
                     movieCard(c.title, c.url, c.poster)?.let { cards += it }
                 }
+                // v41: on a TV (leanback) show at most 6 cards per
+                // lane row on the home load — the TV app exits with
+                // the full 128-poster burst while the phone is fine.
+                // The IMDb row stays full (24); hasMore stays true
+                // so sideways scroll still loads page 2 live.
+                val shown = if (HorrorEnv.isTv && cards.size > 6) cards.subList(0, 6) else cards
                 return newHomePageResponse(
-                    listOf(HomePageList(request.name, cards, isHorizontalImages = true)),
+                    listOf(HomePageList(request.name, shown, isHorizontalImages = true)),
                     cached.hasMore
                 )
             }

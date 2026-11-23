@@ -458,6 +458,25 @@ import okhttp3.RequestBody.Companion.toRequestBody
  * so MovieBox can be restored if its cause is found.
  * getMainPage byte-identical to v24/v26.
  *
+ * v31 (2026-11-23, NEW "IMDb" section - his order):
+ * the section takes its film list from IMDb's horror
+ * interest page (imdb.com/interest/horror/) and brings
+ * each film from MovieBox and the other sections, ONE
+ * card per film, no duplicates. IMDb answers plain HTTP
+ * with an AWS WAF challenge (HTTP 202), so the provider
+ * cannot fetch the page live - the list is a SEED
+ * extracted 2026-11-23 via the real browser (29 movies;
+ * the page's series are excluded, this addon is movies-
+ * only). At runtime each seed title is resolved LIVE:
+ * MovieBox H5 search first (exact normalized-title
+ * match, latest year wins among remakes), then the 6
+ * HTML lanes' search pages in order, first hit wins;
+ * the card shows the IMDb title + rating ("Title ★ 7.4").
+ * 10 seed titles per page. MovieBox HOME lane stays OUT
+ * (v30 rollback). Risk: v30's verdict is still pending,
+ * and this section makes MovieBox search calls from the
+ * home - if v31 exits, this section is the first suspect.
+ *
  * RATING: CloudStream's card type has no rating slot in this app
  * version, so ratings ride the detail page: the plot line opens
  * with «★ التقييم: X/10» wherever the source page provides one
@@ -484,6 +503,9 @@ class HorrorMoviesProvider : MainAPI() {
     override val mainPage = mainPageOf(
         // v30 ROLLBACK: the v15 home (before the MovieBox
         // lane, added in v16) - 6 HTML lanes, no MovieBox.
+        // v31: IMDb section FIRST (seed list, resolved live).
+        "imdb:imdb" to
+            "IMDb",
         "moviz:https://www.moviz.land/tag/%d8%b1%d8%b9%d8%a8/" to
             "أفلام رعب — موفيز لاند",
         "eg:https://egy.bet/genre/%d8%b1%d8%b9%d8%a8/" to
@@ -529,6 +551,41 @@ class HorrorMoviesProvider : MainAPI() {
         request: MainPageRequest
     ): HomePageResponse {
         val (lane, base) = request.data.split(":", limit = 2)
+        // v31: IMDb section — seed titles from IMDb's horror
+        // interest list, each resolved LIVE to one card
+        // (MovieBox search first, then the 6 HTML lanes'
+        // search, first hit wins) and deduped by normalized
+        // title. 10 seed titles per page.
+        if (lane == "imdb") {
+            val pageSize = 10
+            val start = (page - 1) * pageSize
+            if (start < 0 || start >= imdbHorrorSeed.size) {
+                return newHomePageResponse(emptyList(), false)
+            }
+            val slice = imdbHorrorSeed.subList(
+                start, minOf(start + pageSize, imdbHorrorSeed.size)
+            )
+            val cards = ArrayList<SearchResponse>()
+            val seenTitles = HashSet<String>()
+            for ((title, rating) in slice) {
+                if (!seenTitles.add(imdbKey(title))) continue
+                val (url, poster) = runCatching {
+                    imdbResolveTitle(title)
+                }.getOrNull() ?: continue
+                val display = if (rating.isNotBlank()) {
+                    "$title ★ $rating"
+                } else {
+                    title
+                }
+                movieCard(display, url, poster)?.let { cards += it }
+            }
+            return newHomePageResponse(
+                listOf(
+                    HomePageList(request.name, cards, isHorizontalImages = true)
+                ),
+                start + pageSize < imdbHorrorSeed.size
+            )
+        }
         // v17: MovieBox — JSON ranking-list, NOT an HTML page.
         // Arabic-subtitled ONLY: a film with no Arabic in its
         // subtitles field never becomes a card. Pagination (fixed
@@ -732,6 +789,248 @@ class HorrorMoviesProvider : MainAPI() {
             }
         }
         return out
+    }
+
+    // ---------------------------------------------------------------
+    // v31: IMDb section — seed + resolver
+    // ---------------------------------------------------------------
+    /** v31: IMDb horror seed — the top of IMDb's horror interest
+     * list (https://www.imdb.com/interest/horror/), extracted
+     * 2026-11-23 via the real browser because IMDb answers plain
+     * HTTP with an AWS WAF challenge (HTTP 202). Series on that
+     * list are EXCLUDED (this addon is movies-only): Yellowjackets,
+     * From, Supernatural, Crystal Lake, Stranger Things, The
+     * Walking Dead, Widow's Bay, American Horror Story, The Last
+     * of Us, It: Welcome to Derry, Monster (Netflix series).
+     * "Hopeu" on the page is "Hope" (MovieBox's own ranking list
+     * carries "Hope"). Title to IMDb rating; the card shows the
+     * rating as "Title ★ rating". Refresh the seed when he asks. */
+    private val imdbHorrorSeed = listOf(
+        "The Body" to "7.4",
+        "Obsession" to "7.8",
+        "Resident Evil" to "7.4",
+        "Carrie" to "7.8",
+        "Other Mommy" to "5.3",
+        "Clayface" to "7.5",
+        "Backrooms" to "6.7",
+        "Below" to "6.2",
+        "Insidious: Out of the Further" to "6.0",
+        "Hope" to "6.5",
+        "Buddy" to "6.6",
+        "Weapons" to "7.4",
+        "Sinners" to "7.5",
+        "418" to "7.6",
+        "Teenage Sex and Death at Camp Miasma" to "6.4",
+        "Ggoolalba" to "6.9",
+        "Hokum" to "6.6",
+        "Victorian Psycho" to "6.3",
+        "The Cycle" to "6.3",
+        "Apocalipsis Z: Nuevo Mundo" to "5.1",
+        "The Last House" to "5.5",
+        "Send Help" to "6.7",
+        "X" to "6.5",
+        "Frankenstein" to "7.4",
+        "Gunche" to "6.5",
+        "Dracula: A Love Tale" to "6.2",
+        "The Lighthouse" to "7.3",
+        "The Substance" to "7.2",
+        "Cujo" to "6.1"
+    )
+
+    /** v31: normalized title key for IMDb matching — mbTitleKey
+     * plus a trailing "(year)" and a "★ rating" suffix stripped,
+     * so "Weapons (2025)" and "Weapons ★ 7.4" both key as
+     * "weapons". Exact-key equality only: the MovieBox search is
+     * fuzzy ("The Conjuring" also returns The Nun II), so a
+     * startsWith match would resolve the wrong film. */
+    private fun imdbKey(t: String): String {
+        var s = t.trim()
+        s = Regex("""\(\d{4}\)\s*$""").replace(s, "").trim()
+        s = s.substringBefore("★").trim()
+        return mbTitleKey(s)
+    }
+
+    /** v31: MovieBox H5 search for one IMDb title. Exact
+     * normalized-title match only; among several years (remakes)
+     * the latest release wins (the IMDb list is current). The
+     * web token is cached 1 h by mbWebToken(), so per-title
+     * calls are cheap. Returns the detail URL + poster, or null. */
+    private suspend fun imdbSearchMovieBox(
+        title: String
+    ): Pair<String, String?>? {
+        val token = runCatching { mbWebToken().first }.getOrNull().orEmpty()
+        if (token.isBlank()) return null
+        val body = JSONObject().apply {
+            put("keyword", title)
+            put("page", 1)
+            put("perPage", 20)
+            put("subjectType", 1)
+        }.toString()
+        val res = runCatching {
+            app.post(
+                "$mbWebBase/wefeed-h5api-bff/subject/search",
+                headers = mapOf(
+                    "User-Agent" to browserUA,
+                    "Accept" to "application/json",
+                    "Content-Type" to "application/json",
+                    "Authorization" to "Bearer $token",
+                    "X-MB-Token" to token
+                ),
+                requestBody = body.toRequestBody(
+                    "application/json".toMediaType()
+                )
+            )
+        }.getOrNull() ?: return null
+        if (res.code !in 200..299) return null
+        val items = runCatching {
+            JSONObject(res.text).optJSONObject("data")?.optJSONArray("items")
+        }.getOrNull() ?: return null
+        val seedKey = imdbKey(title)
+        var bestUrl: String? = null
+        var bestPoster: String? = null
+        var bestYear = -1
+        for (i in 0 until items.length()) {
+            val o = items.optJSONObject(i) ?: continue
+            if (o.optInt("subjectType", 1) != 1) continue
+            val t = o.optString("title")
+            if (t.isBlank()) continue
+            if (imdbKey(t) != seedKey) continue
+            val dp = o.optString("detailPath")
+            if (dp.isBlank()) continue
+            val y = mbFranchiseYear(o.optString("releaseDate"))
+            if (y > bestYear) {
+                bestYear = y
+                bestUrl = "$mbWebBase/ar/moviedetail/$dp"
+                bestPoster = o.optJSONObject("cover")?.optString("url")
+                    ?.ifBlank { null }
+                    ?: o.optString("poster").ifBlank { null }
+                    ?: o.optString("coverUrl").ifBlank { null }
+            }
+        }
+        val url = bestUrl ?: return null
+        return url to bestPoster
+    }
+
+    /** v31: one HTML lane's search page for one IMDb title.
+     * Same selectors as search(); the first card whose
+     * normalized title exactly matches the seed wins.
+     * Fail-fast fetch, null on any failure. */
+    private fun imdbSearchLane(
+        lane: String,
+        title: String
+    ): Pair<String, String?>? {
+        val q = java.net.URLEncoder.encode(title, "UTF-8")
+        val url = when (lane) {
+            "moviz" -> "https://www.moviz.land/?s=$q"
+            "eg" -> "https://egy.bet/?s=$q"
+            "myc" -> "https://vid.mycima.cc/search.php?keywords=$q"
+            "lar" -> "https://larozatv.com/search?q=$q"
+            "top" -> "https://topcinema.film/?s=$q"
+            "af" -> "https://aflamstream.com/?s=$q"
+            else -> return null
+        }
+        val html = httpGetTextHeaders(url, homeFetchTimeoutMs, browserHeaders)
+            ?: return null
+        val doc = runCatching { Jsoup.parse(html, url) }.getOrNull()
+            ?: return null
+        val seedKey = imdbKey(title)
+        fun href(a: org.jsoup.nodes.Element): String =
+            a.attr("abs:href").ifBlank { a.attr("href") }
+        val found: Pair<String, String?>? = when (lane) {
+            "moviz" -> doc.select(".search-card").firstNotNullOfOrNull { card ->
+                val a = card.selectFirst("a[href]")
+                    ?: return@firstNotNullOfOrNull null
+                val img = card.selectFirst("img")
+                val t = card.selectFirst(".search-card-title")?.text()
+                    ?: img?.attr("alt") ?: a.attr("aria-label")
+                if (!isMovieTitle(t) || imdbKey(t) != seedKey) {
+                    return@firstNotNullOfOrNull null
+                }
+                href(a) to img?.attr("src")?.ifBlank { null }
+            }
+            "eg" -> doc.select("a.postBlock, a.postBlockCol")
+                .firstNotNullOfOrNull { a ->
+                    val img = a.selectFirst("img")
+                    val poster = img?.attr("data-src")
+                        ?.takeIf { it.isNotBlank() && !it.contains("src-default") }
+                        ?: img?.attr("src")
+                    val t = a.attr("title").ifBlank {
+                        a.selectFirst("h3.title")?.text().orEmpty()
+                    }
+                    if (!isMovieTitle(t) || imdbKey(t) != seedKey) {
+                        return@firstNotNullOfOrNull null
+                    }
+                    href(a) to poster?.ifBlank { null }
+                }
+            "myc" -> doc.select("ul#pm-grid li").firstNotNullOfOrNull { li ->
+                val a = li.selectFirst("a[href*=watch.php]")
+                    ?: return@firstNotNullOfOrNull null
+                val img = li.selectFirst("img")
+                val poster = img?.attr("data-echo")?.ifBlank { null }
+                    ?: img?.attr("src")?.ifBlank { null }
+                val t = a.attr("title")
+                if (!isMovieTitle(t) || imdbKey(t) != seedKey) {
+                    return@firstNotNullOfOrNull null
+                }
+                href(a) to poster
+            }
+            "lar" -> doc.select("article.ay-card").firstNotNullOfOrNull { article ->
+                val a = article.selectFirst("a.ay-card-media")
+                    ?: article.selectFirst("a[href]")
+                    ?: return@firstNotNullOfOrNull null
+                val badge = article.selectFirst(".ay-card-badge")?.text().orEmpty()
+                if (badge.isNotBlank() && !badge.contains("فيلم") &&
+                    !badge.contains("نسخة")
+                ) return@firstNotNullOfOrNull null
+                val t = article.selectFirst(".ay-card-title")?.text()
+                    ?: a.attr("aria-label")
+                if (!isMovieTitle(t) || imdbKey(t) != seedKey) {
+                    return@firstNotNullOfOrNull null
+                }
+                val poster = article.selectFirst("img")?.let {
+                    it.attr("abs:src").ifBlank { it.attr("src") }
+                }?.ifBlank { null }
+                href(a) to poster
+            }
+            "top" -> doc.select("a.recent--block").firstNotNullOfOrNull { a ->
+                val t = a.attr("title")
+                if (!isMovieTitle(t) || imdbKey(t) != seedKey) {
+                    return@firstNotNullOfOrNull null
+                }
+                val img = a.selectFirst("img")
+                val poster = img?.attr("data-src")?.ifBlank { null }
+                    ?: img?.attr("src")?.ifBlank { null }
+                href(a) to poster
+            }
+            "af" -> doc.select("div.ht_grid_1_4").firstNotNullOfOrNull { div ->
+                val a = div.selectFirst("a.thumbnail-link")
+                    ?: return@firstNotNullOfOrNull null
+                val img = div.selectFirst("img")
+                val t = div.selectFirst("h2.entry-title a")?.text().orEmpty()
+                if (!isMovieTitle(t) || imdbKey(t) != seedKey) {
+                    return@firstNotNullOfOrNull null
+                }
+                href(a) to img?.attr("src")?.ifBlank { null }
+            }
+            else -> null
+        }
+        val (u, p) = found ?: return null
+        if (u.isBlank()) return null
+        return u to p
+    }
+
+    /** v31: resolve one IMDb title to a playable card — MovieBox
+     * search first, then the 6 HTML lanes in order, first hit
+     * wins. Null when no source has it (the title is skipped). */
+    private suspend fun imdbResolveTitle(
+        title: String
+    ): Pair<String, String?>? {
+        runCatching { imdbSearchMovieBox(title) }.getOrNull()?.let { return it }
+        for (lane in listOf("moviz", "eg", "myc", "lar", "top", "af")) {
+            runCatching { imdbSearchLane(lane, title) }.getOrNull()
+                ?.let { return it }
+        }
+        return null
     }
 
     // ---------------------------------------------------------------

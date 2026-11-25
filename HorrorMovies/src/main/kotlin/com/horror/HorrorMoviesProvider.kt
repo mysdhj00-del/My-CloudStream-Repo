@@ -20,18 +20,8 @@ import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.loadExtractor
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import org.json.JSONObject
-import org.json.JSONArray
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
-import android.util.Base64
-import javax.crypto.Mac
-import javax.crypto.spec.SecretKeySpec
-import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.RequestBody.Companion.toRequestBody
-import java.util.concurrent.Callable
-import java.util.concurrent.Executors
-import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * HorrorMovies (أفلام رعب) — horror movies aggregated from the four
@@ -196,276 +186,6 @@ import java.util.concurrent.atomic.AtomicInteger
  * still get poster only, no YouTube query. DEBUG marker is now
  * "Horror v15·<lane>".
  *
- * v16 (2026-11-15, NEW lane "أفلام رعب — MovieBox", FIRST
- * section by the user's explicit order, Arabic-subtitled ONLY):
- * clean-room reimplementation of the MovieBoxProvider v54 (CNC)
- * flow, recovered from its dex — NO code copied, no .cs3
- * redistributed. Catalog = the web ranking-list
- * moviebox.sg/wefeed-h5api-bff/ranking-list/content?id=
- * 8614980535946986176 (verified live p1-6: 17/15/18/18/18/18
- * films; the Arabic filter accepts 2/14/17/17/18/15 = 83 in 6
- * pages). Filter: subtitles field holds comma-separated language
- * names, Arabic as "اَلْعَرَبِيَّةُ" (fully vocalized); normalize
- * (strip diacritics/tatweel, أ/إ/آ→ا, ة→ه, ى→ي) then accept if
- * any name contains "عرب" — verified live on 5 films (Other
- * Mommy, Conjuring: Last Rites, Five Nights at Freddy's, 28
- * Years Later: The Bone Temple accepted; Beware Boiúna English-
- * only excluded). Detail = wefeed-h5api-bff/detail?detailPath=
- * (fields live under data.subject). Playback = guest JWT token
- * (mobile gateway first, web host fallback — the web host grants
- * a real JWT in its x-user header, verified live; the token is
- * accepted by the backend: search 400 "invalid token" -> 200
- * with it) + X-Client-Token + x-tr-signature (HmacMD5 over the
- * canonical string, keys double-base64 from the dex) -> GET
- * {movie-box.co|moviebox.sg}/wefeed-h5api-bff/subject/play ->
- * data.streams[]/dash[]/hls[] (signCookie per stream). Captions
- * via get-ext-captions (Arabic pick) — fail-soft. KNOWN LIMIT
- * (stated plainly): the sandbox is region-blocked (mobile
- * gateway 403 "Service not available in current region"; the
- * play endpoint returns empty streams even with a valid token),
- * so playback is NOT verifiable from here — the original
- * MovieBoxProvider v54 WORKS on the user's phone (his word
- * 2026-11-15 21:44), so the same flow is expected to work
- * on-device; the on-device verdict is his. Apocalypse Z is NOT
- * in the MovieBox ranking p1-6 nor in its H5 search (0 results)
- * at v16 build time — use a listed Arabic-subtitled title
- * (Conjuring: Last Rites, 28 Years Later: The Bone Temple,
- * Other Mommy) for the on-device test. DEBUG marker is now
- * "Horror v16·MovieBox".
- *
- * v17 (2026-11-15, MovieBox rebuilt on the IN flow + pagination
- * fix + franchise parts): the user's on-device verdict on v16
- * was "فيلمين فقط ولا يستغل" (only two films, playback does not
- * work) — page 1 carries only 2 Arabic films and v16's
- * hasNext = rawCount >= 20 stopped the section there; and he
- * ordered "استبداله بهذه" — replace the implementation with
- * MovieBoxIN (CNC v56), which works on his phone. Dex comparison
- * (IN v56 vs v54) proved the playback chain is IDENTICAL between
- * the two (same token fetch, same signing keys, same play
- * endpoint, same emit logic — byte-identical emit code); the
- * differences are only in getMainPage (IN fetches its home tabs
- * dynamically via wefeed-mobile-bff/tab-operating, v54 hardcodes
- * 13 category tabs) and dub handling. So v16's failure is in OUR
- * reimplementation's divergences from the CNC flow, fixed here:
- * (1) the play-call Referer was a relative path
- * "/movies/?id=..." — CNC sends the FULL player-page URL
- * "<playBase>/movies/<detailPath>?id=<subjectId>&type=/movie/
- * detail&detailSe=&detailEp=&lang=en" (proven from the IN dex,
- * loadLinks$1 lines ~110f-1133; v54 identical); (2) detailPath
- * was URL-encoded in the play URL — CNC appends it raw;
- * (3) emitted links carried Referer = the same relative path,
- * no Origin, and the signed cookie under hardcoded "Cookie" —
- * CNC's emit (loadLinks$emitStream$2, lines 780-794) sends for
- * VIDEO links Origin = subDomain, Referer =
- * "<subDomain>/movies/<subPath>?id=...&type=...", the mobile
- * Pixel 9 Chrome 154 UA, and the cookie under the stream's own
- * signHeaderKey (default "X-MB-Token"); non-VIDEO links get
- * {Referer: "https://movie-box.co/", desktop Chrome 154 UA}.
- * Here subDomain = the play base that returned the streams and
- * subPath = detailPath, so the emitted Referer is exactly the
- * player-page URL the backend validated when issuing the
- * streams (judgment call — the dex does not name how CNC
- * derives them; the alternative, stream-URL origin, is noted
- * in v17/NOTES.md). One CNC detail NOT reproduced: a header
- * whose value is {"timezone":"Asia/Calcutta"} (IN dex 113d) —
- * its header NAME could not be recovered from the dex (no
- * timezone header string exists in it) and guessing a name is
- * worse than omitting it. Pagination: hasNext now reads
- * data.pager.hasMore AND stops only when a page brings zero NEW
- * raw items (seen-set by detailPath, cleared on page 1) — a page
- * with zero Arabic cards does NOT end the section. Verified
- * live: 8 pages, 128 raw, 106 Arabic, 106 unique, 0 dupes,
- * hasMore=false on p8. NEW: franchise parts on the film page
- * (his order 2026-11-15 22:18) — load() searches MovieBox for
- * the film's base name and attaches every matching part, sorted
- * by year then part number, Arabic-subtitled only, fail-soft.
- * Verified live: Saw -> 8 parts (2004..2023, X last); The
- * Conjuring -> 2 parts (the 2013/2016 films are not in the
- * MovieBox search index at all); 28 Years Later -> 2 parts.
- * DEBUG marker is now "Horror v17·MovieBox".
- *
- * v18 (2026-11-15, MovieBox Arabic captions): the user's
- * on-device verdict on v17 was "جيد يشتغل moivebox لكن
- * الترجمة غير موجودة" — playback works, subtitles missing.
- * TWO defects, both proven live from the sandbox before any
- * code changed:
- * (1) ROUTE: v17 fetched captions ONLY from the mobile
- * gateway (apig.inmoviebox.com get-ext-captions /
- * get-stream-captions) — 403 "Service not available in
- * current region" from every US IP tested, and the web BFF
- * caption endpoint 403s "invalid region" the same way, while
- * playback (H5 bases) works — so on the user's US network
- * the caption call died silently (fail-soft, no diagnostic).
- * The H5-api-bff caption endpoint
- * (moviebox.sg/wefeed-h5api-bff/subject/caption) answers
- * HTTP 200 from a US IP — NOT region-gated — so it goes
- * FIRST in v18, with the REAL stream id + format from the
- * play response (id=subjectId alone returns an empty
- * captions array; a missing id is a 400 "empty id"). The
- * mobile routes stay as fallback. Detail/play responses
- * carry NO captions (only the subtitles language-name list
- * and an empty resource object).
- * (2) FIELDS: v17's pick checked `language` == "ar"/"ara"
- * and lanName for "عرب" — but the caption object fields
- * (proven from the CNC IN dex + the CloudX model) are lan
- * (code, e.g. "ar"), lanName (display name, e.g. "Arabic"),
- * url — there is NO "language" field, and lanName is Latin,
- * so neither check could ever match. v18 accepts lan /
- * language == ar|ara, lanName containing "عرب" (normalised)
- * or Latin "arab". The CNC dex emits SubtitleFile with
- * (lang, url) and NO headers, so no headers are passed.
- * NEW: the DEBUG line now carries "sub=ar" or
- * "sub=none:<route>=<code>/..." (e.g. "none:h5=200-empty/
- * mob=403") and is emitted even when playback links exist —
- * a missing subtitle is never silent again. Live caption
- * tests on the 4 films: see v18/NOTES.md.
- * DEBUG marker is now "Horror v18·MovieBox".
- *
- * v19 (2026-11-15, MovieBox dual subtitles «العربية +
- * الإنجليزية»): the user's on-device verdict on v18 was
- * "ظهرات الترجمة في قسم moviesbox أفلام رعب" (Arabic
- * subtitles now show) + his order "اضيف عربي + إنجليزي في
- * نفس الوقت" — add Arabic + English at the same time. The
- * same captions array that returns Arabic returns English
- * too, so mbPickCaptions takes the first of each; when both
- * exist the menu gets TWO entries — «العربية» (raw URL, as
- * in v18) and «العربية + الإنجليزية» (Goojara v20 pattern:
- * the anime-subs relay's /relay/mergesubs?eng=&ara=, which
- * fetches both files and returns one merged VTT — verified
- * live from the sandbox on stored test files: 200, merged
- * VTT carries both languages' cues). The mergesubs URL is
- * verified with one GET before advertising it; if it does
- * not serve, the fallback merges locally on the phone's
- * network (which reaches MovieBox) — tolerant VTT/SRT cue
- * parser + overlap merge (Arabic line first, English
- * second) + /relay/store hosting. One side only -> that
- * side alone ("ar" / "en"); both sides but no dual file
- * -> "ar+mf" (Arabic single still emitted). DEBUG: "ar+en"
- * is now the good outcome — the line is emitted whenever
- * the outcome is anything else. The trailer logic in this
- * file is UNTOUCHED in v19 (a separate trailer fix takes
- * HorrorMovies as v20 next). HONEST LIMIT: no real MovieBox
- * caption file was ever retrieved from the sandbox (the
- * play endpoint returns empty streams from a datacenter IP,
- * so no real stream id exists here) — whether the relay can
- * fetch MovieBox's actual caption URLs is unproven until
- * his phone tries; the local-merge fallback exists exactly
- * for that case. See v19/NOTES.md.
- * DEBUG marker is now "Horror v19·MovieBox".
- *
- * v22 (2026-11-18, TEST — MovieBox home lane temporarily
- * DISABLED to isolate the re-add crash): Mohamed reported
- * 2026-11-18 that CloudStream exits when HorrorMovies is
- * re-added (delete = app works, re-add v21 = crash; offline
- * test did NOT open it) and suspects the MovieBox section.
- * Change is ONLY the home lane: the MovieBox entry is removed
- * from mainPageOf and getMainPage returns empty for lane
- * "moviebox" if ever called. ALL MovieBox playback code is
- * untouched (load() MovieBox branch, loadLinksMovieBox,
- * mbWebToken/mbGuestToken, franchise parts, tokens,
- * subtitles) — a film already opened via MovieBox still
- * plays. This is a diagnostic test build, not a redesign;
- * the lane returns only when the phone verdict proves it
- * was (or was not) the crash cause.
- *
- * v23 (2026-11-18, RESTORE — MovieBox home lane restored
- * per Mohamed's explicit order «إعادة القسم»): his on-device
- * verdict 2026-11-18 19:38 EET was v22 STILL EXITS, so the
- * lane was NOT the crash cause. The MovieBox entry is back
- * FIRST in mainPageOf (his standing 2026-11-15 order) and
- * the getMainPage moviebox branch is restored to the v21
- * form. This version does NOT claim to fix the exit crash;
- * the crash cause is still undecided and investigation
- * continues after the restore.
- *
- * v24 (2026-11-19, FAIL-FAST — per-lane 10s load timeout,
- * NO deletions): Mohamed's diagnosis 2026-11-19 00:58 EET
- * is slow loading — the home waits for loading and the page
- * never loads («بطء التحميل هو السبب يعني ينتظر تحميل ولا
- * تتحمل الصفحة») — and he ordered «لا تحدف شي» (delete
- * nothing). getMainPage used unbounded app.get for every
- * lane, so one slow/hung site could hang the whole home and
- * the app exits. Every home fetch now goes through the
- * HttpURLConnection helper with a 10 s connect+read timeout
- * (same pattern as the existing httpGetText): a slow lane
- * returns empty quickly instead of hanging home. ALL 7 lanes
- * stay, MovieBox FIRST, no lane/extension/code deleted.
- *
- * v25 (2026-11-20, DIAGNOSTIC - empty home): v24 still
- * exits on the phone (older CloudStream, only our repo), so
- * the crash was NOT slow loading, NOT the MovieBox lane,
- * NOT the app version, NOT a repo mix. getMainPage returned
- * EMPTY (no sections, no fetches). Verdict 2026-11-22:
- * Mohamed deleted EVERYTHING, added HorrorMovies alone
- * (v25, current published) - the app is STABLE, does not
- * exit. So the addon itself (dex/init) is NOT the crash
- * cause; the crash is in a lane's data/fetch, or in
- * interaction with other addons, or in stored data.
- *
- * v26 (2026-11-22, RESTORE - all 7 lanes back, v24 home
- * code byte-identical): v25 proved the empty home opens.
- * This build restores the full v24 getMainPage (MovieBox
- * FIRST, per-lane 10 s fail-fast, all 7 lanes) to test the
- * next branch: if v26 opens alone, the lanes are exonerated
- * and the crash was other addons / stored data; if v26
- * exits alone, a lane's data is the cause and lanes are
- * bisected one at a time next. No other change vs v25.
- *
- * v27 (2026-11-22, BISECT 1/2 - first 3 lanes only):
- * v26 (all 7 lanes) EXITS on the phone on a clean slate
- * (only HorrorMovies, fresh data), while v25 (empty home)
- * was STABLE - so the crash is in a lane's data/fetch.
- * This build declares ONLY moviebox + moviz + eg in
- * mainPageOf (the other 4 lanes are not fetched at all);
- * getMainPage code is byte-identical to v24/v26. If v27
- * EXITS, the culprit is in these 3 lanes; if v27 is
- * STABLE, it is in myc / lar / top / af. Next build
- * splits the guilty half again.
- *
- * v28 (2026-11-22, MOVIEBOX-ONLY - direct test of his
- * claim): Mohamed 2026-11-22 19:07: "لا هذه المشكلة
- * ظهرت بعد قسم moivebox" - the crash appeared AFTER the
- * MovieBox section was added (v17 introduced the lane).
- * This build declares ONLY moviebox in mainPageOf; v27
- * (moviebox+moviz+eg) is superseded untested. If v28
- * EXITS alone, the MovieBox lane is the cause (then the
- * bad card/data inside it is hunted next: perPage cap
- * or first-half/second-half of its 20 cards). If v28 is
- * STABLE alone, the crash needs MovieBox + another lane,
- * or the timeline points to a data change, and v27's set
- * is tested next. getMainPage byte-identical to v24/v26.
- *
- * v29 (2026-11-22, MOVIZ-ONLY - is it MovieBox-specific
- * or any section?): v28 (MovieBox alone) EXITS, but the
- * live MovieBox list is CLEAN - 17 films, all normal
- * titles/posters/detailPaths, 17/17 Arabic after the
- * diacritic-strip normalizer (the raw "0 Arabic" count
- * was my error: subtitles carry tashkeel). The one 404
- * poster (Obsession) was transient CDN propagation -
- * it returns 200 now. So no bad card is visible in the
- * sandbox region's data. This build declares ONLY the
- * moviz HTML lane: if v29 EXITS too, the crash is in
- * home sections generally (not MovieBox data); if v29
- * is STABLE, it is MovieBox-specific (fetch/region/
- * timing on his line). getMainPage byte-identical.
- *
- * v30 (2026-11-23, ROLLBACK to the pre-problem home -
- * his order "ارجع الإضافة الي الإصدار قبل المشكلة"):
- * the MovieBox home lane was added in v16 (2026-11-15),
- * so the version before the problem is v15's home: the
- * 6 HTML lanes (moviz, eg, myc, lar, top, af), NO
- * MovieBox lane in mainPageOf. v29 (moviz-only) is
- * superseded UNTESTED. Everything else is kept: parts
- * row v21, trailer v4, subtitle gear, fail-fast v24.
- * The MovieBox branch code in getMainPage/load/loadLinks
- * stays but is unreachable while no lane declares it,
- * so MovieBox can be restored if its cause is found.
- * getMainPage byte-identical to v24/v26.
- *
- * v46 (2026-11-25, his order): the section added in v31 is removed — seed, resolver,
- * disk cache, tap-resolve and the blocking token twins are all gone. The subtitle gear
- * and FasselHD playback added in v32 are kept.
- *
  * RATING: CloudStream's card type has no rating slot in this app
  * version, so ratings ride the detail page: the plot line opens
  * with «★ التقييم: X/10» wherever the source page provides one
@@ -490,8 +210,6 @@ class HorrorMoviesProvider : MainAPI() {
     private val relayBase = "https://egydead-stremio.onrender.com"
 
     override val mainPage = mainPageOf(
-        // v30 ROLLBACK: the v15 home (before the MovieBox
-        // lane, added in v16) - 6 HTML lanes, no MovieBox.
         "moviz:https://www.moviz.land/tag/%d8%b1%d8%b9%d8%a8/" to
             "أفلام رعب — موفيز لاند",
         "eg:https://egy.bet/genre/%d8%b1%d8%b9%d8%a8/" to
@@ -537,99 +255,6 @@ class HorrorMoviesProvider : MainAPI() {
         request: MainPageRequest
     ): HomePageResponse {
         val (lane, base) = request.data.split(":", limit = 2)
-        // v17: MovieBox — JSON ranking-list, NOT an HTML page.
-        // Arabic-subtitled ONLY: a film with no Arabic in its
-        // subtitles field never becomes a card. Pagination (fixed
-        // v17 — v16 used rawCount >= 20, but pages return 17/15/18
-        // films, so page 1 gave hasNext=false and the section
-        // stopped at 2 Arabic films): hasNext reads
-        // data.pager.hasMore AND the section stops only when a
-        // page brings zero NEW raw items (seen-set by detailPath,
-        // cleared on page 1) — a page with zero Arabic cards does
-        // NOT end the section, and a clamped past-the-end page
-        // (zero new items) ends it even if hasMore claims true.
-        if (lane == "moviebox") {
-            val url = if (page <= 1) base else "$base&page=$page"
-            // v24: fail-fast 10 s fetch — a slow MovieBox ranking
-            // call returns empty instead of hanging the home.
-            val text = httpGetTextHeaders(url, homeFetchTimeoutMs, mbJsonHeaders)
-            if (text.isNullOrBlank()) {
-                return newHomePageResponse(emptyList(), false)
-            }
-            val dataObj = runCatching {
-                JSONObject(text).optJSONObject("data")
-            }.getOrNull()
-            val list = dataObj?.optJSONArray("subjectList")
-            if (list == null) {
-                return newHomePageResponse(emptyList(), false)
-            }
-            if (page <= 1) mbSeenDetailPaths.clear()
-            val pager = dataObj.optJSONObject("pager")
-            val rawCount = list.length()
-            var rawNew = 0
-            val cards = ArrayList<SearchResponse>()
-            for (i in 0 until rawCount) {
-                val o = list.optJSONObject(i) ?: continue
-                val dp = o.optString("detailPath")
-                if (dp.isBlank()) continue
-                if (!mbSeenDetailPaths.add(dp)) continue
-                rawNew++
-                if (!hasArabicSub(o.optString("subtitles"))) continue
-                val title = o.optString("title")
-                if (title.isBlank()) continue
-                val poster = o.optJSONObject("cover")
-                    ?.optString("url")?.ifBlank { null }
-                movieCard(
-                    title,
-                    "$mbWebBase/ar/moviedetail/$dp",
-                    poster
-                )?.let { cards += it }
-            }
-            val apiHasMore = if (pager != null && pager.has("hasMore")) {
-                pager.optBoolean("hasMore")
-            } else {
-                rawNew > 0
-            }
-            return newHomePageResponse(
-                listOf(
-                    HomePageList(request.name, cards, isHorizontalImages = true)
-                ),
-                apiHasMore && rawNew > 0
-            )
-        }
-        // v38: lane rows come from the persistent cache
-        // (HorrorLaneCache, 24 h TTL) — the app launches ALL
-        // home sections in parallel but AWAITS them all before
-        // rendering (APIRepository.getMainPage: async + await),
-        // so one live lane fetch (4–5 s from the sandbox, the
-        // 10 s timeout on his line) held the instant first row
-        // hostage and the home took exactly 10 s. Now page 1
-        // returns its cached cards immediately (zero network)
-        // and a background refresh re-fetches the page; a stale
-        // entry still shows its cards (better than empty) while
-        // the refresh runs. Only a lane with NO entry at all
-        // returns empty (its refresh fills it for the next
-        // load). Page 2+ is a live fetch — the user scrolling
-        // sideways waits for that page; it is not the home-load
-        // path.
-        if (page <= 1 && lane in listOf("moviz", "eg", "myc", "lar", "top", "af")) {
-            val cached = HorrorLaneCache.get(lane)
-            if (cached != null) {
-                if (System.currentTimeMillis() - cached.at >= HorrorLaneCache.TTL_MS) {
-                    laneRefreshBackground(lane, base)
-                }
-                val cards = ArrayList<SearchResponse>()
-                for (c in cached.cards) {
-                    movieCard(c.title, c.url, c.poster)?.let { cards += it }
-                }
-                return newHomePageResponse(
-                    listOf(HomePageList(request.name, cards, isHorizontalImages = true)),
-                    cached.hasMore
-                )
-            }
-            laneRefreshBackground(lane, base)
-            return newHomePageResponse(emptyList(), false)
-        }
         val url = when (lane) {
             "moviz" -> if (page <= 1) base else base + "page/$page/"
             "eg" -> if (page <= 1) base else base + "page/$page/"
@@ -639,37 +264,16 @@ class HorrorMoviesProvider : MainAPI() {
             "lar" -> if (page <= 1) base else base + "?page=$page"
             else -> base
         }
-        // v24: fail-fast 10 s fetch — a slow site returns empty
-        // instead of hanging the home. Jsoup.parse(html, url)
-        // keeps the base URI so abs:href / abs:src still resolve.
-        val html = httpGetTextHeaders(url, homeFetchTimeoutMs, browserHeaders)
-            ?: return newHomePageResponse(emptyList(), false)
         val doc = runCatching {
-            Jsoup.parse(html, url)
+            app.get(url, headers = browserHeaders).document
         }.getOrNull() ?: return newHomePageResponse(emptyList(), false)
         val cards = when (lane) {
             "moviz", "eg", "myc", "lar", "top", "af" -> parseLaneCards(lane, doc)
             else -> emptyList()
         }
-        // v38: hasNext is shared with the background refresh
-        // (laneHasMore) — one definition, one behaviour.
-        val hasNext = laneHasMore(lane, doc, page)
-        return newHomePageResponse(
-            listOf(HomePageList(request.name, cards, isHorizontalImages = true)),
-            hasNext
-        )
-    }
-
-    /** v38: whether page `page` of a lane has a next page — a
-     * next-page link AND page < last numbered page. Shared by
-     * the live lane branch and the background refresh.
-     * v8: a next-page link alone lies on the last page
-     * (TopCinema p74 still links /page/75/, which is empty) —
-     * hasNext also requires page < last page parsed from the
-     * pagination bar (numbered links only: the » next-arrow
-     * also carries a /page/N+1/ href and would fake a further
-     * last page). */
-    private fun laneHasMore(lane: String, doc: Document, page: Int): Boolean {
+        // v8: a next-page link alone lies on the last page (TopCinema
+        // p74 still links /page/75/, which is empty) — hasNext also
+        // requires page < last page parsed from the pagination bar.
         val nextLink = when (lane) {
             "moviz", "eg", "top", "af" -> doc.select("a[href*=/page/${page + 1}/]").isNotEmpty()
             "myc" -> doc.select("a[href*=page=${page + 1}]").isNotEmpty()
@@ -681,6 +285,10 @@ class HorrorMoviesProvider : MainAPI() {
         val lastPage: Int? = when (lane) {
             "moviz", "eg", "top", "af" -> doc.select("a[href*=/page/]")
                 .mapNotNull { a ->
+                    // Numbered links only: the » next-arrow also
+                    // carries a /page/N+1/ href and would fake a
+                    // further last page (TopCinema p74 links » to
+                    // an empty p75 while the numbers stop at 74).
                     if (a.text().trim().toIntOrNull() == null) {
                         return@mapNotNull null
                     }
@@ -697,56 +305,11 @@ class HorrorMoviesProvider : MainAPI() {
                 }.maxOrNull()
             else -> null
         }
-        return nextLink && (lastPage == null || page < lastPage)
-    }
-
-    private val laneRefreshPool by lazy {
-        Executors.newFixedThreadPool(2)
-    }
-    private val laneRefreshing = HashSet<String>()
-
-    /** v38: background refresh for one lane's home row — fetches
-     * the lane page (10 s timeout; it is background, so a slow
-     * site cannot stall the home), parses it with the same
-     * parseLaneCards, and writes the cards + hasMore to the
-     * persistent cache. A refresh that finds zero cards does
-     * NOT overwrite the cache (a changed markup must not wipe
-     * the row). 2-thread pool (gentle on his 4G); one refresh
-     * per lane at a time (guarded set).
-     * v39: the task waits 2 s before fetching — same reason as
-     * the background fill: the refresh is invisible, so it yields the
-     * bandwidth to the poster images. */
-    private fun laneRefreshBackground(lane: String, base: String) {
-        synchronized(laneRefreshing) {
-            if (!laneRefreshing.add(lane)) return
-        }
-        try {
-            laneRefreshPool.execute {
-                runCatching { Thread.sleep(2000) }
-                try {
-                    runCatching {
-                        val html = httpGetTextHeaders(base, homeFetchTimeoutMs, browserHeaders)
-                        if (!html.isNullOrBlank()) {
-                            val doc = Jsoup.parse(html, base)
-                            val cards = parseLaneCards(lane, doc)
-                            if (cards.isNotEmpty()) {
-                                HorrorLaneCache.put(
-                                    lane,
-                                    cards.map {
-                                        HorrorLaneCache.Card(it.name, it.url, it.posterUrl)
-                                    },
-                                    laneHasMore(lane, doc, 1)
-                                )
-                            }
-                        }
-                    }
-                } finally {
-                    synchronized(laneRefreshing) { laneRefreshing.remove(lane) }
-                }
-            }
-        } catch (_: Exception) {
-            synchronized(laneRefreshing) { laneRefreshing.remove(lane) }
-        }
+        val hasNext = nextLink && (lastPage == null || page < lastPage)
+        return newHomePageResponse(
+            listOf(HomePageList(request.name, cards, isHorizontalImages = true)),
+            hasNext
+        )
     }
 
     private fun parseLaneCards(lane: String, doc: Document): List<SearchResponse> {
@@ -830,132 +393,6 @@ class HorrorMoviesProvider : MainAPI() {
             }
         }
         return out
-    }
-
-    // ---------- v32: FasselHD (panel API, same source as the
-    // FasselHD v13 addon) ----------
-    private val fasApiPrimary = "https://kahitdgku.com/faselhd15/public/api"
-    private val fasConfigUrl = "https://watchit.tn/api_urls.json"
-    private var fasLiveBase: String? = null
-    private var fasConfigTried = false
-    private var fasConfigBase: String? = null
-
-    /** GETs a path on the live FasselHD API base; body or null. */
-    /** v34: fetch the backup-API config once (suspend, on the
-     * calling thread) so the blocking workers never race on
-     * it. Idempotent — a second call is a no-op. */
-    private suspend fun fasWarmConfig() {
-        if (fasConfigTried) return
-        fasConfigTried = true
-        fasConfigBase = runCatching {
-            val cfg = app.get(fasConfigUrl, headers = browserHeaders).text
-            JSONObject(cfg).optString("backupApiUrlNoureddine").trim().trimEnd('/')
-        }.getOrNull()?.ifBlank { null }
-    }
-
-    private suspend fun fasApiGet(path: String): String? {
-        val bases = ArrayList<String>()
-        fasLiveBase?.let { bases += it }
-        if (fasApiPrimary !in bases) bases += fasApiPrimary
-        fasWarmConfig()
-        fasConfigBase?.let { if (it !in bases) bases += it }
-        for (base in bases) {
-            val res = runCatching { app.get("$base/$path", headers = browserHeaders) }.getOrNull()
-            val text = res?.text
-            if (res != null && res.code == 200 && text != null &&
-                (text.startsWith("{") || text.startsWith("["))
-            ) {
-                fasLiveBase = base
-                return text
-            }
-        }
-        return null
-    }
-
-    private suspend fun fasApiJson(path: String): JSONObject? {
-        val text = fasApiGet(path) ?: return null
-        return runCatching { JSONObject(text) }.getOrNull()
-    }
-
-    /** v32: the videos "header" field — a bare URL is the
-     * referer; otherwise "Key: Value|Key: Value" pairs. */
-    private fun fasParseHeaderField(raw: String): Pair<String?, Map<String, String>> {
-        val t = raw.trim()
-        if (t.isBlank()) return null to emptyMap()
-        if (t.startsWith("http")) return t to emptyMap()
-        val extra = LinkedHashMap<String, String>()
-        if (t.contains(":")) {
-            for (part in t.split("|")) {
-                val kv = part.split(":", limit = 2)
-                if (kv.size == 2) {
-                    val k = kv[0].trim()
-                    val v = kv[1].trim()
-                    if (k.isNotBlank() && v.isNotBlank() &&
-                        k.all { it.isLetterOrDigit() || it == '-' }
-                    ) extra[k] = v
-                }
-            }
-        }
-        return null to extra
-    }
-
-    private fun fasIsDirect(url: String): Boolean {
-        val clean = url.substringBefore("?").lowercase()
-        return clean.endsWith(".m3u8") || clean.endsWith(".mp4")
-    }
-
-    /** v32: FasselHD playback — detail -> videos -> stock
-     * extractors; direct .mp4/.m3u8 emitted as-is. The
-     * FasselHD addon's probe/dig/relay phases are NOT ported
-     * — a server no stock extractor handles yields nothing. */
-    private suspend fun loadLinksFassel(
-        data: String,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit,
-        elapsed: () -> Long
-    ): Boolean {
-        val id = Regex("""movie:(\d+)""").find(data)?.groupValues?.get(1)
-        if (id.isNullOrBlank()) {
-            emitDebug(listOf("Horror·Fassel", "id-missing"), callback)
-            return true
-        }
-        val root = fasApiJson("media/detail/$id/1")
-        val videos = root?.optJSONArray("videos")
-        if (videos == null || videos.length() == 0) {
-            emitDebug(listOf("Horror·Fassel", "no-videos"), callback)
-            return true
-        }
-        var emitted = 0
-        val counting: (ExtractorLink) -> Unit = { link ->
-            emitted++
-            callback(link)
-        }
-        for (i in 0 until videos.length()) {
-            if (emitted >= 6 || elapsed() > 25000) break
-            val v = videos.optJSONObject(i) ?: continue
-            val link = v.optString("link")
-            if (link.isBlank()) continue
-            val server = v.optString("server").ifBlank { "FasselHD" }
-            val (ref, _) = fasParseHeaderField(v.optString("header"))
-            val referer = ref ?: "https://fasselhd.com/"
-            if (fasIsDirect(link)) {
-                emitDirectLabeled("FasselHD $server", link, referer, counting)
-            } else {
-                runCatching {
-                    loadExtractor(link, referer, subtitleCallback, counting)
-                }
-            }
-        }
-        if (emitted == 0) {
-            emitDebug(
-                listOf(
-                    "Horror·Fassel", "srv=${videos.length()}",
-                    "ext=0", "t=${elapsed() / 1000}s"
-                ),
-                callback
-            )
-        }
-        return true
     }
 
     // ---------------------------------------------------------------
@@ -1057,15 +494,15 @@ class HorrorMoviesProvider : MainAPI() {
      * Trailer lookup: YouTube search (free, no key) with the desktop
      * UA — the mobile search page returns no parseable results, the
      * desktop page carries ytInitialData with videoId + title runs.
-     * v4 (2026-11-15, user order): trailers in the ORIGINAL language only (dubbed/localized variants skipped).
+     * v3 (2026-11-14, user order): trailers ONLY for Latin titles.
      * An Arabic-only title gets the poster only — no YouTube query
      * at all. Latin candidates only, valid only if they contain at
      * least one [A-Za-z] letter (digits-only candidates like "2"
      * are NOT titles); a result is accepted only when its title
      * contains a Latin candidate AND a trailer word.
-     * The title page itself is 202-blocked from datacenter IPs, so
-     * the suggestion lookup is used only as a title-id resolver
-     * (the subtitle gear's lookup) — not as a video host. The app shows its
+     * IMDb's own title page is 202-blocked from datacenter IPs, so
+     * IMDb is the title resolver only (the subtitle gear's
+     * resolveImdbId) — not the video host. The app shows its
      * trailer button from LoadResponse.trailers; a missing button
      * means the search found nothing for that title. Returns an
      * empty list on any failure — a missing trailer must never
@@ -1075,16 +512,13 @@ class HorrorMoviesProvider : MainAPI() {
      */
 
 
-    // v4 (2026-11-15, user order): trailers in the ORIGINAL language
-    // only — dubbed/localized variants (French/Polish/Russian/...) are
-    // skipped. v3 rules still hold: an Arabic-only title gets the poster
-    // only — no YouTube query at all; Latin candidates only, valid only
-    // if they contain at least one [A-Za-z] letter. The pick prefers the
-    // exact "official trailer" first, then any trailer/teaser/PV — and
-    // rejects titles carrying dub markers or non-Latin script (Cyrillic/
-    // Arabic/CJK), which are dubs or localized re-uploads, never the
-    // original. No match = no trailer button.
-
+    // v3 (2026-11-14, user order): trailers ONLY for Latin titles.
+    // An Arabic-only title gets the poster only — no YouTube query
+    // at all. A Latin candidate is valid only if it contains at
+    // least one [A-Za-z] letter (digits-only candidates like "2"
+    // are NOT titles). Queries are Latin-only; the pick accepts
+    // only a result whose title contains a Latin candidate AND
+    // a trailer word. No match = no trailer button.
     private suspend fun trailerFor(
         title: String,
         isSeries: Boolean = false,
@@ -1127,9 +561,6 @@ class HorrorMoviesProvider : MainAPI() {
      * lists — the page repeats ids across sections, so global
      * zipping can misalign.
      */
-    // v4 (2026-11-15): the pick skips dubbed/localized results
-    // entirely (see isDubbedTitle / hasNonLatinScript below) and
-    // prefers the exact "official trailer" in a first pass.
     private suspend fun youtubeTrailerId(
         query: String,
         names: List<String>,
@@ -1148,42 +579,7 @@ class HorrorMoviesProvider : MainAPI() {
             val lcNames = names.map { it.lowercase(java.util.Locale.ROOT) }
                 .filter { it.length >= 3 }
             if (lcNames.isEmpty()) return null
-            // Dub / localized markers: a result title carrying one of
-            // these is a dubbed or localized re-upload, never the
-            // original-language trailer. "dub" is a WHOLE WORD only
-            // (word-boundary regex) and "dubbed" is listed separately,
-            // so words like "club" or "Dubai" can never match.
-            // "doblado"/"doppiato" = dubbed in Spanish/Italian;
-            // "vostfr" = French-subtitled version; "oficial"/
-            // "legendado" = Portuguese localized title.
-            val dubbedMarks = listOf(
-                "dubbed", "dubs", "doublé", "doublage", "dublado",
-                "dublagem", "dublat", "doblado", "doppiato", "zwiastun",
-                "bande-annonce", "bande annonce", "trailer officiel",
-                "officiel", "oficial", "polski", "français", "francais",
-                "russian", "русский", "трейлер", "дубляж", "озвучка",
-                "hindi", "tamil", "telugu", "español", "italiano",
-                "deutsch", "português", "türkçe", "legendado", "vostfr",
-                "in french", "in polish", "in russian"
-            )
-            val dubWordRe = Regex("""\bdub\b""")
-            val isDubbedTitle = { t: String ->
-                val lt = t.lowercase(java.util.Locale.ROOT)
-                dubWordRe.containsMatchIn(lt) ||
-                    dubbedMarks.any { lt.contains(it) }
-            }
-            // Non-Latin script in the title = a dub or a localized
-            // re-title, never the original (original-language titles
-            // for our Latin-named films are Latin-script).
-            val hasNonLatinScript = { t: String ->
-                t.any { c ->
-                    (c in '\u0400'..'\u052F') || (c in '\u0600'..'\u06FF') ||
-                    (c in '\u4E00'..'\u9FFF') || (c in '\u3040'..'\u30FF') ||
-                    (c in '\u0590'..'\u05FF')
-                }
-            }
             val seen = HashSet<String>()
-            val cands = ArrayList<Pair<String, String>>()
             for (m in idRe.findAll(html)) {
                 val id = m.groupValues[1]
                 if (!seen.add(id)) continue
@@ -1194,20 +590,9 @@ class HorrorMoviesProvider : MainAPI() {
                     ?: continue
                 val lt = t.lowercase(java.util.Locale.ROOT)
                 if (lcNames.none { lt.contains(it) }) continue
-                if (isDubbedTitle(t)) continue
-                if (hasNonLatinScript(t)) continue
-                cands += id to t
-            }
-            // Pass 1: the exact "official trailer" first.
-            for ((id, t) in cands) {
-                if (t.lowercase(java.util.Locale.ROOT)
-                    .contains("official trailer")) return id
-            }
-            // Pass 2: any trailer / teaser / PV.
-            for ((id, t) in cands) {
-                val lt = t.lowercase(java.util.Locale.ROOT)
-                if (lt.contains("trailer") || lt.contains("teaser") ||
-                    (acceptPv && t.contains("PV"))) return id
+                val isTrailer = lt.contains("trailer") || lt.contains("teaser") ||
+                    (acceptPv && t.contains("PV"))
+                if (isTrailer) return id
             }
             null
         } catch (_: Exception) {
@@ -1318,79 +703,6 @@ class HorrorMoviesProvider : MainAPI() {
                     this.posterUrl = poster
                     this.backgroundPosterUrl = poster
                     this.plot = desc
-                    this.trailers = trailers
-                }
-            }
-            // v17: MovieBox — detail JSON; fields live under
-            // data.subject (NOT data itself). subjectId is packed
-            // into the loadLinks data string (third "|||" part).
-            url.contains("moviebox.sg") || url.contains("movie-box.co") -> {
-                val dp = url.substringAfter("/moviedetail/")
-                    .substringBefore("?").substringBefore("#").trim()
-                val json = runCatching {
-                    app.get(
-                        "$mbWebBase/wefeed-h5api-bff/detail?detailPath=" +
-                            java.net.URLEncoder.encode(dp, "UTF-8"),
-                        headers = mbJsonHeaders
-                    ).text
-                }.getOrNull()
-                val subj = runCatching {
-                    JSONObject(json ?: "").optJSONObject("data")
-                        ?.optJSONObject("subject")
-                }.getOrNull()
-                if (subj == null) return movieFallback(url)
-                val title = subj.optString("title")
-                val poster = subj.optJSONObject("cover")
-                    ?.optString("url")?.ifBlank { null }
-                val desc = subj.optString("description")
-                val genre = subj.optString("genre")
-                val rating = subj.optDouble("imdbRatingValue", -1.0)
-                    .let { if (it >= 0) it.toString() else null }
-                val plot = buildString {
-                    if (rating != null) append("★ التقييم: $rating/10\n")
-                    if (genre.isNotBlank()) append("النوع: $genre\n")
-                    if (desc.isNotBlank()) append(desc)
-                }.ifBlank { null }
-                val subjectId = subj.optString("subjectId")
-                val releaseDate = subj.optString("releaseDate")
-                val trailers = trailerFor(title)
-                // v17: franchise parts — every part of the series,
-                // ordered, on the film's own page (fail-soft; no
-                // row at all when no other part is found).
-                val parts = mbFranchiseParts(
-                    title, dp, releaseDate, poster
-                )
-                newMovieLoadResponse(
-                    title.ifBlank { "MovieBox" }, url, TvType.Movie,
-                    movieBoxData(url, title, subjectId)
-                ) {
-                    this.posterUrl = poster
-                    this.backgroundPosterUrl = poster
-                    this.plot = plot
-                    this.trailers = trailers
-                    if (parts.size > 1) this.recommendations = parts
-                }
-            }
-            // v32: FasselHD — panel API detail; the URL carries
-            // a "movie:<id>" token.
-            url.contains("fasselhd.com") -> {
-                val id = Regex("""movie:(\d+)""").find(url)?.groupValues?.get(1)
-                    ?: return movieFallback(url)
-                val root = fasApiJson("media/detail/$id/1")
-                    ?: return movieFallback(url)
-                val title = cleanMovieTitle(
-                    root.optString("title").ifBlank { root.optString("original_name") }
-                )
-                val poster = root.optString("poster_path").ifBlank { null }
-                val desc = root.optString("overview").ifBlank { null }
-                val year = Regex("""(19|20)\d\d""")
-                    .find(root.optString("release_date"))?.value?.toIntOrNull()
-                val trailers = trailerFor(title)
-                newMovieLoadResponse(title.ifBlank { "فاصل إتش دي" }, url, TvType.Movie, subData(url, title)) {
-                    this.posterUrl = poster
-                    this.backgroundPosterUrl = root.optString("backdrop_path").ifBlank { null }
-                    this.plot = desc
-                    this.year = year
                     this.trailers = trailers
                 }
             }
@@ -1723,12 +1035,10 @@ class HorrorMoviesProvider : MainAPI() {
     ): Boolean {
         val t0 = System.currentTimeMillis()
         fun elapsed() = System.currentTimeMillis() - t0
-        // v32: subtitle gear, three modes (ar/en/dual, default
-        // dual) — OpenSubtitles Arabic + English, merged for
-        // dual. Applies to every film.
+        // Auto English subtitles first (settings switch, default ON).
         val (realData, subTitle, _) = parseSubData(data)
-        if (subTitle.isNotBlank()) {
-            emitSubs(subTitle, subtitleCallback)
+        if (HorrorSubs.autoEnglish && subTitle.isNotBlank()) {
+            emitEnglishSub(subTitle, subtitleCallback)
         }
         return when {
             realData.contains("moviz.land") -> loadLinksMoviz(realData, subtitleCallback, callback, ::elapsed)
@@ -1737,10 +1047,6 @@ class HorrorMoviesProvider : MainAPI() {
             realData.contains("larozatv") -> loadLinksLaRos(realData, subtitleCallback, callback, ::elapsed)
             realData.contains("topcinema") -> loadLinksTop(realData, subtitleCallback, callback, ::elapsed)
             realData.contains("aflamstream") -> loadLinksAf(realData, subtitleCallback, callback, ::elapsed)
-            // v32: FasselHD — the URL carries a "movie:<id>" token.
-            realData.contains("fasselhd.com") -> loadLinksFassel(realData, subtitleCallback, callback, ::elapsed)
-            // v17: MovieBox — full data string (carries subjectId).
-            isMovieBox(realData) -> loadLinksMovieBox(data, subtitleCallback, callback, ::elapsed)
             else -> {
                 emitDebug(listOf("Horror", "unknown-lane"), callback)
                 true
@@ -1895,7 +1201,7 @@ class HorrorMoviesProvider : MainAPI() {
         }
         if (emitted == 0 && allowDebug) {
             emitDebug(
-                listOf("Horror v21·$lane") + diagExtra +
+                listOf("Horror v15·$lane") + diagExtra +
                     listOf("srv=${embeds.size}", "ext=$extOk",
                         "dig=$digOk", "relay=$relayOk", "t=${elapsed() / 1000}s"),
                 callback
@@ -1966,7 +1272,7 @@ class HorrorMoviesProvider : MainAPI() {
     ): Boolean {
         val res = runCatching { app.get(data, headers = browserHeaders) }.getOrNull()
         if (res == null) {
-            emitDebug(listOf("Horror v21·EgyBest", "page-fail"), callback)
+            emitDebug(listOf("Horror v15·EgyBest", "page-fail"), callback)
             return true
         }
         val text = res.text
@@ -2094,7 +1400,7 @@ class HorrorMoviesProvider : MainAPI() {
      * subtitle-plugin type that auto-attaches to other providers'
      * playback, so the tool lives here — inside loadLinks, before
      * any video link is emitted:
-     *   Latin title (+ year) → suggestion lookup (key-free) → title id →
+     *   Latin title (+ year) → IMDb suggest (key-free) → IMDb id →
      *   OpenSubtitles v3 Stremio endpoint (key-free) → first
      *   lang=eng file → subtitleCallback(SubtitleFile("English", url)).
      * The .srt downloads without auth (verified: The Conjuring 2013,
@@ -2102,39 +1408,8 @@ class HorrorMoviesProvider : MainAPI() {
      * Everything is fail-soft and fail-fast (8 s caps): if any step
      * misses, playback continues with zero subtitles — never blocked.
      * Titles with no Latin part (fully Arabic titles) cannot be
-     * resolved by the suggestion lookup and get no subtitle in v4.
+     * resolved by IMDb suggest and get no subtitle in v4.
      */
-    /** v24: per-lane fail-fast timeout for home fetches (10 s).
-     * A slow/hung site must return null quickly instead of
-     * hanging the whole home. Same HttpURLConnection pattern
-     * as httpGetText, but with caller-supplied headers so the
-     * HTML lanes keep their browser headers and the MovieBox
-     * lane keeps its JSON headers. No coroutines — the real
-     * Gradle classpath does not expose them, so plain
-     * HttpURLConnection is used instead. */
-    private val homeFetchTimeoutMs = 10_000
-
-    private fun httpGetTextHeaders(
-        url: String,
-        timeoutMs: Int,
-        headers: Map<String, String>
-    ): String? {
-        return runCatching {
-            val conn = java.net.URL(url).openConnection()
-                as java.net.HttpURLConnection
-            conn.requestMethod = "GET"
-            conn.connectTimeout = timeoutMs
-            conn.readTimeout = timeoutMs
-            for ((k, v) in headers) conn.setRequestProperty(k, v)
-            val stream = if (conn.responseCode in 200..299) {
-                conn.inputStream
-            } else {
-                return@runCatching null
-            }
-            stream.bufferedReader(Charsets.UTF_8).use { it.readText() }
-        }.getOrNull()
-    }
-
     private fun httpGetText(url: String, timeoutMs: Int): String? {
         return runCatching {
             val conn = java.net.URL(url).openConnection()
@@ -2191,52 +1466,11 @@ class HorrorMoviesProvider : MainAPI() {
         return fallback
     }
 
-    /** Best OpenSubtitles file for one language, sync-first ranking. */
-    private fun bestSubFor(arr: JSONArray, lang: String): String? {
-        return rankedSubsFor(arr, lang).firstOrNull()
-    }
-
-    /** All OpenSubtitles files for one language, best score first. */
-    private fun rankedSubsFor(arr: JSONArray, lang: String): List<String> {
-        val scored = ArrayList<Pair<Int, String>>()
-        for (i in 0 until arr.length()) {
-            val o = arr.optJSONObject(i) ?: continue
-            if (o.optString("lang") != lang) continue
-            val u = o.optString("url")
-            if (u.isBlank()) continue
-            var score = 0
-            if (o.optInt("fpsMilli", 0) == 23976) score += 3
-            val fmt = o.optString("releaseFormat")
-            if (fmt == "BluRay" || fmt == "WEB") score += 2
-            if (o.optString("SubEncoding") == "UTF-8") score += 1
-            scored.add(score to u)
-        }
-        return scored.sortedByDescending { it.first }.map { it.second }
-    }
-
-    /** v32: subtitle gear, three modes (HorrorSubs.mode, default
-     * dual) — Title (+year) -> suggestion lookup (key-free) ->
-     * OpenSubtitles. Sync-first ranking (v7): don't take the
-     * first file — a subtitle timed for 25fps on a 23.976fps
-     * stream drifts more and more as the film plays. Prefer
-     * 23.976fps BluRay/WEB UTF-8 files, which match the
-     * standard movie streams best.
-     * - "ar": Arabic only (no English fallback — the mode
-     *   says Arabic; the MovieBox route may still add its
-     *   own Arabic for a MovieBox film).
-     * - "en": English only (the old v6 behaviour).
-     * - "dual": Arabic + the merged Arabic+English (relay
-     *   mergesubs, verified 200+WEBVTT first; local merge
-     *   as fallback — same machinery as the MovieBox dual);
-     *   Arabic only when no English exists, English only
-     *   when no Arabic exists. Playback never waits on
-     *   subtitles. */
-    private suspend fun emitSubs(
+    private suspend fun emitEnglishSub(
         title: String,
         subtitleCallback: (SubtitleFile) -> Unit
-    ): String {
-        val mode = HorrorSubs.mode
-        return runCatching {
+    ) {
+        runCatching {
             val year = Regex("""(19|20)\d\d""").find(title)?.value?.toIntOrNull()
             for (candidate in latinTitleCandidates(title)) {
                 val tt = resolveImdbId(candidate, year) ?: continue
@@ -2247,53 +1481,34 @@ class HorrorMoviesProvider : MainAPI() {
                 val arr = runCatching {
                     JSONObject(json).optJSONArray("subtitles")
                 }.getOrNull() ?: continue
-                val ara = bestSubFor(arr, "ara")
-                val eng = bestSubFor(arr, "eng")
-                return when (mode) {
-                    "ar" -> {
-                        if (ara != null) {
-                            subtitleCallback(SubtitleFile("العربية", ara))
-                            "sub:ar"
-                        } else "sub:no-match"
-                    }
-                    "en" -> {
-                        if (eng != null) {
-                            subtitleCallback(SubtitleFile("English", eng))
-                            "sub:en"
-                        } else "sub:no-match"
-                    }
-                    else -> {
-                        if (eng != null && ara != null) {
-                            val mergeUrl = "$mbSubsRelayBase/relay/mergesubs?eng=" +
-                                java.net.URLEncoder.encode(eng, "UTF-8") +
-                                "&ara=" + java.net.URLEncoder.encode(ara, "UTF-8")
-                            subtitleCallback(SubtitleFile("العربية", ara))
-                            val mergeOk = runCatching {
-                                val r = app.get(mergeUrl)
-                                r.code in 200..299 && r.text.contains("WEBVTT")
-                            }.getOrDefault(false)
-                            if (mergeOk) {
-                                subtitleCallback(SubtitleFile("العربية + الإنجليزية", mergeUrl))
-                                "sub:dual"
-                            } else {
-                                val stored = mbMergeCaptionsLocal(ara, eng)
-                                if (stored != null) {
-                                    subtitleCallback(SubtitleFile("العربية + الإنجليزية", stored))
-                                    "sub:dual"
-                                } else "sub:ar+mf"
-                            }
-                        } else if (ara != null) {
-                            subtitleCallback(SubtitleFile("العربية", ara))
-                            "sub:ar-only"
-                        } else if (eng != null) {
-                            subtitleCallback(SubtitleFile("English", eng))
-                            "sub:en-only"
-                        } else "sub:no-match"
+                // Sync-first ranking (v7): don't take the first eng file.
+                // A subtitle timed for 25fps on a 23.976fps stream drifts
+                // more and more as the film plays — the classic desync.
+                // Prefer 23.976fps BluRay/WEB UTF-8 files, which match
+                // the standard movie streams best.
+                var bestUrl = ""
+                var bestScore = -1
+                for (i in 0 until arr.length()) {
+                    val o = arr.optJSONObject(i) ?: continue
+                    if (o.optString("lang") != "eng") continue
+                    val url = o.optString("url")
+                    if (url.isBlank()) continue
+                    var score = 0
+                    if (o.optInt("fpsMilli", 0) == 23976) score += 3
+                    val fmt = o.optString("releaseFormat")
+                    if (fmt == "BluRay" || fmt == "WEB") score += 2
+                    if (o.optString("SubEncoding") == "UTF-8") score += 1
+                    if (score > bestScore) {
+                        bestScore = score
+                        bestUrl = url
                     }
                 }
+                if (bestUrl.isNotBlank()) {
+                    subtitleCallback(SubtitleFile("English", bestUrl))
+                    return
+                }
             }
-            "sub:no-tt"
-        }.getOrDefault("sub:err")
+        }
     }
 
     /** Packs title (+year, parsed from the title) into a loadLinks data string. */
@@ -2493,1338 +1708,5 @@ class HorrorMoviesProvider : MainAPI() {
             }
         }
         return runChain(embeds.toList(), watchUrl, subtitleCallback, callback, elapsed, "Af")
-    }
-
-    // ---------------------------------------------------------------
-    // MovieBox (v17) — clean-room reimplementation of the
-    // MovieBoxProvider v54 (CNC) flow, recovered from its dex
-    // (see ~/workspace/moviebox-study/NOTES.md). NO code copied,
-    // no .cs3 redistributed. Catalog = web ranking-list (works
-    // anonymously); playback = guest JWT token (mobile gateway
-    // first, web host fallback) + X-Client-Token + x-tr-signature
-    // (HmacMD5 over the canonical string) -> subject/play ->
-    // data.streams[]/dash[]/hls[] (signCookie per stream).
-    // Captions via get-ext-captions (Arabic pick), fail-soft.
-    // KNOWN LIMIT: the sandbox is region-blocked (mobile gateway
-    // 403 "Service not available in current region"; play returns
-    // empty streams even with a valid token), so playback is NOT
-    // verifiable from here — the original v54 WORKS on the user's
-    // phone (his word 2026-11-15 21:44), so the same flow is
-    // expected to work on-device; the on-device verdict is his.
-    // ---------------------------------------------------------------
-    private val mbWebBase = "https://moviebox.sg"
-    private val mbMobileBase = "https://apig.inmoviebox.com"
-    // v19: subtitle relay for the dual Arabic+English merge
-    // (Goojara/ReAnime/AnimeGG pattern) — NOT the dead Render
-    // relayBase above. mergesubs merges two caption URLs
-    // server-side; /relay/store hosts a locally merged VTT.
-    private val mbSubsRelayBase = "https://anime-subs-relay.mysdhj00-del.deno.net"
-    private val mbRankId = "8614980535946986176"
-    private val mbRankCategoryType = "4516404531735022304"
-    private val mbJsonHeaders = mapOf(
-        "User-Agent" to browserUA,
-        "Accept" to "application/json, text/plain, */*"
-    )
-    private val mbUaToken =
-        "com.community.mbox.in/50020042 (Linux; U; Android 16; en_IN; " +
-            "sdk_gphone64_x86_64; Build/BP22.250325.006; Cronet/133.0.6876.3)"
-    private val mbUaPlayChrome =
-        "Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 " +
-            "(KHTML, like Gecko) Chrome/154.0.0.0 Mobile Safari/537.36"
-
-    private fun isMovieBox(url: String): Boolean {
-        val h = hostOf(url)
-        return h == "moviebox.sg" || h.endsWith(".moviebox.sg") ||
-            h == "movie-box.co" || h.endsWith(".movie-box.co")
-    }
-
-    /** v17 Arabic-only filter: normalize each subtitle language
-     * name (strip diacritics/tatweel, أ/إ/آ→ا, ة→ه, ى→ي) and
-     * accept the film if ANY name contains "عرب". Arabic shows
-     * as "اَلْعَرَبِيَّةُ" (fully vocalized) in the subtitles
-     * field — verified live: 33/50 accepted on ranking p1-3. */
-    private fun normalizeArabic(s: String): String {
-        var t = s.replace(Regex("""[\u064B-\u0652\u0670\u0640]"""), "")
-        t = t.replace('أ', 'ا').replace('إ', 'ا').replace('آ', 'ا')
-            .replace('ة', 'ه').replace('ى', 'ي')
-        return t
-    }
-
-    private fun hasArabicSub(subtitles: String?): Boolean {
-        if (subtitles.isNullOrBlank()) return false
-        return subtitles.split(",")
-            .any { normalizeArabic(it.trim()).contains("عرب") }
-    }
-
-    /** v17: seen detailPaths for the MovieBox section (dedup
-     * across sideways-scroll pages; cleared on page 1). */
-    private val mbSeenDetailPaths = HashSet<String>()
-
-    private val mbRoman = mapOf(
-        "I" to 1, "II" to 2, "III" to 3, "IV" to 4, "V" to 5,
-        "VI" to 6, "VII" to 7, "VIII" to 8, "IX" to 9, "X" to 10,
-        "XI" to 11, "XII" to 12, "XIII" to 13
-    )
-
-    /** v17: franchise base name — strip a trailing "(YYYY)",
-     * drop any ": subtitle", drop a trailing "Part/Chapter N",
-     * then drop a trailing part number (digits, roman numeral,
-     * "3D") — only when something remains. "The Conjuring:
-     * Last Rites" -> "The Conjuring"; "Saw X" -> "Saw". */
-    private fun mbFranchiseBase(title: String): String {
-        var t = title.trim()
-        t = Regex("""\(\d{4}\)\s*$""").replace(t, "").trim()
-        t = t.substringBefore(":").trim()
-        t = Regex(
-            """\s+(?:Part|Chapter)\s+([IVXLCDM]+|\d+)\s*$""",
-            RegexOption.IGNORE_CASE
-        ).replace(t, "").trim()
-        val m = Regex("""\s+([IVXLCDM]+|\d+|3D)\s*$""").find(t)
-        if (m != null && t.substring(0, m.range.first).trim().length >= 2) {
-            t = t.substring(0, m.range.first).trim()
-        }
-        return Regex("""\s+""").replace(t, " ").trim()
-    }
-
-    /** v17: part number from the title tail — "Saw X" -> 10,
-     * "Saw II" -> 2, "Final Destination 5" -> 5; 0 when no
-     * number is present ("Saw 3D", "The Conjuring: Last
-     * Rites" — the year still orders those). */
-    private fun mbFranchisePart(title: String): Int {
-        var t = title.trim()
-        t = Regex("""\(\d{4}\)\s*$""").replace(t, "").trim()
-        val m1 = Regex(
-            """(?:Part|Chapter)\s+([IVXLCDM]+|\d+)\s*$""",
-            RegexOption.IGNORE_CASE
-        ).find(t)
-        if (m1 != null) {
-            val g = m1.groupValues[1].uppercase()
-            return mbPartNum(g)
-        }
-        val m2 = Regex("""\s+([IVXLCDM]+|\d+)\s*$""")
-            .find(t.substringBefore(":").trim())
-        if (m2 != null) {
-            val g = m2.groupValues[1].uppercase()
-            return mbPartNum(g)
-        }
-        return 0
-    }
-
-    /** v21: a trailing 4-digit year (1900-2099) is a year, not a
-     * part number ("Godzilla 2000" -> part 0, not 2000). */
-    private fun mbPartNum(g: String): Int {
-        val n = g.toIntOrNull()
-        if (n != null && g.length == 4 && n in 1900..2099) return 0
-        return mbRoman[g] ?: n ?: 0
-    }
-
-    private fun mbFranchiseYear(releaseDate: String?): Int =
-        releaseDate?.take(4)?.toIntOrNull() ?: 0
-
-    /** v21: normalized base key for comparison — lowercase,
-     * commas/brackets/quotes removed, all whitespace removed.
-     * Fixes spacing variants ("The Texas Chain Saw Massacre"
-     * == "The Texas Chainsaw Massacre") and bracket variants
-     * ("[Rec]" == "REC"). Deliberately does NOT strip a
-     * leading "the ": "Conjuring" (the look-alike
-     * "Conjuring: The Beyond") must NOT equal "The Conjuring",
-     * and "Purge" must NOT equal "The Purge". */
-    private fun mbBaseKey(title: String): String {
-        var t = mbFranchiseBase(title).lowercase()
-        t = t.replace(Regex("""[,\[\]()\"'’]"""), "")
-        return Regex("""\s+""").replace(t, "")
-    }
-
-    /** v21: normalized title key for dedup — lowercase, bracketed
-     * suffixes ("[English]", "[HD]") removed, leading "the "
-     * stripped, all whitespace/quotes removed. Unlike mbBaseKey
-     * it keeps the subtitle after the colon, so two different
-     * films of one franchise in one year ("Godzilla: King of
-     * the Monsters" vs "Godzilla: The Planet Eater", 2019) do
-     * NOT collide — while spacing variants ("The Texas Chain
-     * Saw Massacre") and dub variants ("... [English]") do. */
-    private fun mbTitleKey(title: String): String {
-        var t = title.lowercase()
-        t = Regex("""\[[^\]]*\]""").replace(t, "")
-        if (t.trim().startsWith("the ")) t = t.trim().substring(4)
-        t = t.replace(Regex("""[\"'’]"""), "")
-        return Regex("""\s+""").replace(t, "").trim()
-    }
-
-    /** v21: franchise alias groups — renamed sequels that share
-     * NO title words with the franchise name, so no structural
-     * rule can match them. A base belongs to a group if it
-     * equals any member (normalized keys); groups are checked
-     * both ways, so opening a renamed sequel still shows the
-     * rest. Deliberately NOT included: Ju-on (a separate
-     * Japanese series, not The Grudge parts) and the
-     * Conjuring-universe crossovers (Annabelle / The Nun are
-     * their own franchises, not Conjuring parts). */
-    private val mbFranchiseAliases: List<Set<String>> = listOf(
-        setOf("saw", "jigsaw", "spiral"),
-        setOf("child's play", "bride of chucky", "seed of chucky",
-            "curse of chucky", "cult of chucky"),
-        setOf("the texas chainsaw massacre", "texas chainsaw massacre",
-            "leatherface", "texas chainsaw"),
-        setOf("a nightmare on elm street", "nightmare on elm street",
-            "new nightmare", "freddy's dead", "freddy vs. jason"),
-        setOf("friday the 13th", "freddy vs. jason",
-            "jason goes to hell"),
-        setOf("the ring", "rings", "ring"),
-        setOf("28 days later", "28 weeks later", "28 years later"),
-        setOf("godzilla", "shin godzilla", "son of godzilla",
-            "the return of godzilla", "return of godzilla")
-    ).map { g -> g.map { mbBaseKey(it) }.toSet() }
-
-    /** v21: does a candidate title belong to the current film's
-     * franchise? Rules (in order):
-     *  A. exact base match (normalized keys).
-     *  B. prefix subtitle — the candidate's pre-colon title
-     *     starts with the base + a space ("Halloween Kills",
-     *     "Annabelle Comes Home", "Godzilla Minus One",
-     *     "The Ring Two", "Paranormal Activity - Next of Kin").
-     *  C. post-colon franchise — the base of the part after the
-     *     colon equals the current base ("Hellbound: Hellraiser
-     *     II", "Leatherface: Texas Chainsaw Massacre III").
-     *  D. "vs." split — either side's base equals the current
-     *     base ("King Kong vs. Godzilla", "Mothra vs. Godzilla").
-     *  E. alias group (see mbFranchiseAliases).
-     *  F. inverted subtitle — "The <sequence-word> <last word
-     *     of the base>" ("The First Purge", "The Forever
-     *     Purge"); the middle word must be an ordinal/finality
-     *     word so "The Wedding Ring" / "The Christmas Ring" do
-     *     NOT match "The Ring".
-     * Known trade-off (NOTES.md): Rule B can include a few
-     * unrelated same-prefix films ('Halloween Night',
-     * 'Insidious Tales') — a title-only match cannot tell a
-     * sequel from a same-name film, and missing real parts is
-     * the worse failure for his order. The v17 look-alike
-     * exclusions still hold: "Conjuring: The Beyond" and
-     * "The Nun II" do NOT match "The Conjuring". */
-    private fun mbIsFranchisePart(candidate: String, base: String): Boolean {
-        val baseKey = mbBaseKey(base)
-        if (baseKey.length < 2) return false
-        val candBase = mbFranchiseBase(candidate)
-        val candKey = mbBaseKey(candidate)
-        if (candKey == baseKey) return true // A
-        val baseNorm = mbFranchiseBase(base).lowercase()
-        // B: prefix subtitle on the pre-colon title
-        // ("Halloween Kills", "Annabelle Comes Home", "Godzilla
-        // Minus One", "The Ring Two", "Paranormal Activity -
-        // Next of Kin"). Punctuation is first normalized to a
-        // space, so "Godzilla, Mothra and King Ghidorah: ..."
-        // also matches. Gated on a base of 5+ characters so a
-        // 3-letter base like "REC" does not swallow "Rec Man".
-        val preNorm = candidate.substringBefore(":").trim().lowercase()
-            .replace(Regex("""[^a-z0-9]+"""), " ").trim()
-        if (baseKey.length >= 5 && preNorm.startsWith(baseNorm + " ")) return true
-        // C: post-colon franchise — the base of the part after
-        // the colon equals the current base AND the post-colon
-        // part carries a part number or is longer than the base
-        // ("Hellbound: Hellraiser II", "Leatherface: Texas
-        // Chainsaw Massacre III"). The number/length guard keeps
-        // "Final Girl: Halloween" OUT of "The Ring" (a bare
-        // franchise name after the colon is a different film's
-        // subtitle, not a part).
-        val postColon = candidate.substringAfter(":", "").trim()
-        if (postColon.isNotBlank() &&
-            mbBaseKey(postColon) == baseKey &&
-            (mbFranchisePart(postColon) > 0 ||
-                postColon.trim().split(Regex("""\s+""")).size >
-                    baseNorm.trim().split(Regex("""\s+""")).size)
-        ) return true
-        // D: "vs." split.
-        val vsParts = Regex("""\s+vs\.?\s+""", RegexOption.IGNORE_CASE)
-            .split(candidate)
-        if (vsParts.size == 2) {
-            for (side in vsParts) {
-                if (mbBaseKey(side) == baseKey) return true
-                val sideNorm = side.trim().lowercase()
-                    .replace(Regex("""[^a-z0-9]+"""), " ").trim()
-                if (sideNorm.startsWith(baseNorm + " ")) return true
-            }
-        }
-        // E: alias group.
-        for (group in mbFranchiseAliases) {
-            if (baseKey in group && candKey in group) return true
-        }
-        // F: inverted subtitle ("The First Purge").
-        val lastWord = baseNorm.substringAfterLast(" ")
-        if (lastWord.length >= 4) {
-            val candLow = candidate.trim().lowercase()
-            if (candLow.startsWith("the ") &&
-                candLow.endsWith(" $lastWord")
-            ) {
-                val middle = candLow.removePrefix("the ")
-                    .removeSuffix(" $lastWord").trim()
-                if (middle in setOf(
-                        "first", "last", "final", "forever",
-                        "next", "new", "ultimate"
-                    )
-                ) return true
-            }
-        }
-        return false
-    }
-
-    /** v17: franchise parts for a MovieBox film page (his order
-     * 2026-11-15 22:18 — a film with more than one part shows ALL
-     * its parts, ordered). v21: the parts search takes the WEB
-     * token FIRST (MovieBoxIN v10 lesson — H5 search with the
-     * phone's mobile token is suspected to return 400, so the
-     * v17 feature may never have worked on the phone; the
-     * sandbox always tested it with a web token), falls back to
-     * the guest token, and skips the search when no token exists
-     * at all (H5 search without a token is 400, proven live).
-     * When H5 returns 400/empty, a mobile search/v2 fallback
-     * runs (Rennvol pattern — untested live, 403 from the
-     * sandbox). Matching is mbIsFranchisePart (rules A–F), NOT
-     * exact-base-only. The Arabic-subtitles gate is RELAXED for
-     * the parts row ONLY — his order "any film with parts" is
-     * unconditional, and the gate demonstrably dropped real
-     * parts (Saw XI 2025, Godzilla: Final Wars); the MovieBox
-     * lane list stays Arabic-only. Dedup: (normalized title,
-     * year) + (base, year, part) only when part > 0 — the old
-     * (base,year,part) dedup wrongly dropped a second same-year
-     * film with part 0 (Godzilla: The Planet Eater vs King of
-     * the Monsters, 2019; Hellraiser: Deader vs Hellworld,
-     * 2005). Sorted by year then part number, capped at 50
-     * (v17's take(20) dropped the NEWEST parts of long series
-     * like Godzilla). The current film is included in its
-     * sorted position. Fully fail-soft: any failure returns the
-     * current film alone (the caller then shows no
-     * recommendations row). */
-    private suspend fun mbFranchiseParts(
-        title: String,
-        detailPath: String,
-        releaseDate: String?,
-        poster: String?
-    ): List<SearchResponse> {
-        val displayTitle = title.ifBlank { "MovieBox" }
-        val current = movieCard(
-            displayTitle,
-            "$mbWebBase/ar/moviedetail/$detailPath",
-            poster
-        )
-        val base = mbFranchiseBase(displayTitle)
-        if (base.length < 2) return listOfNotNull(current)
-        // v21: WEB token first (H5 search), guest token fallback,
-        // no token at all -> no doomed call.
-        val webToken = runCatching { mbWebToken().first }.getOrNull()
-        val guestToken = if (webToken.isNullOrBlank()) {
-            runCatching { mbGuestToken().first }.getOrNull()
-        } else null
-        val token = webToken ?: guestToken
-            ?: return listOfNotNull(current)
-        val found = ArrayList<Triple<Int, Int, SearchResponse>>()
-        val seenTitleYear = HashSet<String>()
-        val seenBaseYearPart = HashSet<String>()
-        var matched = 0
-        var h5Failed = false
-        fun consider(o: JSONObject) {
-            val t = o.optString("title").ifBlank { o.optString("name") }
-            if (t.isBlank()) return
-            if (o.optInt("subjectType", 1) != 1) return
-            if (!mbIsFranchisePart(t, base)) return
-            val dp = o.optString("detailPath")
-            if (dp.isBlank()) return
-            val y = mbFranchiseYear(o.optString("releaseDate"))
-            val p = mbFranchisePart(t)
-            // v21: normalized-title dedup (spacing/bracket
-            // variants of one listing, e.g. "The Texas Chain Saw
-            // Massacre" vs "The Texas Chainsaw Massacre", and
-            // "[English]" dub variants) + (base, year, part)
-            // only when part > 0 (catches "Saw 11" vs "Saw XI"
-            // without dropping a second same-year film).
-            if (!seenTitleYear.add(mbTitleKey(t) + "|" + y)) return
-            if (p > 0 &&
-                !seenBaseYearPart.add(mbBaseKey(base) + "|" + y + "|" + p)
-            ) return
-            val coverUrl = o.optJSONObject("cover")?.optString("url")
-                ?.ifBlank { null }
-                ?: o.optString("poster").ifBlank { null }
-                ?: o.optString("coverUrl").ifBlank { null }
-            val card = movieCard(
-                t,
-                "$mbWebBase/ar/moviedetail/$dp",
-                coverUrl
-            ) ?: return
-            matched++
-            found += Triple(if (y > 0) y else 9999, p, card)
-        }
-        // The search walk mirrors the verified live behaviour:
-        // pages return 6-16 items each and hasMore turns false
-        // around page 6 even while totalCount reads higher — the
-        // API's reachable window, not our cap, ends the walk.
-        // v21: perPage 50 (proven live: 13 items/page vs ~6 at
-        // perPage 20 for "Final Destination").
-        var page = 1
-        while (page <= 6) {
-            val body = JSONObject().apply {
-                put("keyword", base)
-                put("page", page)
-                put("perPage", 50)
-                put("subjectType", 1)
-            }.toString()
-            val res = runCatching {
-                app.post(
-                    "$mbWebBase/wefeed-h5api-bff/subject/search",
-                    headers = mapOf(
-                        "User-Agent" to browserUA,
-                        "Accept" to "application/json",
-                        "Content-Type" to "application/json",
-                        "Authorization" to "Bearer $token",
-                        "X-MB-Token" to token
-                    ),
-                    requestBody = body.toRequestBody(
-                        "application/json".toMediaType()
-                    )
-                )
-            }.getOrNull()
-            if (res == null) {
-                h5Failed = true
-                break
-            }
-            if (res.code !in 200..299) {
-                h5Failed = true
-                break
-            }
-            val data = runCatching {
-                JSONObject(res.text).optJSONObject("data")
-            }.getOrNull()
-            if (data == null) {
-                h5Failed = true
-                break
-            }
-            val items = data.optJSONArray("items")
-            if (items == null || items.length() == 0) {
-                if (page == 1) h5Failed = true
-                break
-            }
-            for (i in 0 until items.length()) {
-                items.optJSONObject(i)?.let { consider(it) }
-            }
-            val pager = data.optJSONObject("pager")
-            if (pager != null && pager.has("hasMore") &&
-                !pager.optBoolean("hasMore")
-            ) break
-            page++
-        }
-        // v21: mobile search/v2 fallback — only when H5 failed
-        // or matched nothing.
-        if (h5Failed || matched == 0) {
-            runCatching { mbFranchisePartsMobile(base, token, ::consider) }
-        }
-        if (current != null) {
-            val curYear = mbFranchiseYear(releaseDate)
-            val curPart = mbFranchisePart(displayTitle)
-            val k1 = mbTitleKey(displayTitle) + "|" + curYear
-            val k2 = mbBaseKey(base) + "|" + curYear + "|" + curPart
-            if (seenTitleYear.add(k1) &&
-                (curPart <= 0 || seenBaseYearPart.add(k2))
-            ) {
-                found += Triple(
-                    if (curYear > 0) curYear else 9999, curPart, current
-                )
-            }
-        }
-        found.sortWith(
-            compareBy<Triple<Int, Int, SearchResponse>> { it.first }
-                .thenBy { it.second }
-                .thenBy { it.third.name }
-        )
-        return found.map { it.third }.take(50)
-    }
-
-    /** v21: mobile search/v2 fallback for the parts search
-     * (Rennvol pattern — POST subject-api/search/v2, signed
-     * headers with body, Bearer guest token). Response arrays
-     * are merged tolerantly (first non-empty of items /
-     * subjects / subjectList / list / results[].subjects);
-     * cards need a non-blank detailPath (this module's load()
-     * cannot open a subjectId-only card). Pages 1..2 only.
-     * UNTESTED LIVE: the mobile gateway is 403 from the
-     * sandbox, so this path is built from Rennvol's published
-     * code and MovieBoxIN's proven mobile branch — the phone
-     * is the judge. */
-    private suspend fun mbFranchisePartsMobile(
-        keyword: String,
-        token: String,
-        consider: (JSONObject) -> Unit
-    ) {
-        var page = 1
-        while (page <= 2) {
-            val body = JSONObject().apply {
-                put("page", page)
-                put("perPage", 20)
-                put("keyword", keyword)
-            }.toString()
-            val url = "$mbMobileBase/wefeed-mobile-bff/subject-api/search/v2"
-            val headers = mbSignedHeaders(
-                "POST", url, mbUaToken, mbClientInfoToken(),
-                body = body, contentType = "application/json; charset=utf-8"
-            ).toMutableMap()
-            headers["Authorization"] = "Bearer $token"
-            headers["X-MB-Token"] = token
-            val res = runCatching {
-                app.post(
-                    url, headers = headers,
-                    requestBody = body.toRequestBody(
-                        "application/json; charset=utf-8".toMediaType()
-                    )
-                )
-            }.getOrNull() ?: break
-            if (res.code !in 200..299) break
-            val data = runCatching {
-                JSONObject(res.text).optJSONObject("data")
-            }.getOrNull() ?: break
-            val arr = mbFranchiseMobileArray(data) ?: break
-            if (arr.length() == 0) break
-            for (i in 0 until arr.length()) {
-                arr.optJSONObject(i)?.let { consider(it) }
-            }
-            val pager = data.optJSONObject("pager")
-            if (pager != null && pager.has("hasMore") &&
-                !pager.optBoolean("hasMore")
-            ) break
-            page++
-        }
-    }
-
-    /** v21: first non-empty parseable subject array in a mobile
-     * search/v2 response (Rennvol's subjectsOf order). */
-    private fun mbFranchiseMobileArray(data: JSONObject): JSONArray? {
-        for (key in listOf("items", "subjects", "subjectList", "list")) {
-            val arr = data.optJSONArray(key)
-            if (arr != null && arr.length() > 0) return arr
-        }
-        val results = data.optJSONArray("results")
-        if (results != null) {
-            for (i in 0 until results.length()) {
-                val arr = results.optJSONObject(i)?.optJSONArray("subjects")
-                if (arr != null && arr.length() > 0) return arr
-            }
-        }
-        return null
-    }
-
-    /** loadLinks data for MovieBox: url ||| title ||| subjectId. */
-    private fun movieBoxData(url: String, title: String, subjectId: String): String =
-        subData(url, title) + "|||" + subjectId
-
-    // --- v54 auth (protocol constants recovered from the dex) ---
-    private val mbDeviceId: String by lazy {
-        val rnd = java.security.SecureRandom()
-        val bytes = ByteArray(16)
-        rnd.nextBytes(bytes)
-        bytes.joinToString("") { "%02x".format(it.toInt() and 0xFF) }
-    }
-
-    private fun md5Hex(bytes: ByteArray): String {
-        val digest = java.security.MessageDigest.getInstance("MD5")
-            .digest(bytes)
-        return digest.joinToString("") { "%02x".format(it.toInt() and 0xFF) }
-    }
-
-    /** The two HMAC keys, double-base64 as stored in the dex. */
-    private val mbKeyDefaultB64 =
-        "NzZpUmwwN3MweFNOOWpxbUVXQXQ3OUVCSlp1bElRSXNWNjRGWnIyTw=="
-    private val mbKeyAltB64 =
-        "WHFuMm5uTzQxL0w5Mm8xaXVYaFNMSFRiWHZZNFo1Wlo2Mm04bVNMQQ=="
-
-    private fun mbKey(doubleB64: String): ByteArray {
-        val once = Base64.decode(doubleB64, Base64.DEFAULT)
-        val inner = String(once, Charsets.UTF_8).trim()
-        return Base64.decode(inner, Base64.DEFAULT)
-    }
-
-    private fun urlDecode(s: String): String = runCatching {
-        java.net.URLDecoder.decode(s.replace("+", "%2B"), "UTF-8")
-    }.getOrDefault(s)
-
-    /** Canonical string: METHOD\nACCEPT\nCONTENT_TYPE\nBODY_LEN\n
-     * TS\nBODY_HASH\nPATH[?sorted-query] — query keys sorted
-     * alphabetically, each rendered name=value (decoded) joined
-     * with '&'. GET with no body => BODY_LEN and BODY_HASH are
-     * empty strings. */
-    private fun mbCanonical(
-        method: String,
-        url: String,
-        ts: Long,
-        body: String? = null,
-        contentType: String = "application/json"
-    ): String {
-        val qStart = url.indexOf('?')
-        val rawPath = if (qStart >= 0) url.substring(0, qStart) else url
-        val path = Regex("""^[a-z]+://[^/]+""").replace(rawPath, "")
-        val pairs = ArrayList<Pair<String, String>>()
-        if (qStart >= 0) {
-            val query = url.substring(qStart + 1)
-            if (query.isNotBlank()) {
-                for (part in query.split("&")) {
-                    if (part.isEmpty()) continue
-                    val eq = part.indexOf('=')
-                    val k = if (eq >= 0) urlDecode(part.substring(0, eq))
-                    else urlDecode(part)
-                    val v = if (eq >= 0) urlDecode(part.substring(eq + 1))
-                    else ""
-                    pairs += k to v
-                }
-            }
-        }
-        val rendered = StringBuilder()
-        for (k in pairs.map { it.first }.distinct().sorted()) {
-            for ((kk, vv) in pairs) {
-                if (kk == k) {
-                    if (rendered.isNotEmpty()) rendered.append("&")
-                    rendered.append(k).append("=").append(vv)
-                }
-            }
-        }
-        val curl = if (rendered.isEmpty()) path else "$path?$rendered"
-        // v21: body-aware canonical (Rennvol pattern — the
-        // canonical is [method, accept, contentType, bodyLength,
-        // ts, bodyHash, url]; a null body keeps the old empty
-        // slots, so every existing GET caller signs exactly as
-        // before. A POST must pass its body so the gateway's
-        // signature check matches.
-        val bodyBytes = body?.toByteArray(Charsets.UTF_8)
-        val bodyLength = bodyBytes?.size?.toString() ?: ""
-        val bodyHash = if (bodyBytes != null) {
-            md5Hex(bodyBytes.copyOfRange(0, minOf(bodyBytes.size, 102400)))
-        } else ""
-        return listOf(
-            method.uppercase(), "application/json", contentType,
-            bodyLength, ts.toString(), bodyHash, curl
-        ).joinToString("\n")
-    }
-
-    /** X-Client-Token = "<ts>,<md5(reverse(ts))>"; x-tr-signature
-     * = "<ts>|2|<base64(HmacMD5(key, canonical))>". v21: optional
-     * body + contentType for POST signing (mobile search/v2);
-     * GET callers pass neither and sign exactly as before. */
-    private fun mbSignedHeaders(
-        method: String,
-        url: String,
-        ua: String,
-        clientInfo: String,
-        body: String? = null,
-        contentType: String = "application/json"
-    ): Map<String, String> {
-        val ts = System.currentTimeMillis()
-        val xct = "$ts,${md5Hex(ts.toString().reversed().toByteArray(Charsets.UTF_8))}"
-        val canonical = mbCanonical(method, url, ts, body, contentType)
-        val mac = Mac.getInstance("HmacMD5")
-        mac.init(SecretKeySpec(mbKey(mbKeyDefaultB64), "HmacMD5"))
-        val sigBytes = mac.doFinal(canonical.toByteArray(Charsets.UTF_8))
-        val sig = "$ts|2|" + Base64.encodeToString(sigBytes, Base64.NO_WRAP)
-        return mapOf(
-            "User-Agent" to ua,
-            "Accept" to "application/json",
-            "Content-Type" to contentType,
-            "X-Client-Token" to xct,
-            "x-tr-signature" to sig,
-            "X-Client-Info" to clientInfo,
-            "X-Client-Status" to "0"
-        )
-    }
-
-    private fun mbClientInfoToken(): String =
-        "{\"package_name\":\"com.community.mbox.in\",\"version_name\":\"3.0.03.0529.03\"," +
-            "\"version_code\":50020042,\"os\":\"android\",\"os_version\":\"16\"," +
-            "\"device_id\":\"" + mbDeviceId + "\",\"install_store\":\"ps\"," +
-            "\"gaid\":\"d7578036d13336cc\",\"brand\":\"google\",\"model\":\"SM-S918B\"," +
-            "\"system_language\":\"en\",\"net\":\"NETWORK_WIFI\",\"region\":\"IN\"," +
-            "\"timezone\":\"Asia/Calcutta\",\"sp_code\":\"\"}"
-
-    private fun mbClientInfoPlay(): String =
-        "{\"package_name\":\"com.community.mbox.in\",\"version_name\":\"4.0.02.0831.03\"," +
-            "\"version_code\":50020126,\"os\":\"android\",\"os_version\":\"14\"," +
-            "\"install_ch\":\"official\",\"device_id\":\"" + mbDeviceId + "\"," +
-            "\"install_store\":\"official\",\"gaid\":\"1b2212c1-dadf-43c3-a0c8-bd6ce48ae22d\"," +
-            "\"brand\":\"Google\",\"model\":\"Pixel 8\",\"system_language\":\"en\"," +
-            "\"net\":\"NETWORK_WIFI\",\"region\":\"IN\",\"timezone\":\"Asia/Calcutta\"," +
-            "\"sp_code\":\"\",\"X-Play-Mode\":\"1\",\"X-Idle-Data\":\"1\"," +
-            "\"X-Family-Mode\":\"0\",\"X-Content-Mode\":\"0\"}"
-
-    /** Read the guest JWT from one call: the token arrives in the
-     * "x-user" response header (a JSON string with a "token"
-     * field) or, failing that, in the JSON body. */
-    private suspend fun mbTokenFrom(
-        url: String,
-        signed: Boolean,
-        clientInfo: String?,
-        ua: String
-    ): String? {
-        return try {
-            val headers = if (signed && clientInfo != null) {
-                mbSignedHeaders("GET", url, ua, clientInfo)
-            } else {
-                mapOf(
-                    "User-Agent" to ua,
-                    "Accept" to "application/json, text/plain, */*"
-                )
-            }
-            val res = app.get(url, headers = headers)
-            if (res.code !in 200..299) return null
-            val xu = res.headers["x-user"] ?: res.headers["X-User"]
-            val fromHeader = xu?.let {
-                runCatching { JSONObject(it).optString("token") }.getOrNull()
-            }?.ifBlank { null }
-            if (!fromHeader.isNullOrBlank()) return fromHeader
-            val body = res.text
-            if (body.isBlank()) return null
-            val j = runCatching { JSONObject(body) }.getOrNull()
-                ?: return null
-            j.optString("token").ifBlank { null }
-                ?: j.optJSONObject("data")?.optString("token")?.ifBlank { null }
-        } catch (_: Exception) {
-            null
-        }
-    }
-
-    @Volatile
-    private var mbCachedToken: String? = null
-    @Volatile
-    private var mbCachedAt: Long = 0
-
-    /** Guest JWT (valid ~90 days; cached 1 h per session). Mobile
-     * gateway first (v54 order), web host fallback — the web host
-     * grants the same JWT in its x-user header (verified live). */
-    private suspend fun mbGuestToken(): Pair<String?, String> {
-        val now = System.currentTimeMillis()
-        val cached = mbCachedToken
-        if (cached != null && now - mbCachedAt < 3600_000) {
-            return cached to "cached"
-        }
-        val mobUrl = "$mbMobileBase/wefeed-mobile-bff/tab/ranking-list" +
-            "?tabId=0&categoryType=$mbRankCategoryType&page=1&perPage=1"
-        var tok = mbTokenFrom(
-            mobUrl, signed = true,
-            clientInfo = mbClientInfoToken(), ua = mbUaToken
-        )
-        var via = "mob"
-        if (tok == null) {
-            val webUrl = "$mbWebBase/wefeed-h5api-bff/ranking-list/content" +
-                "?id=$mbRankId&page=1&perPage=1"
-            tok = mbTokenFrom(
-                webUrl, signed = false, clientInfo = null, ua = browserUA
-            )
-            via = "web"
-        }
-        if (tok != null) {
-            mbCachedToken = tok
-            mbCachedAt = now
-        }
-        return tok to via
-    }
-
-    @Volatile
-    private var mbCachedWebToken: String? = null
-    @Volatile
-    private var mbCachedWebAt: Long = 0
-
-    /** v21: WEB token, minted from the web host ONLY (mirror of
-     * MovieBoxIN v10's mbWebToken — same ranking-list/content
-     * call, separate 1 h cache). WHY: H5 subject/search is
-     * token-gated and the phone's guest token is a MOBILE token
-     * (mbGuestToken mints mobile-first); the sandbox always
-     * tested H5 search with a web token while the phone always
-     * used a mobile token, and phone search never worked in any
-     * version until v10 switched the H5 branch to web-first
-     * («البحث تحسن»). The parts search takes this token FIRST;
-     * a mobile token against H5 search is suspected to return
-     * 400 «invalid token» (unprovable from the sandbox — the
-     * mobile mint is 403 here; the phone is the judge). */
-    private suspend fun mbWebToken(): Pair<String?, String> {
-        val now = System.currentTimeMillis()
-        val cached = mbCachedWebToken
-        if (cached != null && now - mbCachedWebAt < 3600_000) {
-            return cached to "webcached"
-        }
-        val webUrl = "$mbWebBase/wefeed-h5api-bff/ranking-list/content" +
-            "?id=$mbRankId&page=1&perPage=1"
-        val tok = mbTokenFrom(
-            webUrl, signed = false, clientInfo = null, ua = browserUA
-        )
-        if (tok != null) {
-            mbCachedWebToken = tok
-            mbCachedWebAt = now
-        }
-        return tok to "web"
-    }
-
-    private fun mbStreamUrl(s: JSONObject): String? {
-        val direct = s.optString("url").trim()
-        if (direct.isNotBlank()) return direct
-        val arr = s.optJSONArray("resolutions") ?: return null
-        for (i in 0 until arr.length()) {
-            val u = arr.optJSONObject(i)?.optString("url").orEmpty().trim()
-            if (u.isNotBlank()) return u
-        }
-        return null
-    }
-
-    /** v17: CNC-faithful emit (MovieBoxProviderIN loadLinks$
-     * emitStream$2, lines 780-794 — byte-identical logic in v54's
-     * emitNetStream$2). VIDEO links get Origin + the full
-     * player-page Referer + the mobile Chrome UA + the signed
-     * cookie under the stream's own signHeaderKey (default
-     * "X-MB-Token"); every other type gets {Referer:
-     * "https://movie-box.co/", desktop Chrome 154 UA}.
-     * subDomain = the play base that returned the streams,
-     * subPath = detailPath, so the emitted Referer is exactly the
-     * player-page URL the backend validated for the play call. */
-    private suspend fun emitMovieBoxLink(
-        url: String,
-        label: String,
-        signCookie: String?,
-        signHeaderKey: String?,
-        playBase: String,
-        detailPath: String,
-        subjectId: String,
-        callback: (ExtractorLink) -> Unit
-    ) {
-        val type = when {
-            url.contains(".m3u8") -> ExtractorLinkType.M3U8
-            url.contains(".mpd") -> ExtractorLinkType.DASH
-            else -> ExtractorLinkType.VIDEO
-        }
-        val playerReferer = "$playBase/movies/$detailPath?id=$subjectId" +
-            "&type=/movie/detail&detailSe=&detailEp=&lang=en"
-        val headers: Map<String, String> =
-            if (type != ExtractorLinkType.VIDEO) {
-                mapOf(
-                    "Referer" to "https://movie-box.co/",
-                    "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36"
-                )
-            } else {
-                val m = LinkedHashMap<String, String>()
-                m["Origin"] = playBase
-                m["Referer"] = playerReferer
-                m["User-Agent"] = mbUaPlayChrome
-                if (!signCookie.isNullOrBlank()) {
-                    val key = signHeaderKey?.ifBlank { null } ?: "X-MB-Token"
-                    m[key] = signCookie
-                }
-                m
-            }
-        val quality = when {
-            label.contains("1080") -> Qualities.P1080.value
-            label.contains("720") -> Qualities.P720.value
-            label.contains("480") -> Qualities.P480.value
-            label.contains("360") -> Qualities.P360.value
-            else -> Qualities.Unknown.value
-        }
-        runCatching {
-            callback(
-                newExtractorLink(
-                    name, label, url, type
-                ) {
-                    this.referer = if (type != ExtractorLinkType.VIDEO) {
-                        "https://movie-box.co/"
-                    } else {
-                        playerReferer
-                    }
-                    this.quality = quality
-                    this.headers = headers
-                }
-            )
-        }
-    }
-
-    /** v18: is this caption object an Arabic track? The caption
-     * object fields (proven from the CNC dex + the CloudX model)
-     * are lan (code, e.g. "ar"), lanName (display name, e.g.
-     * "Arabic"), url — there is NO "language" field, which v17
-     * checked (so v17's `language == "ar"` never matched), and
-     * lanName is Latin ("Arabic"), so the "عرب" check on it
-     * never matched either. Accept every plausible form. */
-    private fun mbIsArabicCaption(o: JSONObject): Boolean {
-        val lan = o.optString("lan").lowercase()
-        val lang = o.optString("language").lowercase()
-        if (lan == "ar" || lan == "ara" || lang == "ar" || lang == "ara") return true
-        val lanName = o.optString("lanName")
-        if (normalizeArabic(lanName).contains("عرب")) return true
-        if (lanName.lowercase().contains("arab")) return true
-        return false
-    }
-
-    /** v19: mirror of mbIsArabicCaption for English tracks. */
-    private fun mbIsEnglishCaption(o: JSONObject): Boolean {
-        val lan = o.optString("lan").lowercase()
-        val lang = o.optString("language").lowercase()
-        if (lan == "en" || lan == "eng" || lang == "en" || lang == "eng") return true
-        val lanName = o.optString("lanName")
-        if (lanName.lowercase().contains("english")) return true
-        if (normalizeArabic(lanName).contains("انجليز")) return true
-        return false
-    }
-
-    /** v19: scan one captions array for the FIRST Arabic and the
-     * FIRST English track. Returns (araUrl, engUrl) — either
-     * may be null. Both come from the SAME array (the same
-     * caption call that returns Arabic returns English too). */
-    private fun mbPickCaptions(
-        arr: org.json.JSONArray?
-    ): Pair<String?, String?> {
-        var ara: String? = null
-        var eng: String? = null
-        if (arr == null) return null to null
-        for (i in 0 until arr.length()) {
-            val o = arr.optJSONObject(i) ?: continue
-            val capUrl = o.optString("url")
-            if (capUrl.isBlank()) continue
-            if (ara == null && mbIsArabicCaption(o)) ara = capUrl
-            if (eng == null && mbIsEnglishCaption(o)) eng = capUrl
-            if (ara != null && eng != null) break
-        }
-        return ara to eng
-    }
-
-    // ---- v19 local subtitle merge (fallback when the relay
-    // mergesubs URL does not serve) ----
-    private data class MbSubCue(
-        val startMs: Long,
-        val endMs: Long,
-        val text: String
-    )
-
-    private fun mbSubTsToMs(t: String): Long {
-        val clean = t.trim().replace(',', '.')
-        val parts = clean.split(":")
-        val secParts = parts.last().split(".")
-        val secs = secParts[0].toLongOrNull() ?: 0L
-        val ms = (secParts.getOrNull(1) ?: "0").padEnd(3, '0')
-            .take(3).toLongOrNull() ?: 0L
-        var total = secs * 1000 + ms
-        if (parts.size == 3) total += (parts[0].toLongOrNull() ?: 0L) * 3600000 +
-            (parts[1].toLongOrNull() ?: 0L) * 60000
-        else if (parts.size == 2) total += (parts[0].toLongOrNull() ?: 0L) * 60000
-        return total
-    }
-
-    private fun mbFmtMs(ms: Long): String {
-        val h = ms / 3600000
-        val m = (ms % 3600000) / 60000
-        val s = (ms % 60000) / 1000
-        val r = ms % 1000
-        return "%02d:%02d:%02d.%03d".format(h, m, s, r)
-    }
-
-    /** Tolerant VTT/SRT cue parser (SRT index lines and comma
-     * timestamps are skipped/accepted; HTML tags stripped). */
-    private fun mbParseSubCues(text: String): List<MbSubCue> {
-        val cues = ArrayList<MbSubCue>()
-        val blocks = text.replace("\r\n", "\n").replace("\r", "\n")
-            .split("\n\n")
-        val tsRe = Regex(
-            """(\d{1,2}:\d{2}:\d{2}[.,]\d{1,3}|\d{1,2}:\d{2}[.,]\d{1,3})\s*-->\s*(\d{1,2}:\d{2}:\d{2}[.,]\d{1,3}|\d{1,2}:\d{2}[.,]\d{1,3})"""
-        )
-        for (block in blocks) {
-            val lines = block.lines().map { it.trim() }
-                .filter { it.isNotEmpty() }
-            if (lines.isEmpty()) continue
-            var tsIdx = -1
-            var m: MatchResult? = null
-            for (i in lines.indices) {
-                m = tsRe.find(lines[i])
-                if (m != null) {
-                    tsIdx = i
-                    break
-                }
-            }
-            if (tsIdx < 0 || m == null) continue
-            val startMs = mbSubTsToMs(m.groupValues[1])
-            val endMs = mbSubTsToMs(m.groupValues[2])
-            val cueText = lines.subList(tsIdx + 1, lines.size)
-                .joinToString("\n") { it.replace(Regex("<[^>]*>"), "") }
-                .trim()
-            if (cueText.isEmpty()) continue
-            cues += MbSubCue(startMs, endMs, cueText)
-        }
-        return cues
-    }
-
-    /** Merge Arabic + English cue lists into one dual VTT:
-     * every Arabic cue gains the overlapping English line(s)
-     * underneath it; English cues with no Arabic overlap stay
-     * on their own. Same shape the relay's mergesubs returns
-     * (Arabic line first, English second). */
-    private fun mbBuildDualVTT(
-        araCues: List<MbSubCue>,
-        engCues: List<MbSubCue>
-    ): String {
-        val usedEng = HashSet<Int>()
-        val merged = ArrayList<MbSubCue>()
-        for (a in araCues) {
-            val overlapping = engCues.withIndex()
-                .filter { it.value.startMs < a.endMs && it.value.endMs > a.startMs }
-            val enText = overlapping.joinToString("\n") { it.value.text }
-            overlapping.forEach { usedEng += it.index }
-            val text = if (enText.isEmpty()) a.text else a.text + "\n" + enText
-            merged += MbSubCue(a.startMs, a.endMs, text)
-        }
-        for ((idx, e) in engCues.withIndex()) {
-            if (idx !in usedEng) merged += MbSubCue(e.startMs, e.endMs, e.text)
-        }
-        merged.sortBy { it.startMs }
-        val out = StringBuilder("WEBVTT\n\n")
-        for (c in merged) {
-            out.append(mbFmtMs(c.startMs)).append(" --> ")
-                .append(mbFmtMs(c.endMs)).append("\n")
-                .append(c.text).append("\n\n")
-        }
-        return out.toString()
-    }
-
-    /** Fetch both caption files on the phone's network (which
-     * reaches MovieBox), merge locally and host the result on
-     * the subtitle relay. Returns the stored dual URL, or null
-     * when any step fails. */
-    private suspend fun mbMergeCaptionsLocal(
-        araUrl: String,
-        engUrl: String
-    ): String? {
-        return runCatching {
-            val araText = app.get(araUrl).text
-            val engText = app.get(engUrl).text
-            if (araText.isBlank() || engText.isBlank()) return@runCatching null
-            val araCues = mbParseSubCues(araText)
-            val engCues = mbParseSubCues(engText)
-            if (araCues.isEmpty() || engCues.isEmpty()) return@runCatching null
-            val vtt = mbBuildDualVTT(araCues, engCues)
-            val res = app.post(
-                "$mbSubsRelayBase/relay/store",
-                data = mapOf("vtt" to vtt)
-            )
-            JSONObject(res.text).optString("url").ifEmpty { null }
-        }.getOrNull()
-    }
-
-    /** Emit subtitles from one captions array. Returns the sub
-     * diagnostic: "ar+en" when the dual option was emitted,
-     * "ar" / "en" for a single side, "ar+mf" when both sides
-     * exist but no dual file could be built (merge + local
-     * fallback both failed — the Arabic single is still
-     * emitted), or null when the array holds neither.
-     * Dual = the relay's /relay/mergesubs (Goojara v20 pattern:
-     * it fetches both files and returns one merged VTT),
-     * verified with one GET before advertising it; the local
-     * merge + store above is the fallback. */
-    private suspend fun mbEmitFromArray(
-        arr: org.json.JSONArray?,
-        subtitleCallback: (SubtitleFile) -> Unit
-    ): String? {
-        val (ara, eng) = mbPickCaptions(arr)
-        if (ara == null && eng == null) return null
-        // v32: the subtitle gear mode gates MovieBox captions
-        // too — "ar" emits Arabic only, "en" English only,
-        // "dual" (default) keeps the v19 behaviour below.
-        when (HorrorSubs.mode) {
-            "ar" -> {
-                if (ara != null) {
-                    subtitleCallback(SubtitleFile("العربية", ara))
-                    return "ar"
-                }
-                return null
-            }
-            "en" -> {
-                if (eng != null) {
-                    subtitleCallback(SubtitleFile("English", eng))
-                    return "en"
-                }
-                return null
-            }
-        }
-        if (ara != null) subtitleCallback(SubtitleFile("العربية", ara))
-        if (ara != null && eng != null) {
-            val mergeUrl = "$mbSubsRelayBase/relay/mergesubs?eng=" +
-                java.net.URLEncoder.encode(eng, "UTF-8") +
-                "&ara=" + java.net.URLEncoder.encode(ara, "UTF-8")
-            val mergeOk = runCatching {
-                val r = app.get(mergeUrl)
-                r.code in 200..299 && r.text.contains("WEBVTT")
-            }.getOrDefault(false)
-            if (mergeOk) {
-                subtitleCallback(SubtitleFile("العربية + الإنجليزية", mergeUrl))
-                return "ar+en"
-            }
-            val stored = mbMergeCaptionsLocal(ara, eng)
-            if (stored != null) {
-                subtitleCallback(SubtitleFile("العربية + الإنجليزية", stored))
-                return "ar+en"
-            }
-            return "ar+mf"
-        }
-        if (ara != null) return "ar"
-        subtitleCallback(SubtitleFile("English", eng!!))
-        return "en"
-    }
-
-    /** Captions array from a caption-endpoint body: the mobile
-     * shape (data.extCaptions) or the H5 shape (data.captions),
-     * plus top-level fallbacks. */
-    private fun mbCaptionsArray(
-        json: JSONObject?,
-        vararg keys: String
-    ): org.json.JSONArray? {
-        if (json == null) return null
-        val data = json.optJSONObject("data")
-        for (k in keys) {
-            data?.optJSONArray(k)?.let { return it }
-            json.optJSONArray(k)?.let { return it }
-        }
-        return null
-    }
-
-    /** Captions for a film (v19: Arabic + English dual).
-     * Returns a diagnostic: "ar+en" when the dual option was
-     * emitted, "ar" / "en" for a single side, "ar+mf" when both
-     * sides exist but no dual file could be built, else a
-     * compact "none:<route>=<code>/..." trail (e.g.
-     * "none:h5=200-empty/mob=403").
-     * v18: the v17 routes called ONLY the mobile gateway
-     * (apig.inmoviebox.com) — 403 "Service not available in
-     * current region" from every US IP tested (and the web BFF
-     * caption endpoint 403s "invalid region" the same way), so
-     * on the user's US network the caption call died silently
-     * while playback (H5 bases) worked. The H5-api-bff caption
-     * endpoint (moviebox.sg/wefeed-h5api-bff/subject/caption)
-     * answers HTTP 200 from a US IP — it is NOT region-gated —
-     * so it goes FIRST here, with the REAL stream id + format
-     * from the play response (id=subjectId alone returns an
-     * empty captions array; a missing id is a 400 "empty id").
-     * The mobile routes stay as fallback. The CNC dex emits
-     * SubtitleFile with (lang, url) and NO headers, so no
-     * headers are passed with the caption URL. */
-    private suspend fun mbEmitArabicCaption(
-        subjectId: String,
-        detailPath: String,
-        playBase: String,
-        token: String,
-        h5Caps: List<Pair<String, String>>,
-        streamId: String?,
-        resourceId: String?,
-        subtitleCallback: (SubtitleFile) -> Unit
-    ): String {
-        val trail = ArrayList<String>()
-        // Route H5 first: NOT region-gated (200 from a US IP).
-        for ((sid, fmt) in h5Caps) {
-            val capUrl = "$playBase/wefeed-h5api-bff/subject/caption" +
-                "?format=$fmt&id=$sid&subjectId=$subjectId" +
-                "&detailPath=$detailPath"
-            val headers = mbSignedHeaders(
-                "GET", capUrl, mbUaToken, mbClientInfoToken()
-            ) + mapOf(
-                "Authorization" to "Bearer $token",
-                "X-MB-Token" to token
-            )
-            val res = runCatching { app.get(capUrl, headers = headers) }.getOrNull()
-            val code = res?.code ?: 0
-            if (res == null || code !in 200..299) {
-                trail += "h5=$code"
-                continue
-            }
-            val json = runCatching { JSONObject(res.text) }.getOrNull()
-            val arr = mbCaptionsArray(json, "captions", "extCaptions")
-            if (arr == null || arr.length() == 0) {
-                trail += "h5=$code-empty"
-                continue
-            }
-            mbEmitFromArray(arr, subtitleCallback)?.let { return it }
-            trail += "h5=$code-nocap"
-        }
-        // Route mobile ext-captions (subjectId only).
-        runCatching {
-            val extUrl = "$mbMobileBase/wefeed-mobile-bff/subject-api/" +
-                "get-ext-captions?subjectId=$subjectId"
-            val extHeaders = mbSignedHeaders(
-                "GET", extUrl, mbUaToken, mbClientInfoToken()
-            ) + mapOf(
-                "Authorization" to "Bearer $token",
-                "X-MB-Token" to token
-            )
-            val extRes = app.get(extUrl, headers = extHeaders)
-            trail += "mob=${extRes.code}"
-            if (extRes.code in 200..299) {
-                val extJson = runCatching { JSONObject(extRes.text) }.getOrNull()
-                val arr = mbCaptionsArray(extJson, "extCaptions", "captions")
-                mbEmitFromArray(arr, subtitleCallback)?.let { return it }
-            }
-        }
-        // Route mobile stream-captions (needs stream + resource ids).
-        if (!streamId.isNullOrBlank() && !resourceId.isNullOrBlank()) {
-            runCatching {
-                val streamUrl = "$mbMobileBase/wefeed-mobile-bff/subject-api/" +
-                    "get-stream-captions?subjectId=$subjectId" +
-                    "&streamId=$streamId&episode=0&resourceId=$resourceId"
-                val streamHeaders = mbSignedHeaders(
-                    "GET", streamUrl, mbUaToken, mbClientInfoToken()
-                ) + mapOf(
-                    "Authorization" to "Bearer $token",
-                    "X-MB-Token" to token
-                )
-                val streamRes = app.get(streamUrl, headers = streamHeaders)
-                trail += "mobstr=${streamRes.code}"
-                if (streamRes.code in 200..299) {
-                    val streamJson = runCatching { JSONObject(streamRes.text) }.getOrNull()
-                    val arr = mbCaptionsArray(streamJson, "captions", "extCaptions")
-                    mbEmitFromArray(arr, subtitleCallback)?.let { return it }
-                }
-            }
-        }
-        return "none:" + trail.joinToString("/")
-    }
-
-    private suspend fun loadLinksMovieBox(
-        data: String,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit,
-        elapsed: () -> Long
-    ): Boolean {
-        val parts = data.split("|||")
-        val realData = parts.getOrNull(0) ?: data
-        val subjectId = parts.getOrNull(2).orEmpty()
-        val detailPath = realData.substringAfter("/moviedetail/")
-            .substringBefore("?").substringBefore("#").trim()
-        var streamsFound = 0
-        var emitted = 0
-        var playCode = "?"
-        var tokVia = "none"
-        var streamId: String? = null
-        var resourceId: String? = null
-        var subDiag = "?"
-        val counting: (ExtractorLink) -> Unit = { link ->
-            emitted++
-            callback(link)
-        }
-        if (subjectId.isBlank() || detailPath.isBlank()) {
-            emitDebug(
-                listOf(
-                    "Horror v21·MovieBox", "srv=0", "ext=0", "dig=0",
-                    "relay=0", "t=${elapsed() / 1000}s", "tok=$tokVia",
-                    "play=$playCode", "id-missing"
-                ),
-                callback
-            )
-            return true
-        }
-        val (token, via) = mbGuestToken()
-        tokVia = via
-        if (token != null) {
-            val bases = listOf("https://movie-box.co", "https://moviebox.sg")
-            for (base in bases) {
-                if (emitted > 0 || elapsed() > 20000) break
-                // v17 (IN dex, loadLinks$1 ~110f-1133; v54
-                // identical): the play Referer is the FULL
-                // player-page URL on the SAME base, with the
-                // detailPath in the path — NOT the relative
-                // "/movies/?id=..." v16 sent. detailPath goes
-                // into the play URL RAW (no URL-encoding).
-                val referer = "$base/movies/$detailPath?id=$subjectId" +
-                    "&type=/movie/detail&detailSe=&detailEp=&lang=en"
-                val playUrl = "$base/wefeed-h5api-bff/subject/play" +
-                    "?subjectId=$subjectId&se=0&ep=0" +
-                    "&detailPath=$detailPath" +
-                    "&streamSignType=1" +
-                    "&supportCodecs%5Bhevc%5D=1&supportCodecs%5Bh264%5D=1"
-                val headers = mbSignedHeaders(
-                    "GET", playUrl, mbUaPlayChrome, mbClientInfoPlay()
-                ) + mapOf(
-                    "Referer" to referer,
-                    "Authorization" to "Bearer $token",
-                    "X-MB-Token" to token,
-                    "x-play-mode" to "1",
-                    "x-request-lang" to "en",
-                    "x-vip-restrict" to "0",
-                    "x-no-high-risk-restrict" to "0",
-                    "x-source" to ""
-                )
-                val res = runCatching { app.get(playUrl, headers = headers) }
-                    .getOrNull() ?: continue
-                playCode = res.code.toString()
-                if (res.code !in 200..299) continue
-                val body = res.text
-                if (body.isBlank()) continue
-                val d = runCatching {
-                    JSONObject(body).optJSONObject("data")
-                }.getOrNull() ?: continue
-                resourceId = d.optString("resourceId").ifBlank { null }
-                    ?: resourceId
-                val streamObjs = ArrayList<JSONObject>()
-                for (key in listOf("streams", "dash", "hls")) {
-                    val arr = d.optJSONArray(key) ?: continue
-                    for (i in 0 until arr.length()) {
-                        arr.optJSONObject(i)?.let { streamObjs += it }
-                    }
-                }
-                streamsFound += streamObjs.size
-                if (streamObjs.isNotEmpty()) {
-                    streamId = streamObjs[0].optString("id")
-                        .ifBlank { null } ?: streamId
-                    if (resourceId == null) {
-                        resourceId = streamObjs[0].optString("resourceId")
-                            .ifBlank { null }
-                    }
-                }
-                // v18: H5 caption candidates — (stream id, format)
-                // from the play response, first id per format.
-                val h5Caps = ArrayList<Pair<String, String>>()
-                for (s in streamObjs) {
-                    val sid = s.optString("id")
-                    if (sid.isBlank()) continue
-                    val surl = mbStreamUrl(s) ?: continue
-                    val fmt = when {
-                        surl.contains(".mpd") -> "DASH"
-                        surl.contains(".m3u8") -> "HLS"
-                        else -> "MP4"
-                    }
-                    if (h5Caps.none { it.first == sid }) h5Caps += sid to fmt
-                    if (h5Caps.size >= 3) break
-                }
-                for (s in streamObjs) {
-                    if (emitted >= 6 || elapsed() > 25000) break
-                    val linkUrl = mbStreamUrl(s) ?: continue
-                    val signCookie = s.optString("signCookie")
-                        .ifBlank { null }
-                    val signHeaderKey = s.optString("signHeaderKey")
-                        .ifBlank { null }
-                    val resLabel = s.optString("resolution").ifBlank {
-                        s.optJSONArray("resolutions")
-                            ?.optJSONObject(0)?.optString("resolution")
-                            .orEmpty()
-                    }
-                    val q = Regex("""(2160|1440|1080|720|480|360)""")
-                        .find(resLabel)?.groupValues?.get(1)
-                    val label = "MovieBox" + if (q != null) " ${q}p" else ""
-                    emitMovieBoxLink(
-                        linkUrl, label, signCookie, signHeaderKey,
-                        base, detailPath, subjectId, counting
-                    )
-                }
-                if (emitted > 0) {
-                    subDiag = mbEmitArabicCaption(
-                        subjectId, detailPath, base, token, h5Caps,
-                        streamId, resourceId, subtitleCallback
-                    )
-                    break
-                }
-            }
-        }
-        if (emitted == 0 || subDiag != "ar+en") {
-            // v18: a missing subtitle must never be silent again —
-            // emit the DEBUG line even when playback links exist.
-            emitDebug(
-                listOf(
-                    "Horror v21·MovieBox", "srv=$streamsFound",
-                    "ext=$emitted", "dig=0", "relay=0",
-                    "t=${elapsed() / 1000}s", "tok=$tokVia",
-                    "play=$playCode", "sub=$subDiag"
-                ),
-                callback
-            )
-        }
-        return true
     }
 }

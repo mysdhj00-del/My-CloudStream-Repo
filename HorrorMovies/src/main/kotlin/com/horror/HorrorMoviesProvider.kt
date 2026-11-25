@@ -601,14 +601,8 @@ class HorrorMoviesProvider : MainAPI() {
     private fun movieCard(title: String, url: String, poster: String?): SearchResponse? {
         val name = cleanMovieTitle(title)
         if (name.isBlank() || url.isBlank()) return null
-        // v40: percent-encode non-ASCII in the URL and poster —
-        // lar/af (and the lane search results) carry RAW Arabic
-        // in their slugs/poster paths; a raw non-ASCII URL is
-        // invalid (RFC 3986) and the TV app exits on it, while
-        // the phone tolerates it. encodeNonAsciiUrl is a no-op
-        // for ASCII, so already-encoded URLs are untouched.
-        return newMovieSearchResponse(name, encodeNonAsciiUrl(url) ?: url, TvType.Movie) {
-            this.posterUrl = encodeNonAsciiUrl(poster)
+        return newMovieSearchResponse(name, url, TvType.Movie) {
+            this.posterUrl = poster
         }
     }
 
@@ -715,9 +709,11 @@ class HorrorMoviesProvider : MainAPI() {
             }
             val dataObj = runCatching {
                 JSONObject(text).optJSONObject("data")
-            }.getOrNull() ?: return newHomePageResponse(emptyList(), false)
-            val list = dataObj.optJSONArray("subjectList")
-                ?: return newHomePageResponse(emptyList(), false)
+            }.getOrNull()
+            val list = dataObj?.optJSONArray("subjectList")
+            if (list == null) {
+                return newHomePageResponse(emptyList(), false)
+            }
             if (page <= 1) mbSeenDetailPaths.clear()
             val pager = dataObj.optJSONObject("pager")
             val rawCount = list.length()
@@ -777,14 +773,8 @@ class HorrorMoviesProvider : MainAPI() {
                 for (c in cached.cards) {
                     movieCard(c.title, c.url, c.poster)?.let { cards += it }
                 }
-                // v41: on a TV (leanback) show at most 6 cards per
-                // lane row on the home load — the TV app exits with
-                // the full 128-poster burst while the phone is fine.
-                // The IMDb row stays full (24); hasMore stays true
-                // so sideways scroll still loads page 2 live.
-                val shown = if (HorrorEnv.isTv && cards.size > 6) cards.subList(0, 6) else cards
                 return newHomePageResponse(
-                    listOf(HomePageList(request.name, shown, isHorizontalImages = true)),
+                    listOf(HomePageList(request.name, cards, isHorizontalImages = true)),
                     cached.hasMore
                 )
             }

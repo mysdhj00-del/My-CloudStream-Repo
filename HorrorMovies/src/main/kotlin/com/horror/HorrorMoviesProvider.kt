@@ -462,88 +462,9 @@ import java.util.concurrent.atomic.AtomicInteger
  * so MovieBox can be restored if its cause is found.
  * getMainPage byte-identical to v24/v26.
  *
- * v34 (2026-11-23, his order «لكنه بطيئ اجعله سريع
- * في التحميل»): the v33 all-29-upfront row was slow
- * because the 29 titles resolved SEQUENTIALLY (~30-90s:
- * one MovieBox search each, plus a full 6-lane cascade
- * for titles that miss). Three fixes, all in the IMDb
- * branch: (1) a 1-hour in-memory resolution cache
- * (ConcurrentHashMap, instance fields like the MovieBox
- * token cache) — repeat home loads skip the network
- * entirely; (2) the uncached titles resolve IN PARALLEL
- * on a 10-thread pool — blocking HttpURLConnection twins
- * of the MovieBox/FasselHD searches (no coroutines in
- * this codebase; same Executors pattern as the FasselHD
- * probe pool), the token and the FasselHD config warmed
- * once on the calling thread first so workers never race
- * on them; (3) a 12 s overall deadline — a title that has
- * not resolved by then is skipped this load instead of
- * holding the whole row hostage (retried on the next home
- * load). Lane fetches inside the resolver also drop from
- * a 10 s to a 4 s timeout (imdbSearchLane is only used by
- * the resolver). Results merge back in seed order. First
- * load should now be a few seconds, repeat loads near
- * instant.
- *
- * v33 (2026-11-23, his order «اجعل التمرير الجانبي
- * idmb كل الصفحات»): the IMDb section's sideways scroll
- * now shows ALL pages — the whole seed (29 films) is
- * returned on page 1, hasNext=false, page > 1 empty.
- * The row is one horizontal list, so every film is
- * reachable by scrolling right, no need to open the
- * expanded grid. Tradeoff (accepted): the row takes
- * longer to fill, because all 29 titles are resolved
- * live (MovieBox, then FasselHD, then the lanes) before
- * the row appears — the other sections load in parallel,
- * so only this row waits.
- *
- * v32 (2026-11-23, his order «لقسم idmb — نفس باقي
- * الاقسام»): TWO things for the IMDb section, the same
- * as the other sections. (1) SUBTITLE GEAR, three modes
- * (Goojara/AnimeVerse pattern): «العربية» / «الإنجليزية» /
- * «العربية + الإنجليزية» (default dual), chosen in the
- * settings gear — the old single English on/off switch is
- * replaced (migration: old ON -> dual, old OFF -> ar).
- * OpenSubtitles (key-free, IMDb-id resolved) supplies the
- * Arabic + English files with the same sync-first ranking
- * as before (23.976fps BluRay/WEB UTF-8); dual merges them
- * through the relay mergesubs (verified 200+WEBVTT first)
- * with the local merge as fallback, exactly like the
- * MovieBox dual. MovieBox captions follow the same mode
- * (mbEmitFromArray reads HorrorSubs.mode). The gear is
- * addon-wide, so every section's films get it, IMDb
- * included. (2) FASSELHD as an IMDb-section source:
- * imdbResolveTitle now tries MovieBox, then FasselHD
- * (panel API kahitdgku.com/faselhd15/public/api, search
- * endpoint, exact normalized-title match, movie rows
- * only), then the 6 HTML lanes — first hit wins. A
- * FasselHD-resolved film plays through the new load() +
- * loadLinksFassel branches (detail -> videos -> stock
- * extractors, direct .mp4/.m3u8 emitted as-is; the
- * probe/dig/relay phases of the FasselHD addon are NOT
- * ported — a server no stock extractor handles yields
- * nothing). Verified live 2026-11-23: search «Weapons»
- * returns the 2025 film first (id 29099, the title
- * MovieBox lacks), detail carries 28 video servers.
- *
- * v31 (2026-11-23, NEW "IMDb" section - his order):
- * the section takes its film list from IMDb's horror
- * interest page (imdb.com/interest/horror/) and brings
- * each film from MovieBox and the other sections, ONE
- * card per film, no duplicates. IMDb answers plain HTTP
- * with an AWS WAF challenge (HTTP 202), so the provider
- * cannot fetch the page live - the list is a SEED
- * extracted 2026-11-23 via the real browser (29 movies;
- * the page's series are excluded, this addon is movies-
- * only). At runtime each seed title is resolved LIVE:
- * MovieBox H5 search first (exact normalized-title
- * match, latest year wins among remakes), then the 6
- * HTML lanes' search pages in order, first hit wins;
- * the card shows the IMDb title + rating ("Title ★ 7.4").
- * 10 seed titles per page. MovieBox HOME lane stays OUT
- * (v30 rollback). Risk: v30's verdict is still pending,
- * and this section makes MovieBox search calls from the
- * home - if v31 exits, this section is the first suspect.
+ * v46 (2026-11-25, his order): the section added in v31 is removed — seed, resolver,
+ * disk cache, tap-resolve and the blocking token twins are all gone. The subtitle gear
+ * and FasselHD playback added in v32 are kept.
  *
  * RATING: CloudStream's card type has no rating slot in this app
  * version, so ratings ride the detail page: the plot line opens
@@ -571,9 +492,6 @@ class HorrorMoviesProvider : MainAPI() {
     override val mainPage = mainPageOf(
         // v30 ROLLBACK: the v15 home (before the MovieBox
         // lane, added in v16) - 6 HTML lanes, no MovieBox.
-        // v31: IMDb section FIRST (seed list, resolved live).
-        "imdb:imdb" to
-            "IMDb",
         "moviz:https://www.moviz.land/tag/%d8%b1%d8%b9%d8%a8/" to
             "أفلام رعب — موفيز لاند",
         "eg:https://egy.bet/genre/%d8%b1%d8%b9%d8%a8/" to
@@ -619,75 +537,6 @@ class HorrorMoviesProvider : MainAPI() {
         request: MainPageRequest
     ): HomePageResponse {
         val (lane, base) = request.data.split(":", limit = 2)
-        // v31: IMDb section — seed titles from IMDb's horror
-        // interest list, each resolved to one card (MovieBox
-        // search first, then FasselHD, then the 6 HTML lanes'
-        // search, first hit wins) and deduped by normalized
-        // title.
-        // v33: the sideways scroll shows ALL pages — the whole
-        // seed on page 1, hasNext=false, page > 1 empty.
-        // v35: FAST, panel design (2026-11-23, 6 models on
-        // duck.ai, UNANIMOUS): v34 was still slow because its
-        // in-memory cache died on every close/reopen, so every
-        // test was a cold start — 29 titles x up to 8 searches
-        // (up to 232 requests), 10 threads = ~3 waves gated
-        // by the slowest request, and the 12 s deadline only
-        // truncated the row instead of speeding it. The fix:
-        // a PERSISTENT disk cache (HorrorImdbCache,
-        // SharedPreferences, 14-day TTL — panel majority 3/6;
-        // URLs are stable for weeks), getMainPage returns
-        // immediately from disk with ZERO network on the
-        // critical path, a placeholder card for a cache miss
-        // whose URL is a synthetic "imdb-resolve:" token
-        // resolved lazily in load() on tap (one title, 8 s
-        // cap), and a background fill (4 threads, panel
-        // majority) for missing/stale titles only, fired
-        // after the row returns. No coroutines anywhere (CI
-        // has none).
-        // v37: the 3 s ceiling (his order 2026-11-23 16:39) —
-        // the ONE remaining network call on this path, the
-        // web-token mint, moved to the background fill
-        // (mbWebTokenBlocking, coordinator task), so this
-        // branch is now pure disk + card building and returns
-        // in milliseconds. The row is local; only the app's
-        // own rendering and the poster image loads sit between
-        // the user and the row.
-        if (lane == "imdb") {
-            if (page > 1) {
-                return newHomePageResponse(emptyList(), false)
-            }
-            val now = System.currentTimeMillis()
-            val toFill = ArrayList<String>()
-            val cards = ArrayList<SearchResponse>()
-            val seenTitles = HashSet<String>()
-            for ((title, rating) in imdbHorrorSeed) {
-                if (!seenTitles.add(imdbKey(title))) continue
-                val key = imdbKey(title)
-                val display = if (rating.isNotBlank()) {
-                    "$title ★ $rating"
-                } else {
-                    title
-                }
-                val hit = HorrorImdbCache.get(key)
-                if (hit != null && now - hit.at < HorrorImdbCache.TTL_MS) {
-                    movieCard(display, hit.url, hit.poster)?.let { cards += it }
-                } else {
-                    if (!toFill.contains(title)) toFill += title
-                    val resolveUrl = "imdb-resolve:" +
-                        java.net.URLEncoder.encode(title, "UTF-8")
-                    movieCard(display, resolveUrl, null)?.let { cards += it }
-                }
-            }
-            if (toFill.isNotEmpty()) {
-                imdbFillBackground(toFill)
-            }
-            return newHomePageResponse(
-                listOf(
-                    HomePageList(request.name, cards, isHorizontalImages = true)
-                ),
-                false
-            )
-        }
         // v17: MovieBox — JSON ranking-list, NOT an HTML page.
         // Arabic-subtitled ONLY: a film with no Arabic in its
         // subtitles field never becomes a card. Pagination (fixed
@@ -753,7 +602,7 @@ class HorrorMoviesProvider : MainAPI() {
         // home sections in parallel but AWAITS them all before
         // rendering (APIRepository.getMainPage: async + await),
         // so one live lane fetch (4–5 s from the sandbox, the
-        // 10 s timeout on his line) held the instant IMDb row
+        // 10 s timeout on his line) held the instant first row
         // hostage and the home took exactly 10 s. Now page 1
         // returns its cached cards immediately (zero network)
         // and a background refresh re-fetches the page; a stale
@@ -865,7 +714,7 @@ class HorrorMoviesProvider : MainAPI() {
      * the row). 2-thread pool (gentle on his 4G); one refresh
      * per lane at a time (guarded set).
      * v39: the task waits 2 s before fetching — same reason as
-     * the IMDb fill: the refresh is invisible, so it yields the
+     * the background fill: the refresh is invisible, so it yields the
      * bandwidth to the poster images. */
     private fun laneRefreshBackground(lane: String, base: String) {
         synchronized(laneRefreshing) {
@@ -983,418 +832,6 @@ class HorrorMoviesProvider : MainAPI() {
         return out
     }
 
-    // ---------------------------------------------------------------
-    // v31: IMDb section — seed + resolver
-    // ---------------------------------------------------------------
-    /** v31: IMDb horror seed — the top of IMDb's horror interest
-     * list (https://www.imdb.com/interest/horror/), extracted
-     * 2026-11-23 via the real browser because IMDb answers plain
-     * HTTP with an AWS WAF challenge (HTTP 202). Series on that
-     * list are EXCLUDED (this addon is movies-only): Yellowjackets,
-     * From, Supernatural, Crystal Lake, Stranger Things, The
-     * Walking Dead, Widow's Bay, American Horror Story, The Last
-     * of Us, It: Welcome to Derry, Monster (Netflix series).
-     * "Hopeu" on the page is "Hope" (MovieBox's own ranking list
-     * carries "Hope"). Title to IMDb rating; the card shows the
-     * rating as "Title ★ rating". Refresh the seed when he asks. */
-    private val imdbHorrorSeed = listOf(
-        "The Body" to "7.4",
-        "Obsession" to "7.8",
-        "Resident Evil" to "7.4",
-        "Carrie" to "7.8",
-        "Other Mommy" to "5.3",
-        "Clayface" to "7.5",
-        "Backrooms" to "6.7",
-        "Below" to "6.2",
-        "Insidious: Out of the Further" to "6.0",
-        "Hope" to "6.5",
-        "Buddy" to "6.6",
-        "Weapons" to "7.4",
-        "Sinners" to "7.5",
-        "418" to "7.6",
-        "Teenage Sex and Death at Camp Miasma" to "6.4",
-        "Ggoolalba" to "6.9",
-        "Hokum" to "6.6",
-        "Victorian Psycho" to "6.3",
-        "The Cycle" to "6.3",
-        "Apocalipsis Z: Nuevo Mundo" to "5.1",
-        "The Last House" to "5.5",
-        "Send Help" to "6.7",
-        "X" to "6.5",
-        "Frankenstein" to "7.4",
-        "Gunche" to "6.5",
-        "Dracula: A Love Tale" to "6.2",
-        "The Lighthouse" to "7.3",
-        "The Substance" to "7.2",
-        "Cujo" to "6.1"
-    )
-
-    /** v31: normalized title key for IMDb matching — mbTitleKey
-     * plus a trailing "(year)" and a "★ rating" suffix stripped,
-     * so "Weapons (2025)" and "Weapons ★ 7.4" both key as
-     * "weapons". Exact-key equality only: the MovieBox search is
-     * fuzzy ("The Conjuring" also returns The Nun II), so a
-     * startsWith match would resolve the wrong film. */
-    private fun imdbKey(t: String): String {
-        var s = t.trim()
-        s = Regex("""\(\d{4}\)\s*$""").replace(s, "").trim()
-        s = s.substringBefore("★").trim()
-        return mbTitleKey(s)
-    }
-
-    /** v31: MovieBox H5 search for one IMDb title. Exact
-     * normalized-title match only; among several years (remakes)
-     * the latest release wins (the IMDb list is current). The
-     * web token is cached 1 h by mbWebToken(), so per-title
-     * calls are cheap. Returns the detail URL + poster, or null. */
-    /** v34: the item-picking loop of the MovieBox H5 search —
-     * exact normalized-title match, subjectType==1 (movies),
-     * latest year wins among remakes. Pure function, shared by
-     * the suspend search and its blocking twin. */
-    private fun mbPickSearchItem(
-        items: JSONArray,
-        seedKey: String
-    ): Pair<String, String?>? {
-        var bestUrl: String? = null
-        var bestPoster: String? = null
-        var bestYear = -1
-        for (i in 0 until items.length()) {
-            val o = items.optJSONObject(i) ?: continue
-            if (o.optInt("subjectType", 1) != 1) continue
-            val t = o.optString("title")
-            if (t.isBlank()) continue
-            if (imdbKey(t) != seedKey) continue
-            val dp = o.optString("detailPath")
-            if (dp.isBlank()) continue
-            val y = mbFranchiseYear(o.optString("releaseDate"))
-            if (y > bestYear) {
-                bestYear = y
-                bestUrl = "$mbWebBase/ar/moviedetail/$dp"
-                bestPoster = o.optJSONObject("cover")?.optString("url")
-                    ?.ifBlank { null }
-                    ?: o.optString("poster").ifBlank { null }
-                    ?: o.optString("coverUrl").ifBlank { null }
-            }
-        }
-        val url = bestUrl ?: return null
-        return url to bestPoster
-    }
-
-    private suspend fun imdbSearchMovieBox(
-        title: String
-    ): Pair<String, String?>? {
-        val token = runCatching { mbWebToken().first }.getOrNull().orEmpty()
-        if (token.isBlank()) return null
-        return imdbSearchMovieBoxBlocking(title, token)
-    }
-
-    /** v34: blocking twin of the MovieBox H5 search — same
-     * POST, same picking, raw HttpURLConnection instead of
-     * app.post, so it can run on a worker thread (no
-     * coroutines in this codebase). The token is minted once
-     * by the caller and passed in. */
-    private fun imdbSearchMovieBoxBlocking(
-        title: String,
-        token: String
-    ): Pair<String, String?>? {
-        val body = JSONObject().apply {
-            put("keyword", title)
-            put("page", 1)
-            put("perPage", 20)
-            put("subjectType", 1)
-        }.toString()
-        val text = httpPostJsonBlocking(
-            "$mbWebBase/wefeed-h5api-bff/subject/search",
-            body,
-            mapOf(
-                "User-Agent" to browserUA,
-                "Accept" to "application/json",
-                "Content-Type" to "application/json",
-                "Authorization" to "Bearer $token",
-                "X-MB-Token" to token
-            ),
-            8000
-        ) ?: return null
-        val items = runCatching {
-            JSONObject(text).optJSONObject("data")?.optJSONArray("items")
-        }.getOrNull() ?: return null
-        return mbPickSearchItem(items, imdbKey(title))
-    }
-
-    /** v34: resolver lane-fetch timeout (4 s, not the 10 s
-     * home timeout). A search page that takes longer is a
-     * dead/slow site — fail fast so one unresolvable title
-     * cannot burn 60 s (6 lanes x 10 s) inside the pool. */
-    private val imdbResolveTimeoutMs = 4_000
-
-    /** v31: one HTML lane's search page for one IMDb title.
-     * Same selectors as search(); the first card whose
-     * normalized title exactly matches the seed wins.
-     * Fail-fast fetch, null on any failure. */
-    private fun imdbSearchLane(
-        lane: String,
-        title: String
-    ): Pair<String, String?>? {
-        val q = java.net.URLEncoder.encode(title, "UTF-8")
-        val url = when (lane) {
-            "moviz" -> "https://www.moviz.land/?s=$q"
-            "eg" -> "https://egy.bet/?s=$q"
-            "myc" -> "https://vid.mycima.cc/search.php?keywords=$q"
-            "lar" -> "https://larozatv.com/search?q=$q"
-            "top" -> "https://topcinema.film/?s=$q"
-            "af" -> "https://aflamstream.com/?s=$q"
-            else -> return null
-        }
-        val html = httpGetTextHeaders(url, imdbResolveTimeoutMs, browserHeaders)
-            ?: return null
-        val doc = runCatching { Jsoup.parse(html, url) }.getOrNull()
-            ?: return null
-        val seedKey = imdbKey(title)
-        fun href(a: org.jsoup.nodes.Element): String =
-            a.attr("abs:href").ifBlank { a.attr("href") }
-        val found: Pair<String, String?>? = when (lane) {
-            "moviz" -> doc.select(".search-card").firstNotNullOfOrNull { card ->
-                val a = card.selectFirst("a[href]")
-                    ?: return@firstNotNullOfOrNull null
-                val img = card.selectFirst("img")
-                val t = card.selectFirst(".search-card-title")?.text()
-                    ?: img?.attr("alt") ?: a.attr("aria-label")
-                if (!isMovieTitle(t) || imdbKey(t) != seedKey) {
-                    return@firstNotNullOfOrNull null
-                }
-                href(a) to img?.attr("src")?.ifBlank { null }
-            }
-            "eg" -> doc.select("a.postBlock, a.postBlockCol")
-                .firstNotNullOfOrNull { a ->
-                    val img = a.selectFirst("img")
-                    val poster = img?.attr("data-src")
-                        ?.takeIf { it.isNotBlank() && !it.contains("src-default") }
-                        ?: img?.attr("src")
-                    val t = a.attr("title").ifBlank {
-                        a.selectFirst("h3.title")?.text().orEmpty()
-                    }
-                    if (!isMovieTitle(t) || imdbKey(t) != seedKey) {
-                        return@firstNotNullOfOrNull null
-                    }
-                    href(a) to poster?.ifBlank { null }
-                }
-            "myc" -> doc.select("ul#pm-grid li").firstNotNullOfOrNull { li ->
-                val a = li.selectFirst("a[href*=watch.php]")
-                    ?: return@firstNotNullOfOrNull null
-                val img = li.selectFirst("img")
-                val poster = img?.attr("data-echo")?.ifBlank { null }
-                    ?: img?.attr("src")?.ifBlank { null }
-                val t = a.attr("title")
-                if (!isMovieTitle(t) || imdbKey(t) != seedKey) {
-                    return@firstNotNullOfOrNull null
-                }
-                href(a) to poster
-            }
-            "lar" -> doc.select("article.ay-card").firstNotNullOfOrNull { article ->
-                val a = article.selectFirst("a.ay-card-media")
-                    ?: article.selectFirst("a[href]")
-                    ?: return@firstNotNullOfOrNull null
-                val badge = article.selectFirst(".ay-card-badge")?.text().orEmpty()
-                if (badge.isNotBlank() && !badge.contains("فيلم") &&
-                    !badge.contains("نسخة")
-                ) return@firstNotNullOfOrNull null
-                val t = article.selectFirst(".ay-card-title")?.text()
-                    ?: a.attr("aria-label")
-                if (!isMovieTitle(t) || imdbKey(t) != seedKey) {
-                    return@firstNotNullOfOrNull null
-                }
-                val poster = article.selectFirst("img")?.let {
-                    it.attr("abs:src").ifBlank { it.attr("src") }
-                }?.ifBlank { null }
-                href(a) to poster
-            }
-            "top" -> doc.select("a.recent--block").firstNotNullOfOrNull { a ->
-                val t = a.attr("title")
-                if (!isMovieTitle(t) || imdbKey(t) != seedKey) {
-                    return@firstNotNullOfOrNull null
-                }
-                val img = a.selectFirst("img")
-                val poster = img?.attr("data-src")?.ifBlank { null }
-                    ?: img?.attr("src")?.ifBlank { null }
-                href(a) to poster
-            }
-            "af" -> doc.select("div.ht_grid_1_4").firstNotNullOfOrNull { div ->
-                val a = div.selectFirst("a.thumbnail-link")
-                    ?: return@firstNotNullOfOrNull null
-                val img = div.selectFirst("img")
-                val t = div.selectFirst("h2.entry-title a")?.text().orEmpty()
-                if (!isMovieTitle(t) || imdbKey(t) != seedKey) {
-                    return@firstNotNullOfOrNull null
-                }
-                href(a) to img?.attr("src")?.ifBlank { null }
-            }
-            else -> null
-        }
-        val (u, p) = found ?: return null
-        if (u.isBlank()) return null
-        return u to p
-    }
-
-    /** v31: resolve one IMDb title to a playable card — MovieBox
-     * search first, then the 6 HTML lanes in order, first hit
-     * wins. Null when no source has it (the title is skipped). */
-    private suspend fun imdbResolveTitle(
-        title: String
-    ): Pair<String, String?>? {
-        runCatching { imdbSearchMovieBox(title) }.getOrNull()?.let { return it }
-        // v32: FasselHD next — its panel API search is a real
-        // catalog, stronger than scraping the HTML lanes.
-        runCatching { imdbSearchFassel(title) }.getOrNull()?.let { return it }
-        for (lane in listOf("moviz", "eg", "myc", "lar", "top", "af")) {
-            runCatching { imdbSearchLane(lane, title) }.getOrNull()
-                ?.let { return it }
-        }
-        return null
-    }
-
-    // v35: background fill + tap-resolve machinery (panel).
-    // The resolution cache itself is HorrorImdbCache
-    // (persistent, in the Plugin file) — the v34 in-memory
-    // map is gone (it died on every app close).
-    // Fill pool: v39: 2 threads (was 4, panel majority) — the
-    // fill is invisible background work, and 2 threads halve
-    // the burst competing with the poster images on his 4G.
-    // Shared for the app's lifetime, never shut down; the fill
-    // fires once per home load at most (imdbFillRunning guard)
-    // and resolves only missing/stale titles.
-    private val imdbFillPool by lazy {
-        Executors.newFixedThreadPool(2)
-    }
-    @Volatile
-    private var imdbFillRunning = false
-
-    /** v37: the fill is now self-contained — it mints the web
-     * token ITSELF on a worker thread (blocking twin) via a
-     * coordinator task, so getMainPage pays ZERO network.
-     * The coordinator occupies one pool thread only while
-     * minting (~0.5 s), then the per-title tasks run on the
-     * pool. A failed mint just means MovieBox is skipped
-     * (blank token) — FasselHD and the lanes still run.
-     * v39: the coordinator waits 2 s before starting — the
-     * fill is invisible (its results show on the NEXT home
-     * load), so it yields the bandwidth to the poster images
-     * the user is looking at right now. */
-    private fun imdbFillBackground(titles: List<String>) {
-        if (titles.isEmpty()) return
-        synchronized(this) {
-            if (imdbFillRunning) return
-            imdbFillRunning = true
-        }
-        val jobs = titles.toList()
-        try {
-            imdbFillPool.execute {
-                runCatching { Thread.sleep(2000) }
-                val token = runCatching { mbWebTokenBlocking() }.getOrNull().orEmpty()
-                val remaining = AtomicInteger(jobs.size)
-                try {
-                    for (title in jobs) {
-                        imdbFillPool.execute {
-                            try {
-                                runCatching {
-                                    // v36: try the stale entry's source
-                                    // first — most re-resolves hit on the
-                                    // first request.
-                                    val preferred = HorrorImdbCache.get(imdbKey(title))
-                                        ?.source?.takeIf { it != "?" }
-                                    imdbResolveTitleBlocking(title, token, preferred)?.let { found ->
-                                        HorrorImdbCache.put(
-                                            imdbKey(title),
-                                            found.first, found.second, found.third
-                                        )
-                                    }
-                                }
-                            } finally {
-                                if (remaining.decrementAndGet() == 0) {
-                                    imdbFillRunning = false
-                                }
-                            }
-                        }
-                    }
-                } catch (_: Exception) {
-                    imdbFillRunning = false
-                }
-            }
-        } catch (_: Exception) {
-            imdbFillRunning = false
-        }
-    }
-
-    /** v35: resolve ONE title on a worker thread with an 8 s
-     * cap (tap path). The common MovieBox hit is ~1 s; an
-     * unresolvable title returns null instead of hanging
-     * load() for the full cascade (~27 s). */
-    private val imdbTapPool by lazy {
-        Executors.newSingleThreadExecutor()
-    }
-
-    private fun imdbResolveOne(
-        title: String,
-        token: String
-    ): Triple<String, String?, String>? {
-        return try {
-            val future = imdbTapPool.submit(Callable {
-                runCatching { imdbResolveTitleBlocking(title, token) }.getOrNull()
-            })
-            runCatching { future.get(8, TimeUnit.SECONDS) }.getOrNull()
-        } catch (_: Exception) {
-            null
-        }
-    }
-
-    /** v34: blocking twin of imdbResolveTitle — same order
-     * (MovieBox, then FasselHD, then the 6 HTML lanes),
-     * first hit wins. Runs on a worker thread. A blank token
-     * skips MovieBox (the mint failed) — FasselHD and the
-     * lanes still run.
-     * v35: returns (url, poster, source) — the source is
-     * stored in the persistent cache (panel: try the last
-     * successful source first on a later re-resolve).
-     * v36: preferredSource does exactly that — the
-     * background fill passes the stale entry's source, so
-     * most re-resolves hit on the FIRST request instead of
-     * walking the whole chain (the preferred source is not
-     * retried in the standard-order pass). */
-    private fun imdbResolveTitleBlocking(
-        title: String,
-        mbToken: String,
-        preferredSource: String? = null
-    ): Triple<String, String?, String>? {
-        val lanes = listOf("moviz", "eg", "myc", "lar", "top", "af")
-        fun tryMovieBox(): Triple<String, String?, String>? {
-            if (mbToken.isBlank()) return null
-            return runCatching { imdbSearchMovieBoxBlocking(title, mbToken) }.getOrNull()
-                ?.let { Triple(it.first, it.second, "moviebox") }
-        }
-        fun tryFassel(): Triple<String, String?, String>? {
-            return runCatching { imdbSearchFasselBlocking(title) }.getOrNull()
-                ?.let { Triple(it.first, it.second, "fassel") }
-        }
-        fun tryLane(lane: String): Triple<String, String?, String>? {
-            return runCatching { imdbSearchLane(lane, title) }.getOrNull()
-                ?.let { Triple(it.first, it.second, lane) }
-        }
-        val pref = preferredSource
-        if (pref != null) {
-            when (pref) {
-                "moviebox" -> tryMovieBox()?.let { return it }
-                "fassel" -> tryFassel()?.let { return it }
-                else -> if (pref in lanes) tryLane(pref)?.let { return it }
-            }
-        }
-        if (pref != "moviebox") tryMovieBox()?.let { return it }
-        if (pref != "fassel") tryFassel()?.let { return it }
-        for (lane in lanes) {
-            if (lane == pref) continue
-            tryLane(lane)?.let { return it }
-        }
-        return null
-    }
-
     // ---------- v32: FasselHD (panel API, same source as the
     // FasselHD v13 addon) ----------
     private val fasApiPrimary = "https://kahitdgku.com/faselhd15/public/api"
@@ -1435,73 +872,9 @@ class HorrorMoviesProvider : MainAPI() {
         return null
     }
 
-    /** v34: blocking twin of fasApiJson — same bases (already
-     * warmed by the caller), raw HttpURLConnection, read-only
-     * (never updates fasLiveBase, so workers cannot race). */
-    private fun fasApiJsonBlocking(path: String): JSONObject? {
-        val bases = ArrayList<String>()
-        fasLiveBase?.let { bases += it }
-        if (fasApiPrimary !in bases) bases += fasApiPrimary
-        fasConfigBase?.let { if (it !in bases) bases += it }
-        for (base in bases) {
-            val text = httpGetTextHeaders("$base/$path", 8000, browserHeaders)
-                ?: continue
-            if (text.startsWith("{") || text.startsWith("[")) {
-                return runCatching { JSONObject(text) }.getOrNull()
-            }
-        }
-        return null
-    }
-
     private suspend fun fasApiJson(path: String): JSONObject? {
         val text = fasApiGet(path) ?: return null
         return runCatching { JSONObject(text) }.getOrNull()
-    }
-
-    /** v32: one IMDb title on FasselHD — panel search, movie
-     * rows only, exact normalized-title match, first hit wins
-     * (same contract as imdbSearchLane). Returns the detail
-     * URL (a "movie:<id>" token on fasselhd.com, which load()
-     * and loadLinksFassel understand) + poster. Verified live
-     * 2026-11-23: «Weapons» returns the 2025 film first
-     * (id 29099) — the title MovieBox lacks. */
-    /** v34: the row-picking loop of the FasselHD search —
-     * movie rows only, exact normalized-title match, first
-     * hit wins. Pure function, shared by the suspend search
-     * and its blocking twin. */
-    private fun fasPickSearchRow(
-        rows: JSONArray,
-        seedKey: String
-    ): Pair<String, String?>? {
-        for (i in 0 until rows.length()) {
-            val row = rows.optJSONObject(i) ?: continue
-            if (row.optString("type").lowercase() != "movie") continue
-            val t = row.optString("title").ifBlank { row.optString("name") }
-            if (t.isBlank() || !isMovieTitle(t) || imdbKey(t) != seedKey) continue
-            val id = row.optString("id")
-            if (id.isBlank()) continue
-            return "https://fasselhd.com/movie:$id" to
-                row.optString("poster_path").ifBlank { null }
-        }
-        return null
-    }
-
-    private suspend fun imdbSearchFassel(
-        title: String
-    ): Pair<String, String?>? {
-        fasWarmConfig()
-        return imdbSearchFasselBlocking(title)
-    }
-
-    /** v34: blocking twin — same search, same exact-match
-     * picking, usable from a worker thread. */
-    private fun imdbSearchFasselBlocking(
-        title: String
-    ): Pair<String, String?>? {
-        val q = java.net.URLEncoder.encode(title, "UTF-8")
-        val root = fasApiJsonBlocking("search/$q/1") ?: return null
-        val rows = root.optJSONArray("search") ?: return null
-        return fasPickSearchRow(rows, imdbKey(title))
     }
 
     /** v32: the videos "header" field — a bare URL is the
@@ -1690,9 +1063,9 @@ class HorrorMoviesProvider : MainAPI() {
      * least one [A-Za-z] letter (digits-only candidates like "2"
      * are NOT titles); a result is accepted only when its title
      * contains a Latin candidate AND a trailer word.
-     * IMDb's own title page is 202-blocked from datacenter IPs, so
-     * IMDb is the title resolver only (the subtitle gear's
-     * resolveImdbId) — not the video host. The app shows its
+     * The title page itself is 202-blocked from datacenter IPs, so
+     * the suggestion lookup is used only as a title-id resolver
+     * (the subtitle gear's lookup) — not as a video host. The app shows its
      * trailer button from LoadResponse.trailers; a missing button
      * means the search found nothing for that title. Returns an
      * empty list on any failure — a missing trailer must never
@@ -1844,28 +1217,6 @@ class HorrorMoviesProvider : MainAPI() {
 
     override suspend fun load(url: String): LoadResponse {
         return when {
-            // v35: IMDb placeholder card (panel) — the home row
-            // shows the seed title with a synthetic URL when the
-            // persistent cache has no fresh entry; the title is
-            // resolved lazily HERE, on tap, for this ONE title
-            // only, on a worker thread with an 8 s cap (the
-            // common MovieBox hit is ~1 s; an unresolvable
-            // title falls back instead of hanging the detail
-            // page). A hit is written to the persistent cache,
-            // so the next home load shows the real card.
-            url.startsWith("imdb-resolve:") -> {
-                val title = runCatching {
-                    java.net.URLDecoder.decode(
-                        url.removePrefix("imdb-resolve:"), "UTF-8"
-                    )
-                }.getOrNull().orEmpty()
-                if (title.isBlank()) return movieFallback(url)
-                val token = runCatching { mbWebToken().first }.getOrNull().orEmpty()
-                val found = imdbResolveOne(title, token)
-                if (found == null) return movieFallback(url)
-                HorrorImdbCache.put(imdbKey(title), found.first, found.second, found.third)
-                return load(found.first)
-            }
             url.contains("moviz.land") -> {
                 val doc = runCatching {
                     app.get(url, headers = browserHeaders).document
@@ -2374,7 +1725,7 @@ class HorrorMoviesProvider : MainAPI() {
         fun elapsed() = System.currentTimeMillis() - t0
         // v32: subtitle gear, three modes (ar/en/dual, default
         // dual) — OpenSubtitles Arabic + English, merged for
-        // dual. Applies to every film, IMDb section included.
+        // dual. Applies to every film.
         val (realData, subTitle, _) = parseSubData(data)
         if (subTitle.isNotBlank()) {
             emitSubs(subTitle, subtitleCallback)
@@ -2743,7 +2094,7 @@ class HorrorMoviesProvider : MainAPI() {
      * subtitle-plugin type that auto-attaches to other providers'
      * playback, so the tool lives here — inside loadLinks, before
      * any video link is emitted:
-     *   Latin title (+ year) → IMDb suggest (key-free) → IMDb id →
+     *   Latin title (+ year) → suggestion lookup (key-free) → title id →
      *   OpenSubtitles v3 Stremio endpoint (key-free) → first
      *   lang=eng file → subtitleCallback(SubtitleFile("English", url)).
      * The .srt downloads without auth (verified: The Conjuring 2013,
@@ -2751,7 +2102,7 @@ class HorrorMoviesProvider : MainAPI() {
      * Everything is fail-soft and fail-fast (8 s caps): if any step
      * misses, playback continues with zero subtitles — never blocked.
      * Titles with no Latin part (fully Arabic titles) cannot be
-     * resolved by IMDb suggest and get no subtitle in v4.
+     * resolved by the suggestion lookup and get no subtitle in v4.
      */
     /** v24: per-lane fail-fast timeout for home fetches (10 s).
      * A slow/hung site must return null quickly instead of
@@ -2775,33 +2126,6 @@ class HorrorMoviesProvider : MainAPI() {
             conn.connectTimeout = timeoutMs
             conn.readTimeout = timeoutMs
             for ((k, v) in headers) conn.setRequestProperty(k, v)
-            val stream = if (conn.responseCode in 200..299) {
-                conn.inputStream
-            } else {
-                return@runCatching null
-            }
-            stream.bufferedReader(Charsets.UTF_8).use { it.readText() }
-        }.getOrNull()
-    }
-
-    /** v34: blocking JSON POST (raw HttpURLConnection, same
-     * pattern as httpGetTextHeaders) — the blocking twin of
-     * app.post, so a search can run on a worker thread. */
-    private fun httpPostJsonBlocking(
-        url: String,
-        body: String,
-        headers: Map<String, String>,
-        timeoutMs: Int
-    ): String? {
-        return runCatching {
-            val conn = java.net.URL(url).openConnection()
-                as java.net.HttpURLConnection
-            conn.requestMethod = "POST"
-            conn.doOutput = true
-            conn.connectTimeout = timeoutMs
-            conn.readTimeout = timeoutMs
-            for ((k, v) in headers) conn.setRequestProperty(k, v)
-            conn.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
             val stream = if (conn.responseCode in 200..299) {
                 conn.inputStream
             } else {
@@ -2891,7 +2215,7 @@ class HorrorMoviesProvider : MainAPI() {
     }
 
     /** v32: subtitle gear, three modes (HorrorSubs.mode, default
-     * dual) — Title (+year) -> IMDb suggest (key-free) ->
+     * dual) — Title (+year) -> suggestion lookup (key-free) ->
      * OpenSubtitles. Sync-first ranking (v7): don't take the
      * first file — a subtitle timed for 25fps on a 23.976fps
      * stream drifts more and more as the film plays. Prefer
@@ -3928,61 +3252,6 @@ class HorrorMoviesProvider : MainAPI() {
             mbCachedWebAt = now
         }
         return tok to "web"
-    }
-
-    /** v37: BLOCKING twin of mbTokenFrom — same ranking-list
-     * call, same headers, same token extraction (x-user
-     * header first, then the body token). The suspend version
-     * uses app.get, which a worker thread cannot call; this
-     * one uses raw HttpURLConnection, so the background fill
-     * can mint the web token WITHOUT the home-load path
-     * paying for it. Timeout 8 s (same as the H5 search).
-     * Unsigned headers only — the fill needs the WEB token,
-     * never the signed mobile mint. */
-    private fun mbTokenFromBlocking(
-        url: String,
-        ua: String
-    ): String? {
-        return runCatching {
-            val conn = java.net.URL(url).openConnection()
-                as java.net.HttpURLConnection
-            conn.requestMethod = "GET"
-            conn.connectTimeout = 8000
-            conn.readTimeout = 8000
-            conn.setRequestProperty("User-Agent", ua)
-            conn.setRequestProperty("Accept", "application/json, text/plain, */*")
-            if (conn.responseCode !in 200..299) return@runCatching null
-            val fromHeader = conn.getHeaderField("x-user")
-                ?.let { runCatching { JSONObject(it).optString("token") }.getOrNull() }
-                ?.ifBlank { null }
-            if (!fromHeader.isNullOrBlank()) return@runCatching fromHeader
-            val body = conn.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
-            if (body.isBlank()) return@runCatching null
-            val j = runCatching { JSONObject(body) }.getOrNull()
-                ?: return@runCatching null
-            j.optString("token").ifBlank { null }
-                ?: j.optJSONObject("data")?.optString("token")?.ifBlank { null }
-        }.getOrNull()
-    }
-
-    /** v37: BLOCKING twin of mbWebToken — same 1 h in-memory
-     * cache (already @Volatile, shared with the suspend
-     * path), same ranking-list mint. Called by the
-     * background fill's coordinator, never by getMainPage. */
-    private fun mbWebTokenBlocking(): String? {
-        val now = System.currentTimeMillis()
-        val cached = mbCachedWebToken
-        if (cached != null && now - mbCachedWebAt < 3600_000) {
-            return cached
-        }
-        val webUrl = "$mbWebBase/wefeed-h5api-bff/ranking-list/content" +
-            "?id=$mbRankId&page=1&perPage=1"
-        val tok = mbTokenFromBlocking(webUrl, browserUA)
-        if (tok != null) {
-            mbCachedWebToken = tok
-            mbCachedWebAt = now
-        }
-        return tok
     }
 
     private fun mbStreamUrl(s: JSONObject): String? {
